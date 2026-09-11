@@ -363,6 +363,9 @@ const CLAUDE_FRESH_SECS: i64 = 15 * 60;
 struct Snapshot {
     at: i64,
     usage: Value,
+    /// The Claude account it belongs to, so a login switch doesn't show old usage.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 /// Our last API response, rate-limit backoff and renewal date, kept across restarts.
@@ -452,6 +455,31 @@ fn apply_statusline(meters: &mut Vec<Meter>, rate_limits: &Value) {
     }
 }
 
+/// The "old" note for Claude. Live statusline figures cover only 5h and week, so
+/// when they are fresh, name the meters that came from the older full response.
+fn claude_staleness(
+    now: i64,
+    live_at: Option<i64>,
+    snap_at: Option<i64>,
+    labels: &[&str],
+) -> Option<String> {
+    match (live_at, snap_at) {
+        (Some(live), Some(snap)) if now - live < CLAUDE_FRESH_SECS => {
+            let others: Vec<&str> = labels
+                .iter()
+                .copied()
+                .filter(|l| !matches!(*l, "5h" | "week"))
+                .collect();
+            (now - snap >= CLAUDE_FRESH_SECS && !others.is_empty())
+                .then(|| format!("{} {} old", others.join(", "), age(snap)))
+        }
+        (live, snap) => {
+            let at = live.into_iter().chain(snap).max()?;
+            (now - at >= CLAUDE_FRESH_SECS).then(|| format!("{} old", age(at)))
+        }
+    }
+}
+
 fn claude_should_call(api: bool, now: i64, newest: Option<i64>, state: &ClaudeState) -> bool {
     let fresh = newest.is_some_and(|at| now - at < CLAUDE_FRESH_SECS);
     api && !fresh && now >= state.blocked_until && now - state.last_attempt >= CLAUDE_FRESH_SECS
@@ -461,22 +489,32 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
     let api = config.api;
     let creds = claude_credentials();
     let oauth = creds.as_ref().map(|c| &c["claudeAiOauth"]);
-    let cache = claude_code_cache();
+    let (cache, account) = claude_code_state();
     let mut state = ClaudeState::load();
     let now = now_unix();
+    // Our saved response is only good for the account it was fetched for.
+    if account.is_some() && state.last.as_ref().is_some_and(|s| s.account != account) {
+        state.last = None;
+    }
 
+    // The statusline refreshes only 5h and week, so it doesn't make the rest fresh.
     let statusline = claude_statusline();
     let newest = [&cache, &state.last]
         .into_iter()
         .flatten()
         .map(|s| s.at)
-        .chain(statusline.as_ref().map(|(at, _)| *at))
         .max();
     let mut problem = None;
     if claude_should_call(api, now, newest, &state) {
         state.last_attempt = now;
         match claude_api(oauth) {
-            Ok(usage) => state.last = Some(Snapshot { at: now, usage }),
+            Ok(usage) => {
+                state.last = Some(Snapshot {
+                    at: now,
+                    usage,
+                    account: account.clone(),
+                })
+            }
             Err(ClaudeError::RateLimited(retry_after)) => {
                 state.blocked_until = now + retry_after.max(CLAUDE_FRESH_SECS);
             }
@@ -512,15 +550,17 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         .as_ref()
         .map(|s| claude_meters(&s.usage))
         .unwrap_or_default();
-    let mut data_at = snap.as_ref().map(|s| s.at);
+    let snap_at = snap.as_ref().map(|s| s.at);
     // Live 5h/weekly numbers from the statusline beat an older full response.
+    let mut live_at = None;
     if let Some((at, rate_limits)) = statusline
-        && data_at.is_none_or(|d| at > d)
+        && snap_at.is_none_or(|d| at > d)
     {
         apply_statusline(&mut meters, &rate_limits);
-        data_at = Some(at);
+        live_at = Some(at);
     }
-    let Some(data_at) = data_at.filter(|_| !meters.is_empty()) else {
+    // When the 5h and week readings were taken.
+    let Some(data_at) = live_at.or(snap_at).filter(|_| !meters.is_empty()) else {
         return Err(if rate_limited {
             format!(
                 "Claude rate limited; retrying in {}",
@@ -558,8 +598,8 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         }
     }
 
-    let note = (now - data_at >= CLAUDE_FRESH_SECS).then(|| {
-        let mut note = format!("{} old", age(data_at));
+    let labels: Vec<&str> = meters.iter().filter_map(|m| m.label.as_deref()).collect();
+    let note = claude_staleness(now, live_at, snap_at, &labels).map(|mut note| {
         if rate_limited {
             note += &format!(" · rate limited · retry {}", until(state.blocked_until));
         } else if let Some(p) = problem {
@@ -585,19 +625,28 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
     })
 }
 
-/// Claude Code keeps its latest /api/oauth/usage response in ~/.claude.json.
-fn claude_code_cache() -> Option<Snapshot> {
-    let v = read_json_file(&home().ok()?.join(".claude.json")).ok()?;
+/// From ~/.claude.json: Claude Code's latest /api/oauth/usage response, if it
+/// belongs to the logged-in account, and that account's id.
+fn claude_code_state() -> (Option<Snapshot>, Option<String>) {
+    let Some(v) = home()
+        .ok()
+        .and_then(|h| read_json_file(&h.join(".claude.json")).ok())
+    else {
+        return (None, None);
+    };
+    let account = v["oauthAccount"]["accountUuid"].as_str().map(String::from);
     let c = &v["cachedUsageUtilization"];
     // Ignore a cache left behind by another account.
-    let owner = v["oauthAccount"]["accountUuid"].as_str();
-    if owner.is_some() && c["accountUuid"].as_str() != owner {
-        return None;
-    }
-    Some(Snapshot {
-        at: i64_of(&c["fetchedAtMs"])? / 1000,
-        usage: c["utilization"].clone(),
-    })
+    let cache = (account.is_none() || c["accountUuid"].as_str() == account.as_deref())
+        .then(|| {
+            Some(Snapshot {
+                at: i64_of(&c["fetchedAtMs"])? / 1000,
+                usage: c["utilization"].clone(),
+                account: account.clone(),
+            })
+        })
+        .flatten();
+    (cache, account)
 }
 
 enum ClaudeError {
@@ -1030,6 +1079,29 @@ mod tests {
         let mut only = Vec::new();
         apply_statusline(&mut only, &json!({ "seven_day": { "used_percentage": 7 } }));
         assert_eq!(labels(&only), [("week", 7.0, None)]);
+    }
+
+    #[test]
+    fn claude_staleness_names_old_meters() {
+        let now = now_unix();
+        let labels = ["5h", "week", "fable wk"];
+        let note = |live, snap, labels: &[&str]| claude_staleness(now, live, snap, labels);
+        assert_eq!(note(Some(now - 5), Some(now - 60), &labels), None);
+        // Fresh statusline, old full response: only the caps are old.
+        assert_eq!(
+            note(Some(now - 5), Some(now - 1800), &labels).as_deref(),
+            Some("fable wk 30m old")
+        );
+        assert_eq!(note(Some(now - 5), Some(now - 1800), &["5h", "week"]), None);
+        // No statusline, or an old one: everything is as old as the newest source.
+        assert_eq!(
+            note(None, Some(now - 1800), &labels).as_deref(),
+            Some("30m old")
+        );
+        assert_eq!(
+            note(Some(now - 1800), Some(now - 3600), &labels).as_deref(),
+            Some("30m old")
+        );
     }
 
     #[test]
