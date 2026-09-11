@@ -2,7 +2,7 @@
 
 Always-on-top widget for GitHub Copilot, Claude and Codex usage, plans and renewals.
 
-<img width="323" height="237" alt="image" src="https://github.com/user-attachments/assets/29bc8928-0440-46c9-98d3-0cd0231311bb" />
+<img width="270" height="220" alt="Usage widget showing Claude and Codex plans, renewal dates, usage bars and reset countdowns" src="docs/usage-widget.png" />
 
 ## Install
 
