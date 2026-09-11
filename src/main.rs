@@ -8,6 +8,8 @@ mod claude_web;
 mod codex_estimate;
 mod config;
 mod estimate;
+#[cfg(target_os = "macos")]
+mod menubar;
 mod providers;
 mod timeutil;
 
@@ -71,6 +73,10 @@ struct App {
     /// Decimal places for percentages.
     precision: usize,
     config_error: Option<String>,
+    #[cfg(target_os = "macos")]
+    menubar: Option<menubar::MenuBar>,
+    #[cfg(target_os = "macos")]
+    shown: bool,
 }
 
 impl App {
@@ -102,6 +108,11 @@ impl App {
                 (*p, slot)
             })
             .collect();
+        #[cfg(target_os = "macos")]
+        let (menubar, config_error) = match menubar::MenuBar::new(&cc.egui_ctx, &providers) {
+            Ok(bar) => (Some(bar), config_error),
+            Err(e) => (None, config_error.or(Some(format!("menu bar icon: {e}")))),
+        };
         Self {
             providers,
             slots,
@@ -111,6 +122,10 @@ impl App {
             opacity,
             precision,
             config_error,
+            #[cfg(target_os = "macos")]
+            menubar,
+            #[cfg(target_os = "macos")]
+            shown: true,
         }
     }
 
@@ -581,6 +596,23 @@ impl eframe::App for App {
         let mut edit_config = false;
         let mut quit = false;
 
+        #[cfg(target_os = "macos")]
+        if let Some(bar) = &self.menubar {
+            for action in bar.take_actions() {
+                match action {
+                    menubar::Action::ToggleWidget => {
+                        self.shown = !self.shown;
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(self.shown));
+                        bar.set_widget_shown(self.shown);
+                    }
+                    menubar::Action::Refresh => refresh = true,
+                    menubar::Action::Open(p) => ctx.open_url(egui::OpenUrl::new_tab(p.url())),
+                    menubar::Action::EditConfig => edit_config = true,
+                    menubar::Action::Quit => quit = true,
+                }
+            }
+        }
+
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
             let bg = ui.interact(ui.max_rect(), ui.id().with("bg"), Sense::click_and_drag());
@@ -726,6 +758,13 @@ usage: usage-widget [config | --startup | --no-startup]"
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false),
+        // An accessory app: no Dock icon or Cmd+Tab entry; the menu bar icon
+        // stands in for them.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
     eframe::run_native(

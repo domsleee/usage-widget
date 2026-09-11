@@ -22,6 +22,7 @@ Re-run `cargo install` and restart the widget to upgrade.
 
 - Drag to move; position is remembered.
 - Right-click: refresh, usage pages, edit config, quit (no taskbar entry).
+- macOS: lives in the menu bar, with no Dock icon or Cmd+Tab entry. Its menu also hides and shows the widget.
 - Click a service name to open its usage page.
 
 ## Config

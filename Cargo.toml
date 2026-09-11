@@ -27,3 +27,5 @@ cbc = "0.1"
 objc2 = "0.6"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 sha1 = "0.10"
+tray-icon = "0.24.2"
+winit = "0.30"
