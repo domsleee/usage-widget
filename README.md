@@ -1,61 +1,90 @@
 # usage-widget
 
-A small always-on-top desktop widget (Rust, egui) that shows how much of your
-GitHub Copilot, Claude and Codex allowance you have used, in dollars. It
-refreshes every five minutes and can be dragged anywhere on screen.
+Always-on-top desktop widget (Rust, egui) for GitHub Copilot, Claude and Codex usage.
 
 <img width="323" height="237" alt="image" src="https://github.com/user-attachments/assets/29bc8928-0440-46c9-98d3-0cd0231311bb" />
 
-
-Credit-to-dollar rates live at the top of `src/providers.rs`:
-Copilot 50,000 credits = $500, Codex 12,500 credits = $500. Claude reports
-dollars directly. The footer total sums all three.
-
-## How it gets the numbers
-
-No logins of its own. It reuses credentials the CLIs already store locally:
-
-| Service | Credential | Endpoint |
-| --- | --- | --- |
-| Copilot | `gh auth token` (or `GITHUB_TOKEN` / `GH_TOKEN`) | `api.github.com/copilot_internal/user` premium request quota |
-| Claude | `~/.claude/.credentials.json` written by Claude Code | `api.anthropic.com/api/oauth/usage` |
-| Codex | `~/.codex/auth.json` written by Codex CLI | `chatgpt.com/backend-api/wham/usage` |
-
-What is shown depends on the plan:
-
-- Copilot: premium request credits used / entitlement.
-- Claude: 5-hour and 7-day windows when the plan has them, plus monthly spend against the cap when present.
-- Codex: 5-hour and weekly rate-limit windows when present, plus the workspace spend limit when present.
-
-Tokens are read from disk on every refresh and never written back. If Claude Code or
-Codex have not run for a while their access token expires and the widget says so.
-Running `claude` or `codex` once refreshes it.
-
-These endpoints are the same ones the CLIs and web settings pages use. They are not
-formally documented and may change.
+Per service: plan, countdown to renewal or quota reset, rolling windows (5h, week,
+per-model caps) with reset countdowns (hover either for the local time), and spend in
+dollars.
 
 ## Install
 
-Needs a Rust toolchain (https://rustup.rs). Windows only.
+Needs Rust. Built for Windows; runs on macOS without `--startup`.
 
 ```
 cargo install --git https://github.com/pepsi-enjoyer/usage-widget
-usage-widget --startup
+usage-widget --startup   # start at login; --no-startup undoes
 usage-widget
 ```
 
-`--startup` registers the exe in your per-user Run key so it launches at login;
-`--no-startup` removes it. The widget stays out of the taskbar and Alt-Tab, so quit
-it from its right-click menu.
+Re-run `cargo install` to upgrade. `install.ps1` does the same from a clone.
 
-To upgrade, run the `cargo install` line again and restart the widget.
+## Use
 
-From a clone, `install.ps1` does the same three steps using the local checkout.
-
-## Using it
-
-- Drag anywhere on the widget to move it. Position is remembered between runs.
-- Right-click for refresh, links to each service's usage page, and Quit.
+- Drag to move; position is remembered.
+- Right-click: refresh, usage pages, edit config, quit (no taskbar entry).
 - Click a service name to open its usage page.
-- Set `USAGE_WIDGET_REFRESH_MINS` to change the refresh interval (default 5).
-- Set `USAGE_WIDGET_OPACITY` (20-100) to change the window opacity (default 85).
+
+## Config
+
+`usage-widget config` creates and opens `config.toml` (in `$VISUAL`/`$EDITOR` if set).
+It lives in `%APPDATA%\usage-widget\` on Windows and
+`~/Library/Application Support/usage-widget/` on macOS. Restart the widget after editing.
+
+```toml
+refresh_mins = 5    # minutes between refreshes, minimum 1
+opacity = 85        # window opacity 20-100, Windows only
+precision = 1       # decimal places for percentages, 0-3
+
+[copilot]
+enabled = true      # false hides the service; same for [claude] and [codex]
+
+[claude]
+enabled = true
+api = true          # false = only read Claude Code's cache, never call Anthropic
+browser_cookies = false  # macOS: read your claude.ai login from Chrome/Arc/Brave/Edge for the renewal day
+estimate = false    # estimate the part of the next percent from local token use
+
+[codex]
+enabled = true
+estimate = false    # estimate the part of the next percent from local token use
+```
+
+## Credentials
+
+Reuses what the CLIs already store; never writes them.
+
+| Service | Credential | Endpoints |
+| --- | --- | --- |
+| Copilot | `gh auth token`, `GITHUB_TOKEN` or `GH_TOKEN` | `api.github.com/copilot_internal/user` |
+| Claude | `~/.claude/.credentials.json` (macOS: keychain) | `api.anthropic.com/api/oauth/usage` |
+| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage`, `/subscriptions` |
+
+Claude's usage endpoint allows each token only a few calls before a 429 of up to an
+hour, so the widget reads the copy Claude Code caches in `~/.claude.json` and calls
+the API only when that is over 15 minutes old, at most every 15 minutes, honouring
+`Retry-After`. Old data is labelled with its age.
+
+For live Claude 5h/weekly numbers, have your Claude Code statusline script save its
+input (it carries `rate_limits` from every response, so no extra requests):
+
+```bash
+INPUT=$(cat)
+case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-statusline.json;; esac
+```
+
+Codex and Claude report whole percents. With `estimate = true` their windows get an
+estimated fraction, marked `~`: each refresh the widget reads what the local logs gained
+(Codex CLI's `~/.codex/sessions`, Claude Code's `~/.claude/projects`), prices those
+tokens (Codex's credit rate card, Anthropic's relative model prices), and divides the
+cost since the last whole-percent tick by what a point has cost in that window. Codex
+logs carry the percent with every response; for Claude the widget learns it from its own
+readings, so its estimate needs a few ticks to warm up. Use the logs never see (Codex
+cloud, claude.ai, other devices) makes the decimals a guess.
+
+Copilot shows its monthly quota reset. Claude's renewal date is only served to claude.ai
+browser sessions, so it needs `claude.browser_cookies = true`: the widget then decrypts
+the claude.ai session cookie from Chrome, Arc, Brave or Edge (macOS asks once for
+keychain access) and asks claude.ai once a day. Token expired? Run `claude` or `codex` once. Endpoints are
+undocumented and may change. Dollar rates live in `src/providers.rs`.

@@ -3,40 +3,54 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod claude_estimate;
+mod claude_web;
+mod codex_estimate;
+mod config;
+mod estimate;
 mod providers;
 mod timeutil;
 
+use config::Config;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Meter, Provider, Unit, money};
+use providers::{Cycle, Meter, Provider, Unit, Usage, money};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, now_unix};
+use timeutil::{ago, local_when, now_unix, until, until_short};
 
-const WIDTH: f32 = 250.0;
+const WIDTH: f32 = 270.0;
 const MARGIN: i8 = 12;
-const DEFAULT_REFRESH_MINS: u64 = 5;
-const DEFAULT_OPACITY_PERCENT: u32 = 85;
+/// Width of the meter-label column, so every reset countdown starts at the same x.
+const LABEL_COL: f32 = 50.0;
 
 // The window is opaque and painted entirely in BG; Windows rounds the corners
 // at the compositor level (see `apply_windows_chrome`), so nothing else shows.
 const BG: Color32 = Color32::from_rgb(24, 26, 32);
 const TEXT: Color32 = Color32::from_gray(232);
+/// Meter labels ("5h", "week").
+const LABEL: Color32 = Color32::from_rgb(196, 199, 205);
+/// Supporting details: plan, renewal, countdowns, notes.
+const META: Color32 = Color32::from_rgb(150, 155, 165);
 const MUTED: Color32 = Color32::from_gray(135);
-const TRACK: Color32 = Color32::from_gray(58);
+const TRACK: Color32 = Color32::from_rgb(48, 50, 56);
 const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
     provider: Provider,
-    result: Result<Vec<Meter>, String>,
+    result: Result<Usage, String>,
     at: i64,
 }
 
 #[derive(Clone, Default)]
 struct Slot {
+    plan: Option<String>,
+    cycle: Option<Cycle>,
+    note: Option<String>,
+    estimated: Vec<String>,
     meters: Option<Vec<Meter>>,
     error: Option<String>,
     updated: Option<i64>,
@@ -44,34 +58,55 @@ struct Slot {
 }
 
 struct App {
+    providers: Vec<Provider>,
     slots: HashMap<Provider, Slot>,
     rx: Receiver<Update>,
     refresh_tx: Sender<()>,
     interval: Duration,
+    opacity: u32,
+    /// Decimal places for percentages.
+    precision: usize,
+    config_error: Option<String>,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let interval = Duration::from_secs(60 * refresh_minutes());
+    fn new(cc: &eframe::CreationContext<'_>, config: Config, config_error: Option<String>) -> Self {
+        let providers: Vec<Provider> = Provider::ALL
+            .into_iter()
+            .filter(|p| config.enabled(*p))
+            .collect();
+        let interval = config.refresh_interval();
+        let opacity = config.opacity;
+        let precision = config.precision.min(3);
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
-        spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
+        spawn_worker(
+            cc.egui_ctx.clone(),
+            tx,
+            refresh_rx,
+            providers.clone(),
+            config,
+        );
 
-        let mut slots = HashMap::new();
-        for p in Provider::ALL {
-            slots.insert(
-                p,
-                Slot {
+        let slots = providers
+            .iter()
+            .map(|p| {
+                let slot = Slot {
                     loading: true,
                     ..Default::default()
-                },
-            );
-        }
+                };
+                (*p, slot)
+            })
+            .collect();
         Self {
+            providers,
             slots,
             rx,
             refresh_tx,
             interval,
+            opacity,
+            precision,
+            config_error,
         }
     }
 
@@ -88,8 +123,12 @@ impl App {
             slot.loading = false;
             slot.updated = Some(u.at);
             match u.result {
-                Ok(m) => {
-                    slot.meters = Some(m);
+                Ok(usage) => {
+                    slot.plan = usage.plan;
+                    slot.cycle = usage.cycle;
+                    slot.note = usage.note;
+                    slot.estimated = usage.estimated;
+                    slot.meters = Some(usage.meters);
                     slot.error = None;
                 }
                 Err(e) => slot.error = Some(e),
@@ -101,51 +140,48 @@ impl App {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
-    /// Sum of every dollar-denominated meter across providers.
+    /// Sum of the dollar-denominated meters across providers. None unless there
+    /// are several, since a single one would just repeat its own row.
     fn total(&self) -> Option<Meter> {
         let mut used = 0.0;
         let mut total = 0.0;
-        let mut any = false;
+        let mut count = 0;
         for slot in self.slots.values() {
             for m in slot.meters.iter().flatten() {
                 if m.unit == Unit::Dollars {
                     used += m.used;
                     total += m.total;
-                    any = true;
+                    count += 1;
                 }
             }
         }
-        any.then(|| Meter {
+        (count > 1).then(|| Meter {
             label: None,
             used,
             total,
             unit: Unit::Dollars,
+            resets_at: None,
         })
     }
-}
-
-fn refresh_minutes() -> u64 {
-    std::env::var("USAGE_WIDGET_REFRESH_MINS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|m| *m >= 1)
-        .unwrap_or(DEFAULT_REFRESH_MINS)
 }
 
 fn spawn_worker(
     ctx: egui::Context,
     tx: Sender<Update>,
     refresh_rx: Receiver<()>,
-    interval: Duration,
+    providers: Vec<Provider>,
+    config: Config,
 ) {
+    let interval = config.refresh_interval();
     std::thread::spawn(move || {
         loop {
             std::thread::scope(|s| {
-                for p in Provider::ALL {
+                for &p in &providers {
                     let tx = tx.clone();
                     let ctx = ctx.clone();
+                    let config = &config;
                     s.spawn(move || {
-                        let result = p.fetch();
+                        let result = p.fetch(config);
                         let _ = tx.send(Update {
                             provider: p,
                             result,
@@ -167,7 +203,7 @@ fn spawn_worker(
 /// Windows 11: round the window corners and drop the 1px accent border, so the
 /// frameless window looks like a floating card without needing transparency.
 #[cfg(windows)]
-fn apply_windows_chrome(frame: &eframe::Frame) {
+fn apply_windows_chrome(frame: &eframe::Frame, opacity: u32) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[link(name = "dwmapi")]
@@ -192,7 +228,7 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
         return;
     };
     let hwnd = win.hwnd.get();
-    set_opacity(hwnd);
+    set_opacity(hwnd, opacity);
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
@@ -210,7 +246,7 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
 }
 
 #[cfg(not(windows))]
-fn apply_windows_chrome(_frame: &eframe::Frame) {}
+fn apply_windows_chrome(_frame: &eframe::Frame, _opacity: u32) {}
 
 fn level_color(percent: f64) -> Color32 {
     if percent < 60.0 {
@@ -223,29 +259,37 @@ fn level_color(percent: f64) -> Color32 {
 }
 
 fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(3), TRACK);
+    painter.rect_filled(rect, CornerRadius::same(2), TRACK);
     if fraction > 0.0 {
         let mut fill = rect;
-        fill.set_width((rect.width() * fraction).max(6.0));
-        painter.rect_filled(fill, CornerRadius::same(3), color);
+        fill.set_width((rect.width() * fraction).max(4.0));
+        painter.rect_filled(fill, CornerRadius::same(2), color);
     }
 }
 
 /// "$523.54 / $1,000   52%" right-aligned, coloured by level.
-fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
+fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated: bool) {
     let pct = m.percent();
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if m.total > 0.0 {
-            ui.label(
-                RichText::new(format!("{pct:.0}%"))
+            let mark = if estimated { "~" } else { "" };
+            let resp = ui.label(
+                RichText::new(format!("{mark}{pct:.precision$}%"))
                     .size(size)
                     .strong()
                     .color(level_color(pct)),
             );
+            if estimated {
+                resp.on_hover_text(
+                    "Estimated: Codex reports whole percents, so the part of the next one \
+                     comes from this Mac's Codex token use. Codex cloud and other devices \
+                     aren't counted.",
+                );
+            }
             if m.unit != Unit::Percent {
-                ui.label(RichText::new(m.summary()).size(size).color(TEXT));
+                ui.label(RichText::new(m.summary()).size(size - 1.0).color(TEXT));
             }
         } else {
             ui.label(RichText::new("unlimited").size(size).color(MUTED));
@@ -253,54 +297,89 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
-fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
-    let single = slot
-        .meters
-        .as_ref()
-        .filter(|m| m.len() == 1 && m[0].label.is_none())
-        .map(|m| &m[0]);
-
-    ui.horizontal(|ui| {
+fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot, precision: usize) {
+    // A fixed-height, bottom-aligned row (`with_layout` would take all the height left).
+    let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.hyperlink_to(name, p.url()).on_hover_text(p.url());
+        let mut info: Vec<String> = slot.plan.iter().cloned().collect();
+        let mut hover = None;
+        if let Some(c) = &slot.cycle {
+            // A countdown, recomputed every frame so it stays right as time passes.
+            info.push(format!("{} {}", c.verb, until_short(c.at)));
+            hover = Some(format!("{} {}", c.verb, local_when(c.at)));
+        }
+        if !info.is_empty() {
+            let font = egui::FontId::proportional(10.0);
+            let galley = ui.painter().layout_no_wrap(info.join(" · "), font, META);
+            let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
+            // egui aligns text boxes, not baselines: bottom-aligned, the smaller text
+            // sits 1pt below the name's baseline (measured), so lift it by that.
+            ui.painter()
+                .galley(rect.min - Vec2::new(0.0, 1.0), galley, META);
+            if let Some(hover) = hover {
+                resp.on_hover_text(hover);
+            }
+        }
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
-        if let Some(m) = single {
-            amounts(ui, m, 12.0);
-        }
     });
+    ui.add_space(6.0);
 
-    match (single, &slot.meters, &slot.error) {
-        (Some(m), _, _) => {
-            if m.total > 0.0 {
-                bar(ui, m.fraction(), level_color(m.percent()));
-            }
-        }
-        (None, Some(meters), _) => {
-            for m in meters {
-                ui.horizontal(|ui| {
-                    if let Some(label) = &m.label {
-                        ui.label(RichText::new(label).size(11.0).color(MUTED));
-                    }
-                    amounts(ui, m, 12.0);
-                });
-                if m.total > 0.0 {
-                    bar(ui, m.fraction(), level_color(m.percent()));
+    match (&slot.meters, &slot.error) {
+        (Some(meters), _) => {
+            for (i, m) in meters.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(6.0);
                 }
+                let estimated = m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
+                meter_row(ui, m, precision, estimated);
             }
         }
-        (None, None, Some(err)) => {
+        (None, Some(err)) => {
             ui.label(RichText::new(err).size(10.5).color(ERR));
         }
-        (None, None, None) => {
+        (None, None) => {
             ui.label(RichText::new("loading…").size(10.5).color(MUTED));
         }
     }
     if slot.meters.is_some() {
+        if let Some(note) = &slot.note {
+            ui.add_space(5.0);
+            ui.label(RichText::new(note).size(10.0).color(META));
+        }
         if let Some(err) = &slot.error {
+            ui.add_space(5.0);
             ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
         }
+    }
+}
+
+/// Label, reset countdown and amount on one line, over a thin bar.
+fn meter_row(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
+    ui.horizontal(|ui| {
+        let size = Vec2::new(LABEL_COL, ui.spacing().interact_size.y);
+        ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+            ui.set_min_width(LABEL_COL);
+            if let Some(label) = &m.label {
+                ui.label(RichText::new(label).size(11.0).color(LABEL));
+            }
+        });
+        if let Some(ts) = m.resets_at {
+            ui.label(
+                RichText::new(format!("reset {}", until(ts)))
+                    .size(10.0)
+                    .color(META),
+            )
+            .on_hover_text(local_when(ts));
+        }
+        amounts(ui, m, 12.0, precision, estimated);
+    });
+    if m.total > 0.0 {
+        ui.add_space(2.0);
+        bar(ui, m.fraction(), level_color(m.percent()));
     }
 }
 
@@ -347,7 +426,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Cheap and idempotent; re-applied every frame because winit rewrites the
         // window styles whenever its own flags change (focus, level, visibility).
-        apply_windows_chrome(frame);
+        apply_windows_chrome(frame, self.opacity);
         self.drain();
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(Duration::from_secs(30));
@@ -357,6 +436,7 @@ impl eframe::App for App {
             .inner_margin(Margin::same(MARGIN));
 
         let mut refresh = false;
+        let mut edit_config = false;
         let mut quit = false;
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
@@ -371,7 +451,7 @@ impl eframe::App for App {
                     ui.close();
                 }
                 ui.separator();
-                for p in Provider::ALL {
+                for p in &self.providers {
                     if ui.button(format!("Open {} usage", p.name())).clicked() {
                         ctx.open_url(egui::OpenUrl::new_tab(p.url()));
                         ui.close();
@@ -386,26 +466,42 @@ impl eframe::App for App {
                     .size(10.0)
                     .color(MUTED),
                 );
+                if ui.button("Edit config").clicked() {
+                    edit_config = true;
+                    ui.close();
+                }
                 if ui.button("Quit").clicked() {
                     quit = true;
                     ui.close();
                 }
             });
 
-            ui.spacing_mut().item_spacing.y = 3.0;
+            // Vertical gaps are set explicitly so they can differ by role: tight within
+            // a meter, looser between meters, widest between services.
+            ui.spacing_mut().item_spacing.y = 0.0;
 
             // Wrap the content so its real height can be measured: the panel's own
             // min_rect is always expanded to fill the window.
             let content = ui.vertical(|ui| {
-                for (i, p) in Provider::ALL.iter().enumerate() {
+                for (i, p) in self.providers.iter().enumerate() {
                     if i > 0 {
-                        ui.add_space(5.0);
+                        ui.add_space(12.0);
                     }
                     let slot = self.slots.get(p).cloned().unwrap_or_default();
-                    provider_block(ui, *p, &slot);
+                    provider_block(ui, *p, &slot, self.precision);
+                }
+                if self.providers.is_empty() {
+                    ui.label(
+                        RichText::new("Every service is disabled in the config.")
+                            .size(10.5)
+                            .color(MUTED),
+                    );
+                }
+                if let Some(err) = &self.config_error {
+                    ui.label(RichText::new(err).size(10.0).color(ERR));
                 }
 
-                ui.add_space(4.0);
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if refresh_button(ui) {
                         refresh = true;
@@ -419,23 +515,27 @@ impl eframe::App for App {
                     if let Some(t) = self.total() {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let text = format!("${} / ${}", money(t.used), money(t.total));
-                            ui.label(RichText::new(text).size(10.5).color(TEXT))
-                                .on_hover_text("Total across all three");
+                            ui.label(RichText::new(text).size(10.0).color(MUTED))
+                                .on_hover_text("Total across services");
                         });
                     }
                 });
             });
 
-            // Grow or shrink the window to fit the content.
-            let wanted = content.response.rect.height() + 2.0 * MARGIN as f32;
-            let current = ctx.viewport_rect().height();
-            if (wanted - current).abs() > 1.5 {
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(WIDTH, wanted)));
+            // Grow or shrink the window to fit the content. Capped so a layout that
+            // feeds back on the window size can't exceed the GPU's surface limit.
+            let height = content.response.rect.height() + 2.0 * MARGIN as f32;
+            let wanted = Vec2::new(WIDTH, height.min(1200.0));
+            if (wanted - ctx.viewport_rect().size()).length() > 1.5 {
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(wanted));
             }
         });
 
         if refresh {
             self.refresh_now();
+        }
+        if edit_config && let Err(e) = config::open(false) {
+            self.config_error = Some(e);
         }
         if quit {
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -445,18 +545,28 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result {
     match std::env::args().nth(1).as_deref() {
+        Some("config") => {
+            return match config::open(true) {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    Ok(())
+                }
+                Err(e) => finish(Err(e)),
+            };
+        }
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
         Some(flag) => {
             return finish(Err(format!(
-                "unknown flag {flag}
+                "unknown argument {flag}
 
-usage: usage-widget [--startup | --no-startup]"
+usage: usage-widget [config | --startup | --no-startup]"
             )));
         }
         None => {}
     }
 
+    let (config, config_error) = config::load();
     let options = eframe::NativeOptions {
         persist_window: true,
         viewport: ViewportBuilder::default()
@@ -473,15 +583,14 @@ usage: usage-widget [--startup | --no-startup]"
     eframe::run_native(
         "usage-widget",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, config, config_error)))),
     )
 }
 
 /// Whole-window opacity through a layered window. Per-pixel transparency is not
 /// available with the OpenGL renderer on Windows, so this dims the whole card.
-/// `USAGE_WIDGET_OPACITY` (20-100) overrides the default.
 #[cfg(windows)]
-fn set_opacity(hwnd: isize) {
+fn set_opacity(hwnd: isize, percent: u32) {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
@@ -492,11 +601,7 @@ fn set_opacity(hwnd: isize) {
     const WS_EX_LAYERED: isize = 0x0008_0000;
     const LWA_ALPHA: u32 = 0x2;
 
-    let percent = std::env::var("USAGE_WIDGET_OPACITY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_OPACITY_PERCENT)
-        .clamp(20, 100);
+    let percent = percent.clamp(20, 100);
     if percent >= 100 {
         return;
     }

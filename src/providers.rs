@@ -1,8 +1,11 @@
 //! Fetches usage for each service using credentials already stored by the
-//! corresponding CLI (gh, Claude Code, Codex). Nothing is persisted here.
+//! corresponding CLI (gh, Claude Code, Codex). The only thing persisted is
+//! Claude's last API response, rate-limit backoff and renewal date (see `ClaudeState`).
 
-use crate::timeutil::now_unix;
+use crate::config::Config;
+use crate::timeutil::{age, now_unix, parse_rfc3339, until};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;
@@ -41,11 +44,11 @@ impl Provider {
         }
     }
 
-    pub fn fetch(self) -> Result<Vec<Meter>, String> {
+    pub fn fetch(self, config: &Config) -> Result<Usage, String> {
         match self {
             Provider::Copilot => copilot(),
-            Provider::Claude => claude(),
-            Provider::Codex => codex(),
+            Provider::Claude => claude(&config.claude),
+            Provider::Codex => codex(config.codex.estimate),
         }
     }
 }
@@ -58,6 +61,25 @@ pub enum Unit {
     Percent,
 }
 
+pub struct Usage {
+    /// Subscription name, e.g. "Max 5x" or "Enterprise".
+    pub plan: Option<String>,
+    /// When the plan renews or its quota resets.
+    pub cycle: Option<Cycle>,
+    /// Caveat about the data, e.g. that it is old because of rate limiting.
+    pub note: Option<String>,
+    /// Labels of meters whose values include a local estimate (see `estimate`).
+    pub estimated: Vec<String>,
+    pub meters: Vec<Meter>,
+}
+
+/// A billing-cycle boundary; `verb` is "renews", "resets" or "ends".
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Cycle {
+    pub verb: String,
+    pub at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Meter {
     /// Optional sub-label when a provider has more than one meter (e.g. "5h", "week").
@@ -65,6 +87,8 @@ pub struct Meter {
     pub used: f64,
     pub total: f64,
     pub unit: Unit,
+    /// Unix timestamp when a rolling window (5h, week) resets. Monthly spend leaves this unset.
+    pub resets_at: Option<i64>,
 }
 
 impl Meter {
@@ -124,18 +148,31 @@ fn agent() -> ureq::Agent {
 }
 
 fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), String> {
+    get_json_retry(url, headers).map(|(status, json, _)| (status, json))
+}
+
+/// Like `get_json`, plus the `Retry-After` seconds when the server sends them.
+fn get_json_retry(
+    url: &str,
+    headers: &[(&str, &str)],
+) -> Result<(u16, Value, Option<i64>), String> {
     let mut req = agent().get(url).header("Accept", "application/json");
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
     let mut resp = req.call().map_err(|e| format!("request failed: {e}"))?;
     let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok());
     let text = resp
         .body_mut()
         .read_to_string()
         .map_err(|e| format!("read failed: {e}"))?;
     let json = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
-    Ok((status, json))
+    Ok((status, json, retry_after))
 }
 
 fn home() -> Result<PathBuf, String> {
@@ -207,7 +244,7 @@ fn github_token() -> Result<String, String> {
     Ok(tok)
 }
 
-fn copilot() -> Result<Vec<Meter>, String> {
+fn copilot() -> Result<Usage, String> {
     let token = github_token()?;
     let auth = format!("token {token}");
     let (status, json) = get_json(
@@ -228,58 +265,399 @@ fn copilot() -> Result<Vec<Meter>, String> {
         return Err("no premium_interactions quota in response".into());
     }
 
+    let plan = copilot_plan(&json);
+    // Seats are billed to the org or enterprise; the monthly quota reset is the only date.
+    let cycle = json["quota_reset_date_utc"]
+        .as_str()
+        .and_then(parse_rfc3339)
+        .map(|at| Cycle {
+            verb: "resets".into(),
+            at,
+        });
+
     if snap["unlimited"].as_bool() == Some(true) {
-        return Ok(vec![Meter {
-            label: Some("unlimited".into()),
-            used: 0.0,
-            total: 0.0,
-            unit: Unit::Percent,
-        }]);
+        return Ok(Usage {
+            plan,
+            cycle,
+            note: None,
+            estimated: Vec::new(),
+            meters: vec![Meter {
+                label: Some("unlimited".into()),
+                used: 0.0,
+                total: 0.0,
+                unit: Unit::Percent,
+                resets_at: None,
+            }],
+        });
     }
 
     let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
     let used = f64_of(&snap["credits_used"])
         .or_else(|| f64_of(&snap["remaining"]).map(|r| total - r))
         .unwrap_or(0.0);
-    Ok(vec![Meter {
-        label: None,
-        used: used * COPILOT_USD_PER_CREDIT,
-        total: total * COPILOT_USD_PER_CREDIT,
-        unit: Unit::Dollars,
-    }])
+    Ok(Usage {
+        plan,
+        cycle,
+        note: None,
+        estimated: Vec::new(),
+        meters: vec![Meter {
+            label: None,
+            used: used * COPILOT_USD_PER_CREDIT,
+            total: total * COPILOT_USD_PER_CREDIT,
+            unit: Unit::Dollars,
+            resets_at: None,
+        }],
+    })
+}
+
+fn copilot_plan(json: &Value) -> Option<String> {
+    let sku = json["access_type_sku"].as_str().unwrap_or("");
+    Some(
+        match json["copilot_plan"].as_str().filter(|s| !s.is_empty())? {
+            "individual" if sku.contains("pro_plus") => "Pro+".into(),
+            "individual" if sku.contains("free") => "Free".into(),
+            "individual" => "Pro".into(),
+            other => title_case(other),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
-fn claude() -> Result<Vec<Meter>, String> {
+fn claude_credentials() -> Result<Value, String> {
     let path = home()?.join(".claude").join(".credentials.json");
-    let creds = read_json_file(&path)?;
-    let oauth = &creds["claudeAiOauth"];
-    let token = oauth["accessToken"]
-        .as_str()
-        .ok_or("no claudeAiOauth.accessToken; log in with `claude`")?;
-    if let Some(exp_ms) = i64_of(&oauth["expiresAt"]) {
-        if exp_ms / 1000 < now_unix() {
-            return Err("Claude token expired; run `claude` once to refresh".into());
+    #[cfg(target_os = "macos")]
+    if !path.exists() {
+        return claude_keychain_credentials();
+    }
+    read_json_file(&path)
+}
+
+/// Claude Code on macOS keeps its credentials in the login keychain, not on disk.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials() -> Result<Value, String> {
+    let out = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output()
+        .map_err(|e| format!("cannot run `security` ({e})"))?;
+    if !out.status.success() {
+        return Err("no Claude Code credentials in keychain; log in with `claude`".into());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("bad JSON in keychain entry: {e}"))
+}
+
+/// Anthropic gives each OAuth token only a handful of usage calls before
+/// answering 429 for up to an hour, and Claude Code spends the same budget.
+/// Claude Code caches its own responses in ~/.claude.json, so read that and call
+/// the API only when it is stale, and no more than once per this many seconds.
+const CLAUDE_FRESH_SECS: i64 = 15 * 60;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Snapshot {
+    at: i64,
+    usage: Value,
+}
+
+/// Our last API response, rate-limit backoff and renewal date, kept across restarts.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ClaudeState {
+    last: Option<Snapshot>,
+    last_attempt: i64,
+    blocked_until: i64,
+    /// The claude.ai renewal (`browser_cookies`) and when it was fetched.
+    renewal: Option<(i64, Cycle)>,
+    renewal_attempt: i64,
+}
+
+impl ClaudeState {
+    fn path() -> Option<PathBuf> {
+        dirs::cache_dir().map(|d| d.join("usage-widget").join("claude.json"))
+    }
+
+    fn load() -> Self {
+        Self::path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(bytes) = serde_json::to_vec(self) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+}
+
+/// Claude Code hands the statusline command live `rate_limits` taken from each
+/// response's headers; a statusline script can save that JSON here (see README).
+fn claude_statusline() -> Option<(i64, Value)> {
+    let path = home()
+        .ok()?
+        .join(".claude")
+        .join("usage-widget-statusline.json");
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let at = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let mut v = read_json_file(&path).ok()?;
+    let rate_limits = v["rate_limits"].take();
+    rate_limits.is_object().then_some((at, rate_limits))
+}
+
+/// Overwrites (or adds) the 5h and weekly meters from statusline `rate_limits`.
+fn apply_statusline(meters: &mut Vec<Meter>, rate_limits: &Value) {
+    for (i, (key, label)) in [("five_hour", "5h"), ("seven_day", "week")]
+        .into_iter()
+        .enumerate()
+    {
+        let w = &rate_limits[key];
+        let Some(used) = f64_of(&w["used_percentage"]) else {
+            continue;
+        };
+        // Seconds per the docs; tolerate milliseconds.
+        let resets_at =
+            i64_of(&w["resets_at"]).map(|t| if t > 100_000_000_000 { t / 1000 } else { t });
+        match meters
+            .iter_mut()
+            .find(|m| m.label.as_deref() == Some(label))
+        {
+            Some(m) => {
+                m.used = used;
+                m.resets_at = resets_at.or(m.resets_at);
+            }
+            None => meters.insert(
+                i.min(meters.len()),
+                Meter {
+                    label: Some(label.into()),
+                    used,
+                    total: 100.0,
+                    unit: Unit::Percent,
+                    resets_at,
+                },
+            ),
+        }
+    }
+}
+
+fn claude_should_call(api: bool, now: i64, newest: Option<i64>, state: &ClaudeState) -> bool {
+    let fresh = newest.is_some_and(|at| now - at < CLAUDE_FRESH_SECS);
+    api && !fresh && now >= state.blocked_until && now - state.last_attempt >= CLAUDE_FRESH_SECS
+}
+
+fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
+    let api = config.api;
+    let creds = claude_credentials();
+    let oauth = creds.as_ref().map(|c| &c["claudeAiOauth"]);
+    let cache = claude_code_cache();
+    let mut state = ClaudeState::load();
+    let now = now_unix();
+
+    let statusline = claude_statusline();
+    let newest = [&cache, &state.last]
+        .into_iter()
+        .flatten()
+        .map(|s| s.at)
+        .chain(statusline.as_ref().map(|(at, _)| *at))
+        .max();
+    let mut problem = None;
+    if claude_should_call(api, now, newest, &state) {
+        state.last_attempt = now;
+        match claude_api(oauth) {
+            Ok(usage) => state.last = Some(Snapshot { at: now, usage }),
+            Err(ClaudeError::RateLimited(retry_after)) => {
+                state.blocked_until = now + retry_after.max(CLAUDE_FRESH_SECS);
+            }
+            Err(ClaudeError::Other(e)) => problem = Some(e),
+        }
+        state.save();
+    }
+
+    let mut renewal_problem = None;
+    if config.browser_cookies {
+        // Fetch daily and again once the saved date has passed; after a failure retry
+        // at most hourly, so a denied keychain prompt doesn't return every refresh.
+        let due = state
+            .renewal
+            .as_ref()
+            .is_none_or(|(fetched, c)| now - fetched >= 86_400 || now >= c.at);
+        if due && now - state.renewal_attempt >= 3600 {
+            state.renewal_attempt = now;
+            match crate::claude_web::cycle() {
+                Ok(c) => state.renewal = Some((now, c)),
+                Err(e) => renewal_problem = Some(e),
+            }
+            state.save();
         }
     }
 
+    let rate_limited = now < state.blocked_until;
+    let snap = [cache, state.last]
+        .into_iter()
+        .flatten()
+        .max_by_key(|s| s.at);
+    let mut meters = snap
+        .as_ref()
+        .map(|s| claude_meters(&s.usage))
+        .unwrap_or_default();
+    let mut data_at = snap.as_ref().map(|s| s.at);
+    // Live 5h/weekly numbers from the statusline beat an older full response.
+    if let Some((at, rate_limits)) = statusline
+        && data_at.is_none_or(|d| at > d)
+    {
+        apply_statusline(&mut meters, &rate_limits);
+        data_at = Some(at);
+    }
+    let Some(data_at) = data_at.filter(|_| !meters.is_empty()) else {
+        return Err(if rate_limited {
+            format!(
+                "Claude rate limited; retrying in {}",
+                until(state.blocked_until)
+            )
+        } else {
+            problem.unwrap_or_else(|| "no Claude usage cached yet; open Claude Code".into())
+        });
+    };
+
+    // Claude reports whole percents; estimate the part of the next one from local use.
+    let mut estimated = Vec::new();
+    if config.estimate {
+        let plan = oauth.ok().and_then(claude_plan).unwrap_or_default();
+        // Rounded: statusline figures carry float noise (55.00000000000001).
+        let readings: Vec<(String, f64, i64)> = meters
+            .iter()
+            .filter(|m| {
+                m.unit == Unit::Percent && matches!(m.label.as_deref(), Some("5h" | "week"))
+            })
+            .filter_map(|m| Some((m.label.clone()?, m.used.round(), m.resets_at?)))
+            .collect();
+        let refs: Vec<(&str, f64, i64)> = readings
+            .iter()
+            .map(|(label, pct, window)| (label.as_str(), *pct, *window))
+            .collect();
+        let fractions = crate::claude_estimate::fractions(&refs, data_at, &plan);
+        for ((label, pct, _), fraction) in readings.iter().zip(fractions) {
+            if let Some(fraction) = fraction
+                && let Some(m) = meters.iter_mut().find(|m| m.label.as_ref() == Some(label))
+            {
+                m.used = pct + fraction;
+                estimated.push(label.clone());
+            }
+        }
+    }
+
+    let note = (now - data_at >= CLAUDE_FRESH_SECS).then(|| {
+        let mut note = format!("{} old", age(data_at));
+        if rate_limited {
+            note += &format!(" · rate limited · retry {}", until(state.blocked_until));
+        } else if let Some(p) = problem {
+            note += &format!(" · {p}");
+        }
+        note
+    });
+    let cycle = state
+        .renewal
+        .filter(|_| config.browser_cookies)
+        .map(|(_, c)| c);
+    // Say why the renewal date is missing, but only when there is none to show.
+    let note = match renewal_problem.filter(|_| cycle.is_none()) {
+        Some(e) => Some(note.map_or(format!("renewal: {e}"), |n| format!("{n} · renewal: {e}"))),
+        None => note,
+    };
+    Ok(Usage {
+        plan: oauth.ok().and_then(claude_plan),
+        cycle,
+        note,
+        estimated,
+        meters,
+    })
+}
+
+/// Claude Code keeps its latest /api/oauth/usage response in ~/.claude.json.
+fn claude_code_cache() -> Option<Snapshot> {
+    let v = read_json_file(&home().ok()?.join(".claude.json")).ok()?;
+    let c = &v["cachedUsageUtilization"];
+    // Ignore a cache left behind by another account.
+    let owner = v["oauthAccount"]["accountUuid"].as_str();
+    if owner.is_some() && c["accountUuid"].as_str() != owner {
+        return None;
+    }
+    Some(Snapshot {
+        at: i64_of(&c["fetchedAtMs"])? / 1000,
+        usage: c["utilization"].clone(),
+    })
+}
+
+enum ClaudeError {
+    /// Seconds from `Retry-After`, 0 when absent.
+    RateLimited(i64),
+    Other(String),
+}
+
+fn claude_api(oauth: Result<&Value, &String>) -> Result<Value, ClaudeError> {
+    use ClaudeError::Other;
+    let oauth = oauth.map_err(|e| Other(e.clone()))?;
+    let token = oauth["accessToken"]
+        .as_str()
+        .ok_or_else(|| Other("no claudeAiOauth.accessToken; log in with `claude`".into()))?;
+    if i64_of(&oauth["expiresAt"]).is_some_and(|ms| ms / 1000 < now_unix()) {
+        return Err(Other(
+            "Claude token expired; run `claude` once to refresh".into(),
+        ));
+    }
+
     let auth = format!("Bearer {token}");
-    let (status, json) = get_json(
+    let (status, json, retry_after) = get_json_retry(
         "https://api.anthropic.com/api/oauth/usage",
         &[
             ("Authorization", &auth),
             ("anthropic-beta", "oauth-2025-04-20"),
         ],
-    )?;
+    )
+    .map_err(Other)?;
     match status {
-        200 => {}
-        401 | 403 => return Err("Claude token rejected; run `claude` once to refresh".into()),
-        s => return Err(format!("Anthropic returned HTTP {s}")),
+        200 => Ok(json),
+        401 | 403 => Err(Other(
+            "Claude token rejected; run `claude` once to refresh".into(),
+        )),
+        429 => Err(ClaudeError::RateLimited(retry_after.unwrap_or(0))),
+        s => Err(Other(format!("Anthropic returned HTTP {s}"))),
     }
+}
 
+fn claude_plan(oauth: &Value) -> Option<String> {
+    let name = title_case(
+        oauth["subscriptionType"]
+            .as_str()
+            .filter(|s| !s.is_empty())?,
+    );
+    // rateLimitTier looks like "default_claude_max_5x"; keep the "5x".
+    let tier = oauth["rateLimitTier"]
+        .as_str()
+        .and_then(|t| t.rsplit('_').next())
+        .filter(|t| {
+            t.strip_suffix('x')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        });
+    Some(match tier {
+        Some(t) => format!("{name} {t}"),
+        None => name,
+    })
+}
+
+fn claude_meters(json: &Value) -> Vec<Meter> {
     let mut meters = Vec::new();
     for (key, label) in [
         ("five_hour", "5h"),
@@ -294,8 +672,33 @@ fn claude() -> Result<Vec<Meter>, String> {
                 used: util,
                 total: 100.0,
                 unit: Unit::Percent,
+                resets_at: w["resets_at"].as_str().and_then(parse_rfc3339),
             });
         }
+    }
+
+    // Per-model weekly caps (e.g. Fable) are only reported in `limits`.
+    for l in json["limits"].as_array().into_iter().flatten() {
+        if l["kind"].as_str() != Some("weekly_scoped") {
+            continue;
+        }
+        let (Some(model), Some(pct)) = (
+            l["scope"]["model"]["display_name"].as_str(),
+            f64_of(&l["percent"]),
+        ) else {
+            continue;
+        };
+        let label = format!("{} wk", model.to_lowercase());
+        if meters.iter().any(|m| m.label.as_deref() == Some(&label)) {
+            continue;
+        }
+        meters.push(Meter {
+            label: Some(label),
+            used: pct,
+            total: 100.0,
+            unit: Unit::Percent,
+            resets_at: l["resets_at"].as_str().and_then(parse_rfc3339),
+        });
     }
 
     // Spend against a monthly credit cap (enterprise / extra usage).
@@ -318,6 +721,7 @@ fn claude() -> Result<Vec<Meter>, String> {
             used: used_minor as f64 / div,
             total: limit_minor as f64 / div,
             unit: Unit::Dollars,
+            resets_at: None,
         });
     } else {
         let extra = &json["extra_usage"];
@@ -330,21 +734,18 @@ fn claude() -> Result<Vec<Meter>, String> {
                 used: used / 100.0,
                 total: limit / 100.0,
                 unit: Unit::Dollars,
+                resets_at: None,
             });
         }
     }
-
-    if meters.is_empty() {
-        return Err("no usage windows in response".into());
-    }
-    Ok(meters)
+    meters
 }
 
 // ---------------------------------------------------------------------------
 // Codex (Codex CLI ChatGPT token)
 // ---------------------------------------------------------------------------
 
-fn codex() -> Result<Vec<Meter>, String> {
+fn codex(estimate: bool) -> Result<Usage, String> {
     let path = home()?.join(".codex").join("auth.json");
     let auth_file = read_json_file(&path)?;
     let tokens = &auth_file["tokens"];
@@ -370,6 +771,82 @@ fn codex() -> Result<Vec<Meter>, String> {
         s => return Err(format!("OpenAI returned HTTP {s}")),
     }
 
+    let plan = codex_plan(&json);
+    let cycle = codex_cycle(&headers, account_id);
+    let mut meters = codex_meters(&json);
+    if meters.is_empty() {
+        if json["credits"]["unlimited"].as_bool() == Some(true) {
+            return Ok(Usage {
+                plan,
+                cycle,
+                note: None,
+                estimated: Vec::new(),
+                meters: vec![Meter {
+                    label: Some("unlimited".into()),
+                    used: 0.0,
+                    total: 0.0,
+                    unit: Unit::Percent,
+                    resets_at: None,
+                }],
+            });
+        }
+        return Err("no rate limit or spend data in response".into());
+    }
+
+    // Codex reports whole percents; estimate the part of the next one from local use.
+    let mut estimated = Vec::new();
+    if estimate {
+        let plan_type = json["plan_type"].as_str().unwrap_or_default();
+        if let Some(week) = meters
+            .iter_mut()
+            .find(|m| m.label.as_deref() == Some("week") && m.unit == Unit::Percent)
+            && let Some(window) = week.resets_at
+            && let Some(fraction) = crate::codex_estimate::fraction(week.used, window, plan_type)
+        {
+            week.used += fraction;
+            estimated.extend(week.label.clone());
+        }
+    }
+    Ok(Usage {
+        plan,
+        cycle,
+        note: None,
+        estimated,
+        meters,
+    })
+}
+
+/// When the ChatGPT plan renews, or ends once cancelled, from the subscription record.
+fn codex_cycle(headers: &[(&str, &str)], account_id: &str) -> Option<Cycle> {
+    if account_id.is_empty() {
+        return None;
+    }
+    let url = format!("https://chatgpt.com/backend-api/subscriptions?account_id={account_id}");
+    let (200, sub) = get_json(&url, headers).ok()? else {
+        return None;
+    };
+    let at = sub["active_until"].as_str().and_then(parse_rfc3339)?;
+    let verb = if sub["will_renew"].as_bool() == Some(false) {
+        "ends"
+    } else {
+        "renews"
+    };
+    Some(Cycle {
+        verb: verb.into(),
+        at,
+    })
+}
+
+fn codex_plan(json: &Value) -> Option<String> {
+    Some(
+        match json["plan_type"].as_str().filter(|s| !s.is_empty())? {
+            "prolite" => "Pro Lite".into(),
+            other => title_case(other),
+        },
+    )
+}
+
+fn codex_meters(json: &Value) -> Vec<Meter> {
     let mut meters = Vec::new();
 
     let rl = &json["rate_limit"];
@@ -384,6 +861,8 @@ fn codex() -> Result<Vec<Meter>, String> {
                 used: pct,
                 total: 100.0,
                 unit: Unit::Percent,
+                resets_at: i64_of(&w["reset_at"])
+                    .or_else(|| i64_of(&w["reset_after_seconds"]).map(|s| now_unix() + s)),
             });
         }
     }
@@ -399,21 +878,10 @@ fn codex() -> Result<Vec<Meter>, String> {
             used: used * CODEX_USD_PER_CREDIT,
             total: limit * CODEX_USD_PER_CREDIT,
             unit: Unit::Dollars,
+            resets_at: None,
         });
     }
-
-    if meters.is_empty() {
-        if json["credits"]["unlimited"].as_bool() == Some(true) {
-            return Ok(vec![Meter {
-                label: Some("unlimited".into()),
-                used: 0.0,
-                total: 0.0,
-                unit: Unit::Percent,
-            }]);
-        }
-        return Err("no rate limit or spend data in response".into());
-    }
-    Ok(meters)
+    meters
 }
 
 fn window_label(secs: i64) -> String {
@@ -424,6 +892,21 @@ fn window_label(secs: i64) -> String {
     } else {
         format!("{}h", (secs + 1799) / 3600)
     }
+}
+
+/// "max" -> "Max", "business_plus" -> "Business Plus".
+fn title_case(s: &str) -> String {
+    s.split(['_', ' '])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect::<String>())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -439,5 +922,176 @@ mod tests {
         assert_eq!(money(12_345.5), "12,345.50");
         assert_eq!(window_label(18_000), "5h");
         assert_eq!(window_label(604_800), "week");
+    }
+
+    fn labels(meters: &[Meter]) -> Vec<(&str, f64, Option<i64>)> {
+        meters
+            .iter()
+            .map(|m| (m.label.as_deref().unwrap_or(""), m.used, m.resets_at))
+            .collect()
+    }
+
+    #[test]
+    fn claude_windows_and_scoped_caps() {
+        let json = serde_json::json!({
+            "five_hour": { "utilization": 0.0, "resets_at": "2026-09-11T13:40:00.838217+00:00" },
+            "seven_day": { "utilization": 53.0, "resets_at": "2026-09-15T20:00:00.838238+00:00" },
+            "seven_day_opus": null,
+            "extra_usage": { "monthly_limit": null, "used_credits": null },
+            "limits": [
+                { "kind": "session", "percent": 0, "scope": null },
+                { "kind": "weekly_all", "percent": 53, "scope": null },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 100,
+                    "resets_at": "2026-09-15T19:59:59.838420+00:00",
+                    "scope": { "model": { "display_name": "Fable" }, "surface": null }
+                }
+            ],
+            "spend": { "used": { "amount_minor": 0, "exponent": 2 }, "limit": null }
+        });
+        assert_eq!(
+            labels(&claude_meters(&json)),
+            [
+                ("5h", 0.0, Some(1_789_134_000)),
+                ("week", 53.0, Some(1_789_502_400)),
+                ("fable wk", 100.0, Some(1_789_502_399)),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_weekly_only() {
+        let json = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 65,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 346322,
+                    "reset_at": 1789462965
+                },
+                "secondary_window": null
+            },
+            "spend_control": { "individual_limit": null }
+        });
+        assert_eq!(
+            labels(&codex_meters(&json)),
+            [("week", 65.0, Some(1_789_462_965))]
+        );
+    }
+
+    /// Extraction keeps whatever precision a service sends; rounding happens only
+    /// when the widget formats the number.
+    #[test]
+    fn fractional_percents_survive_extraction() {
+        use serde_json::json;
+        let codex = codex_meters(&json!({
+            "rate_limit": { "primary_window": { "used_percent": 71.37, "limit_window_seconds": 604800 } }
+        }));
+        assert_eq!(codex[0].used, 71.37);
+
+        let mut claude = claude_meters(&json!({ "five_hour": { "utilization": 33.25 } }));
+        assert_eq!(claude[0].used, 33.25);
+        apply_statusline(
+            &mut claude,
+            &json!({ "five_hour": { "used_percentage": 12.34 } }),
+        );
+        assert_eq!(claude[0].used, 12.34);
+    }
+
+    #[test]
+    fn statusline_overrides_windows() {
+        use serde_json::json;
+        let mut meters = claude_meters(&json!({
+            "five_hour": { "utilization": 3.0, "resets_at": "2026-09-11T13:40:00Z" },
+            "seven_day": { "utilization": 53.0, "resets_at": "2026-09-15T20:00:00Z" },
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 100,
+                "scope": { "model": { "display_name": "Fable" } }
+            }]
+        }));
+        apply_statusline(
+            &mut meters,
+            &json!({
+                "five_hour": { "used_percentage": 41.5, "resets_at": 1_789_134_000 },
+                "seven_day": { "used_percentage": 60, "resets_at": 1_789_502_400_000_i64 }
+            }),
+        );
+        assert_eq!(
+            labels(&meters),
+            [
+                ("5h", 41.5, Some(1_789_134_000)),
+                ("week", 60.0, Some(1_789_502_400)),
+                ("fable wk", 100.0, None),
+            ]
+        );
+
+        let mut only = Vec::new();
+        apply_statusline(&mut only, &json!({ "seven_day": { "used_percentage": 7 } }));
+        assert_eq!(labels(&only), [("week", 7.0, None)]);
+    }
+
+    #[test]
+    fn claude_call_gating() {
+        let now = 1_000_000;
+        let idle = ClaudeState::default();
+        assert!(!claude_should_call(true, now, Some(now - 60), &idle));
+        assert!(claude_should_call(
+            true,
+            now,
+            Some(now - CLAUDE_FRESH_SECS),
+            &idle
+        ));
+        assert!(claude_should_call(true, now, None, &idle));
+        assert!(!claude_should_call(false, now, None, &idle));
+        let blocked = ClaudeState {
+            blocked_until: now + 60,
+            ..Default::default()
+        };
+        assert!(!claude_should_call(true, now, None, &blocked));
+        let recent = ClaudeState {
+            last_attempt: now - 60,
+            ..Default::default()
+        };
+        assert!(!claude_should_call(true, now, None, &recent));
+    }
+
+    #[test]
+    fn plan_names() {
+        use serde_json::json;
+        let claude = |sub: &str, tier: &str| {
+            claude_plan(&json!({ "subscriptionType": sub, "rateLimitTier": tier }))
+        };
+        assert_eq!(
+            claude("max", "default_claude_max_5x").as_deref(),
+            Some("Max 5x")
+        );
+        assert_eq!(
+            claude("max", "default_claude_max_20x").as_deref(),
+            Some("Max 20x")
+        );
+        assert_eq!(claude("pro", "default_claude_ai").as_deref(), Some("Pro"));
+        assert_eq!(claude("", "").as_deref(), None);
+
+        let copilot = |plan: &str, sku: &str| {
+            copilot_plan(&json!({ "copilot_plan": plan, "access_type_sku": sku }))
+        };
+        assert_eq!(
+            copilot("enterprise", "copilot_enterprise_seat_quota").as_deref(),
+            Some("Enterprise")
+        );
+        assert_eq!(
+            copilot("individual", "copilot_pro_plus_monthly").as_deref(),
+            Some("Pro+")
+        );
+        assert_eq!(
+            copilot("individual", "monthly_subscriber").as_deref(),
+            Some("Pro")
+        );
+
+        let codex = |plan: &str| codex_plan(&json!({ "plan_type": plan }));
+        assert_eq!(codex("prolite").as_deref(), Some("Pro Lite"));
+        assert_eq!(codex("plus").as_deref(), Some("Plus"));
     }
 }
