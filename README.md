@@ -4,7 +4,7 @@ A small always-on-top desktop widget (Rust, egui) that shows how much of your
 GitHub Copilot, Claude and Codex allowance you have used, in dollars. It
 refreshes every five minutes and can be dragged anywhere on screen.
 
-<img width="259" height="154" alt="image" src="https://github.com/user-attachments/assets/ac0edb40-1ca3-4d8f-a7e0-10053e63bff0" />
+<img width="323" height="237" alt="image" src="https://github.com/user-attachments/assets/29bc8928-0440-46c9-98d3-0cd0231311bb" />
 
 
 Credit-to-dollar rates live at the top of `src/providers.rs`:
