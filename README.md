@@ -1,10 +1,8 @@
 # usage-widget
 
-Always-on-top desktop widget (Rust, egui) for GitHub Copilot, Claude and Codex usage.
+Always-on-top widget for GitHub Copilot, Claude and Codex usage, plans and renewals.
 
 <img width="323" height="237" alt="image" src="https://github.com/user-attachments/assets/29bc8928-0440-46c9-98d3-0cd0231311bb" />
-
-Shows plans, renewal countdowns, usage windows and dollar spend.
 
 ## Install
 
@@ -16,7 +14,23 @@ usage-widget --startup   # start at login; --no-startup undoes
 usage-widget
 ```
 
-Re-run `cargo install` to upgrade.
+Re-run `cargo install` and restart the widget to upgrade.
+
+## Claude Code setup
+
+**Live Claude 5-hour and weekly usage requires a Claude Code status line that saves
+its input for the widget.** Add this at the start of your status line script:
+
+```bash
+INPUT=$(cat)
+case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-statusline.json;; esac
+```
+
+Use `$INPUT` for the rest of the script; stdin has already been read. The file updates
+while you use Claude Code, with no extra API requests.
+
+Without this setup, the widget falls back to cached usage and API requests at most
+every 15 minutes; rate limits can leave the numbers stale.
 
 ## Use
 
@@ -42,7 +56,7 @@ enabled = true      # false hides a service; same key under each
 enabled = true
 api = true          # false = read Claude Code's cache only
 browser_cookies = false  # macOS: read the claude.ai login cookie for the renewal date
-estimate = false    # guess the fraction of the next percent from local token logs, shown with ~
+estimate = false    # estimate between percentage ticks from local logs; shown with ~
 
 [codex]
 enabled = true
@@ -53,23 +67,14 @@ estimate = false    # as for Claude
 
 Reuses the CLIs' stored credentials; never writes them.
 
-| Service | Credential | Endpoints |
-| --- | --- | --- |
-| Copilot | `gh auth token`, `GITHUB_TOKEN` or `GH_TOKEN` | `api.github.com/copilot_internal/user` |
-| Claude | `~/.claude/.credentials.json` (macOS: keychain) | `api.anthropic.com/api/oauth/usage` |
-| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage`, `/subscriptions` |
+| Service | Credential |
+| --- | --- |
+| Copilot | `gh auth token`, `GITHUB_TOKEN` or `GH_TOKEN` |
+| Claude | `~/.claude/.credentials.json` (macOS: keychain) |
+| Codex | `~/.codex/auth.json` |
 
-Claude reads Claude Code's cache first and calls the API at most every 15 minutes,
-honouring rate-limit delays; old data shows its age. For live 5h/weekly numbers with no extra requests, add this to your Claude Code
-statusline script:
+Run `claude` or `codex` to refresh expired tokens. API endpoints are undocumented.
 
-```bash
-INPUT=$(cat)
-case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-statusline.json;; esac
-```
-
-Estimates can't see usage outside the local logs (cloud, claude.ai, other devices), and
-Claude's needs a few percentage ticks to calibrate. The renewal cookie is read from
-Chrome, Arc, Brave or Edge once a day; macOS asks once for keychain access. Expired
-token? Run `claude` or `codex` once. Endpoints are undocumented and may change. Dollar
-rates: `src/providers.rs`.
+Estimates only cover local logs; Claude needs a few percentage ticks to calibrate.
+Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,
+with a keychain access prompt on first use. Dollar rates: `src/providers.rs`.
