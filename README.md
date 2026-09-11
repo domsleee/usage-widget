@@ -4,15 +4,8 @@ A small always-on-top desktop widget (Rust, egui) that shows how much of your
 GitHub Copilot, Claude and Codex allowance you have used, in dollars. It
 refreshes every five minutes and can be dragged anywhere on screen.
 
-```
-Copilot         $626.37 / $1,000  63%
-[===========--------]
-Claude          $526.73 / $1,000  53%
-[==========---------]
-Codex             $459.88 / $500  92%
-[==================-]
-(o) updated just now        $1,615.31 / $2,500
-```
+<img width="259" height="154" alt="image" src="https://github.com/user-attachments/assets/ac0edb40-1ca3-4d8f-a7e0-10053e63bff0" />
+
 
 Credit-to-dollar rates live at the top of `src/providers.rs`:
 Copilot 50,000 credits = $500, Codex 12,500 credits = $500. Claude reports
