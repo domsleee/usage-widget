@@ -27,8 +27,8 @@ const MARGIN: i8 = 12;
 /// Width of the meter-label column, so every reset countdown starts at the same x.
 const LABEL_COL: f32 = 50.0;
 
-// The window is opaque and painted entirely in BG; Windows rounds the corners
-// at the compositor level (see `apply_windows_chrome`), so nothing else shows.
+// The window is painted entirely in BG; Windows rounds the corners at the
+// compositor level (see `apply_window_style`), so nothing else shows.
 const BG: Color32 = Color32::from_rgb(24, 26, 32);
 const TEXT: Color32 = Color32::from_gray(232);
 /// Meter labels ("5h", "week").
@@ -201,9 +201,9 @@ fn spawn_worker(
 }
 
 /// Windows 11: round the window corners and drop the 1px accent border, so the
-/// frameless window looks like a floating card without needing transparency.
+/// frameless window looks like a floating card, and apply the opacity.
 #[cfg(windows)]
-fn apply_windows_chrome(frame: &eframe::Frame, opacity: u32) {
+fn apply_window_style(frame: &eframe::Frame, opacity: u32) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[link(name = "dwmapi")]
@@ -245,8 +245,34 @@ fn apply_windows_chrome(frame: &eframe::Frame, opacity: u32) {
     }
 }
 
-#[cfg(not(windows))]
-fn apply_windows_chrome(_frame: &eframe::Frame, _opacity: u32) {}
+/// macOS: whole-window opacity through the NSWindow's alpha, matching the layered
+/// window on Windows.
+#[cfg(target_os = "macos")]
+fn apply_window_style(frame: &eframe::Frame, opacity: u32) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    let alpha = f64::from(opacity.clamp(20, 100)) / 100.0;
+    // SAFETY: `ns_view` is the live NSView eframe draws into, and `ui` runs on the
+    // main thread, where AppKit calls belong.
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        if !window.is_null() {
+            let _: () = msg_send![window, setAlphaValue: alpha];
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn apply_window_style(_frame: &eframe::Frame, _opacity: u32) {}
 
 fn level_color(percent: f64) -> Color32 {
     if percent < 60.0 {
@@ -426,7 +452,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Cheap and idempotent; re-applied every frame because winit rewrites the
         // window styles whenever its own flags change (focus, level, visibility).
-        apply_windows_chrome(frame, self.opacity);
+        apply_window_style(frame, self.opacity);
         self.drain();
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(Duration::from_secs(30));

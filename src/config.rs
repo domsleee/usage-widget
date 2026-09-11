@@ -11,7 +11,7 @@ const TEMPLATE: &str = r#"# usage-widget settings. Restart the widget after edit
 # Minutes between refreshes (minimum 1).
 refresh_mins = 5
 
-# Window opacity in percent, 20-100. Windows only.
+# Window opacity in percent, 20-100.
 opacity = 85
 
 # Decimal places for percentages, 0-3. The services currently report whole

@@ -24,5 +24,6 @@ strip = true
 [target.'cfg(target_os = "macos")'.dependencies]
 aes = "0.8"
 cbc = "0.1"
+objc2 = "0.6"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 sha1 = "0.10"

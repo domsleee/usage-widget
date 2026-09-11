@@ -3760,6 +3760,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "objc2 0.6.4",
  "pbkdf2",
  "raw-window-handle",
  "serde",
