@@ -27,8 +27,8 @@ const MARGIN: i8 = 12;
 /// Width of the meter-label column, so every reset countdown starts at the same x.
 const LABEL_COL: f32 = 50.0;
 
-// The window is painted entirely in BG; Windows rounds the corners at the
-// compositor level (see `apply_window_style`), so nothing else shows.
+// Windows rounds the opaque window at the compositor level; macOS uses a
+// rounded panel over a transparent window.
 const BG: Color32 = Color32::from_rgb(24, 26, 32);
 const TEXT: Color32 = Color32::from_gray(232);
 /// Meter labels ("5h", "week").
@@ -446,7 +446,11 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        BG.to_normalized_gamma_f32()
+        if cfg!(target_os = "macos") {
+            Color32::TRANSPARENT.to_normalized_gamma_f32()
+        } else {
+            BG.to_normalized_gamma_f32()
+        }
     }
 
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -459,6 +463,7 @@ impl eframe::App for App {
 
         let panel = egui::Frame::NONE
             .fill(BG)
+            .corner_radius(if cfg!(target_os = "macos") { 8 } else { 0 })
             .inner_margin(Margin::same(MARGIN));
 
         let mut refresh = false;
@@ -601,6 +606,7 @@ usage: usage-widget [config | --startup | --no-startup]"
             .with_inner_size([WIDTH, 180.0])
             .with_min_inner_size([WIDTH, 60.0])
             .with_decorations(false)
+            .with_transparent(cfg!(target_os = "macos"))
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false),

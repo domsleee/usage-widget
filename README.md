@@ -2,35 +2,21 @@
 
 Always-on-top widget for GitHub Copilot, Claude and Codex usage, plans and renewals.
 
-<img width="270" height="220" alt="Usage widget showing Claude and Codex plans, renewal dates, usage bars and reset countdowns" src="docs/usage-widget.png" />
+| Windows · dollar usage | macOS · usage windows |
+| --- | --- |
+| <img width="323" height="237" alt="Windows widget showing Copilot, Claude and Codex dollar usage and a combined total" src="docs/usage-widget-windows.png" /> | <img width="270" height="220" alt="macOS widget showing Claude and Codex plans, renewal dates, usage bars and reset countdowns" src="docs/usage-widget.png" /> |
 
 ## Install
 
 Needs Rust. Built for Windows; runs on macOS without `--startup`.
 
-```
+```bash
 cargo install --git https://github.com/pepsi-enjoyer/usage-widget
 usage-widget --startup   # start at login; --no-startup undoes
 usage-widget
 ```
 
 Re-run `cargo install` and restart the widget to upgrade.
-
-## Claude Code setup
-
-**Live Claude 5-hour and weekly usage requires a Claude Code status line that saves
-its input for the widget.** Add this at the start of your status line script:
-
-```bash
-INPUT=$(cat)
-case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-statusline.json;; esac
-```
-
-Use `$INPUT` for the rest of the script; stdin has already been read. The file updates
-while you use Claude Code, with no extra API requests.
-
-Without this setup, the widget falls back to cached usage and API requests at most
-every 15 minutes; rate limits can leave the numbers stale.
 
 ## Use
 
@@ -74,6 +60,20 @@ Reuses the CLIs' stored credentials; never writes them.
 | Codex | `~/.codex/auth.json` |
 
 Run `claude` or `codex` to refresh expired tokens. API endpoints are undocumented.
+
+### Claude Code status line
+
+For live Claude 5-hour and weekly usage, the widget needs your Claude Code status
+line to save its input. Add these lines to the start of your status line script,
+then use `$INPUT` wherever the script previously read stdin:
+
+```bash
+INPUT=$(cat)
+case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-statusline.json;; esac
+```
+
+This updates usage as you use Claude Code, without extra requests. Without it,
+the widget uses cached data and polls at most every 15 minutes, subject to rate limits.
 
 Estimates only cover local logs; Claude needs a few percentage ticks to calibrate.
 Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,
