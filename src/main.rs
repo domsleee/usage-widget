@@ -444,6 +444,19 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
+    match std::env::args().nth(1).as_deref() {
+        Some("--startup") => return finish(set_run_at_login(true)),
+        Some("--no-startup") => return finish(set_run_at_login(false)),
+        Some(flag) => {
+            return finish(Err(format!(
+                "unknown flag {flag}
+
+usage: usage-widget [--startup | --no-startup]"
+            )));
+        }
+        None => {}
+    }
+
     let options = eframe::NativeOptions {
         persist_window: true,
         viewport: ViewportBuilder::default()
@@ -453,6 +466,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size([WIDTH, 60.0])
             .with_decorations(false)
             .with_always_on_top()
+            .with_taskbar(false)
             .with_resizable(false),
         ..Default::default()
     };
@@ -494,4 +508,88 @@ fn set_opacity(hwnd: isize) {
             SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
         }
     }
+}
+
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Registers (or removes) this exe in the per-user Run key so it starts at login.
+#[cfg(windows)]
+fn set_run_at_login(enable: bool) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("reg");
+    if enable {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = exe.display().to_string();
+        let value = if exe.contains(' ') {
+            format!("\"{exe}\"")
+        } else {
+            exe
+        };
+        cmd.args([
+            "add",
+            RUN_KEY,
+            "/v",
+            "usage-widget",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &value,
+            "/f",
+        ]);
+    } else {
+        cmd.args(["delete", RUN_KEY, "/v", "usage-widget", "/f"]);
+    }
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not run reg.exe: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !enable && err.contains("unable to find") {
+            return Ok("usage-widget was not registered to run at login.".into());
+        }
+        return Err(format!("reg.exe failed: {err}"));
+    }
+    Ok(if enable {
+        "usage-widget will start at login.\n\nRun `usage-widget --no-startup` to undo.".into()
+    } else {
+        "usage-widget will no longer start at login.".into()
+    })
+}
+
+#[cfg(not(windows))]
+fn set_run_at_login(_enable: bool) -> Result<String, String> {
+    Err("--startup is only supported on Windows".into())
+}
+
+/// Reports a flag's outcome. Release builds have no console, so use a message box on Windows.
+fn finish(result: Result<String, String>) -> eframe::Result {
+    let (text, is_err) = match &result {
+        Ok(msg) => (msg.clone(), false),
+        Err(msg) => (msg.clone(), true),
+    };
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
+        }
+        let wide = |s: &str| {
+            s.encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let text_w = wide(&text);
+        let caption_w = wide("usage-widget");
+        let icon = if is_err { 0x10 } else { 0x40 }; // MB_ICONERROR / MB_ICONINFORMATION
+        unsafe {
+            MessageBoxW(0, text_w.as_ptr(), caption_w.as_ptr(), icon);
+        }
+    }
+    if is_err {
+        eprintln!("{text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
 }

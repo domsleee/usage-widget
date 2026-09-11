@@ -16,6 +16,5 @@ base64 = "0.22"
 raw-window-handle = "0.6"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
 strip = true

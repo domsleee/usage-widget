@@ -34,15 +34,23 @@ Running `claude` or `codex` once refreshes it.
 These endpoints are the same ones the CLIs and web settings pages use. They are not
 formally documented and may change.
 
-## Build and run
+## Install
+
+Needs a Rust toolchain (https://rustup.rs). Windows only.
 
 ```
-cargo build --release
-target\release\usage-widget.exe
+cargo install --git https://github.com/pepsi-enjoyer/usage-widget
+usage-widget --startup
+usage-widget
 ```
 
-`install.ps1` builds the release binary and drops a shortcut into your Startup folder
-so the widget appears at login.
+`--startup` registers the exe in your per-user Run key so it launches at login;
+`--no-startup` removes it. The widget stays out of the taskbar and Alt-Tab, so quit
+it from its right-click menu.
+
+To upgrade, run the `cargo install` line again and restart the widget.
+
+From a clone, `install.ps1` does the same three steps using the local checkout.
 
 ## Using it
 
