@@ -6,12 +6,12 @@ refreshes every five minutes and can be dragged anywhere on screen.
 
 ```
 Copilot         $626.37 / $1,000  63%
-[===========--------]  resets in 19d 19h
+[===========--------]
 Claude          $526.73 / $1,000  53%
 [==========---------]
 Codex             $459.88 / $500  92%
-[==================-]  resets in 19d 19h
-(o) updated just now   $1,613 / $2,500  65%
+[==================-]
+(o) updated just now        $1,615.31 / $2,500
 ```
 
 Credit-to-dollar rates live at the top of `src/providers.rs`:
@@ -30,7 +30,7 @@ No logins of its own. It reuses credentials the CLIs already store locally:
 
 What is shown depends on the plan:
 
-- Copilot: premium request credits used / entitlement, and the monthly reset.
+- Copilot: premium request credits used / entitlement.
 - Claude: 5-hour and 7-day windows when the plan has them, plus monthly spend against the cap when present.
 - Codex: 5-hour and weekly rate-limit windows when present, plus the workspace spend limit when present.
 
@@ -57,3 +57,4 @@ so the widget appears at login.
 - Right-click for refresh, links to each service's usage page, and Quit.
 - Click a service name to open its usage page.
 - Set `USAGE_WIDGET_REFRESH_MINS` to change the refresh interval (default 5).
+- Set `USAGE_WIDGET_OPACITY` (20-100) to change the window opacity (default 85).

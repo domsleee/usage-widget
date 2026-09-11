@@ -1,7 +1,7 @@
 //! Fetches usage for each service using credentials already stored by the
 //! corresponding CLI (gh, Claude Code, Codex). Nothing is persisted here.
 
-use crate::timeutil::{now_unix, parse_date, parse_rfc3339};
+use crate::timeutil::now_unix;
 use base64::Engine;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -65,8 +65,6 @@ pub struct Meter {
     pub used: f64,
     pub total: f64,
     pub unit: Unit,
-    /// Unix timestamp when this meter resets, if known.
-    pub resets_at: Option<i64>,
 }
 
 impl Meter {
@@ -229,10 +227,6 @@ fn copilot() -> Result<Vec<Meter>, String> {
     if snap.is_null() {
         return Err("no premium_interactions quota in response".into());
     }
-    let resets_at = json["quota_reset_date_utc"]
-        .as_str()
-        .and_then(parse_rfc3339)
-        .or_else(|| json["quota_reset_date"].as_str().and_then(parse_date));
 
     if snap["unlimited"].as_bool() == Some(true) {
         return Ok(vec![Meter {
@@ -240,7 +234,6 @@ fn copilot() -> Result<Vec<Meter>, String> {
             used: 0.0,
             total: 0.0,
             unit: Unit::Percent,
-            resets_at,
         }]);
     }
 
@@ -253,7 +246,6 @@ fn copilot() -> Result<Vec<Meter>, String> {
         used: used * COPILOT_USD_PER_CREDIT,
         total: total * COPILOT_USD_PER_CREDIT,
         unit: Unit::Dollars,
-        resets_at,
     }])
 }
 
@@ -302,7 +294,6 @@ fn claude() -> Result<Vec<Meter>, String> {
                 used: util,
                 total: 100.0,
                 unit: Unit::Percent,
-                resets_at: w["resets_at"].as_str().and_then(parse_rfc3339),
             });
         }
     }
@@ -327,7 +318,6 @@ fn claude() -> Result<Vec<Meter>, String> {
             used: used_minor as f64 / div,
             total: limit_minor as f64 / div,
             unit: Unit::Dollars,
-            resets_at: None,
         });
     } else {
         let extra = &json["extra_usage"];
@@ -340,7 +330,6 @@ fn claude() -> Result<Vec<Meter>, String> {
                 used: used / 100.0,
                 total: limit / 100.0,
                 unit: Unit::Dollars,
-                resets_at: None,
             });
         }
     }
@@ -395,7 +384,6 @@ fn codex() -> Result<Vec<Meter>, String> {
                 used: pct,
                 total: 100.0,
                 unit: Unit::Percent,
-                resets_at: i64_of(&w["reset_at"]),
             });
         }
     }
@@ -411,7 +399,6 @@ fn codex() -> Result<Vec<Meter>, String> {
             used: used * CODEX_USD_PER_CREDIT,
             total: limit * CODEX_USD_PER_CREDIT,
             unit: Unit::Dollars,
-            resets_at: i64_of(&lim["reset_at"]),
         });
     }
 
@@ -422,7 +409,6 @@ fn codex() -> Result<Vec<Meter>, String> {
                 used: 0.0,
                 total: 0.0,
                 unit: Unit::Percent,
-                resets_at: None,
             }]);
         }
         return Err("no rate limit or spend data in response".into());

@@ -14,11 +14,12 @@ use providers::{Meter, Provider, Unit, money};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, now_unix, until};
+use timeutil::{ago, now_unix};
 
 const WIDTH: f32 = 250.0;
 const MARGIN: i8 = 12;
 const DEFAULT_REFRESH_MINS: u64 = 5;
+const DEFAULT_OPACITY_PERCENT: u32 = 85;
 
 // The window is opaque and painted entirely in BG; Windows rounds the corners
 // at the compositor level (see `apply_windows_chrome`), so nothing else shows.
@@ -47,7 +48,6 @@ struct App {
     rx: Receiver<Update>,
     refresh_tx: Sender<()>,
     interval: Duration,
-    chrome_applied: bool,
 }
 
 impl App {
@@ -72,7 +72,6 @@ impl App {
             rx,
             refresh_tx,
             interval,
-            chrome_applied: false,
         }
     }
 
@@ -121,7 +120,6 @@ impl App {
             used,
             total,
             unit: Unit::Dollars,
-            resets_at: None,
         })
     }
 }
@@ -194,6 +192,7 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
         return;
     };
     let hwnd = win.hwnd.get();
+    set_opacity(hwnd);
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
@@ -254,16 +253,6 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
-fn resets_line(ui: &mut egui::Ui, m: &Meter) {
-    if let Some(ts) = m.resets_at {
-        ui.label(
-            RichText::new(format!("resets {}", until(ts)))
-                .size(10.0)
-                .color(MUTED),
-        );
-    }
-}
-
 fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
     let single = slot
         .meters
@@ -287,7 +276,6 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
             if m.total > 0.0 {
                 bar(ui, m.fraction(), level_color(m.percent()));
             }
-            resets_line(ui, m);
         }
         (None, Some(meters), _) => {
             for m in meters {
@@ -300,7 +288,6 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
                 if m.total > 0.0 {
                     bar(ui, m.fraction(), level_color(m.percent()));
                 }
-                resets_line(ui, m);
             }
         }
         (None, None, Some(err)) => {
@@ -358,10 +345,9 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
-        if !self.chrome_applied {
-            apply_windows_chrome(frame);
-            self.chrome_applied = true;
-        }
+        // Cheap and idempotent; re-applied every frame because winit rewrites the
+        // window styles whenever its own flags change (focus, level, visibility).
+        apply_windows_chrome(frame);
         self.drain();
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(Duration::from_secs(30));
@@ -475,4 +461,37 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+/// Whole-window opacity through a layered window. Per-pixel transparency is not
+/// available with the OpenGL renderer on Windows, so this dims the whole card.
+/// `USAGE_WIDGET_OPACITY` (20-100) overrides the default.
+#[cfg(windows)]
+fn set_opacity(hwnd: isize) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+        fn SetLayeredWindowAttributes(hwnd: isize, key: u32, alpha: u8, flags: u32) -> i32;
+    }
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_LAYERED: isize = 0x0008_0000;
+    const LWA_ALPHA: u32 = 0x2;
+
+    let percent = std::env::var("USAGE_WIDGET_OPACITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_OPACITY_PERCENT)
+        .clamp(20, 100);
+    if percent >= 100 {
+        return;
+    }
+    let alpha = (percent * 255 / 100) as u8;
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex & WS_EX_LAYERED == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+            SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+        }
+    }
 }
