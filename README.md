@@ -4,9 +4,7 @@ Always-on-top desktop widget (Rust, egui) for GitHub Copilot, Claude and Codex u
 
 <img width="323" height="237" alt="image" src="https://github.com/user-attachments/assets/29bc8928-0440-46c9-98d3-0cd0231311bb" />
 
-Per service: plan, countdown to renewal or quota reset, rolling windows (5h, week,
-per-model caps) with reset countdowns (hover either for the local time), and spend in
-dollars.
+Shows plans, renewal countdowns, usage windows and dollar spend.
 
 ## Install
 
@@ -18,7 +16,7 @@ usage-widget --startup   # start at login; --no-startup undoes
 usage-widget
 ```
 
-Re-run `cargo install` to upgrade. `install.ps1` does the same from a clone.
+Re-run `cargo install` to upgrade.
 
 ## Use
 
@@ -28,32 +26,32 @@ Re-run `cargo install` to upgrade. `install.ps1` does the same from a clone.
 
 ## Config
 
-`usage-widget config` creates and opens `config.toml` (in `$VISUAL`/`$EDITOR` if set).
-It lives in `%APPDATA%\usage-widget\` on Windows and
-`~/Library/Application Support/usage-widget/` on macOS. Restart the widget after editing.
+`usage-widget config` creates and opens `config.toml` (in `$VISUAL`/`$EDITOR` if set):
+`%APPDATA%\usage-widget\` on Windows, `~/Library/Application Support/usage-widget/` on
+macOS. Restart the widget after editing.
 
 ```toml
 refresh_mins = 5    # minutes between refreshes, minimum 1
-opacity = 85        # window opacity 20-100, Windows only
+opacity = 85        # 20-100, Windows only
 precision = 1       # decimal places for percentages, 0-3
 
 [copilot]
-enabled = true      # false hides the service; same for [claude] and [codex]
+enabled = true      # false hides a service; same key under each
 
 [claude]
 enabled = true
-api = true          # false = only read Claude Code's cache, never call Anthropic
-browser_cookies = false  # macOS: read your claude.ai login from Chrome/Arc/Brave/Edge for the renewal day
-estimate = false    # estimate the part of the next percent from local token use
+api = true          # false = read Claude Code's cache only
+browser_cookies = false  # macOS: read the claude.ai login cookie for the renewal date
+estimate = false    # guess the fraction of the next percent from local token logs, shown with ~
 
 [codex]
 enabled = true
-estimate = false    # estimate the part of the next percent from local token use
+estimate = false    # as for Claude
 ```
 
 ## Credentials
 
-Reuses what the CLIs already store; never writes them.
+Reuses the CLIs' stored credentials; never writes them.
 
 | Service | Credential | Endpoints |
 | --- | --- | --- |
@@ -61,30 +59,17 @@ Reuses what the CLIs already store; never writes them.
 | Claude | `~/.claude/.credentials.json` (macOS: keychain) | `api.anthropic.com/api/oauth/usage` |
 | Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage`, `/subscriptions` |
 
-Claude's usage endpoint allows each token only a few calls before a 429 of up to an
-hour, so the widget reads the copy Claude Code caches in `~/.claude.json` and calls
-the API only when that is over 15 minutes old, at most every 15 minutes, honouring
-`Retry-After`. Old data is labelled with its age.
-
-For live Claude 5h/weekly numbers, have your Claude Code statusline script save its
-input (it carries `rate_limits` from every response, so no extra requests):
+Claude reads Claude Code's cache first and calls the API at most every 15 minutes,
+honouring rate-limit delays; old data shows its age. For live 5h/weekly numbers with no extra requests, add this to your Claude Code
+statusline script:
 
 ```bash
 INPUT=$(cat)
 case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-statusline.json;; esac
 ```
 
-Codex and Claude report whole percents. With `estimate = true` their windows get an
-estimated fraction, marked `~`: each refresh the widget reads what the local logs gained
-(Codex CLI's `~/.codex/sessions`, Claude Code's `~/.claude/projects`), prices those
-tokens (Codex's credit rate card, Anthropic's relative model prices), and divides the
-cost since the last whole-percent tick by what a point has cost in that window. Codex
-logs carry the percent with every response; for Claude the widget learns it from its own
-readings, so its estimate needs a few ticks to warm up. Use the logs never see (Codex
-cloud, claude.ai, other devices) makes the decimals a guess.
-
-Copilot shows its monthly quota reset. Claude's renewal date is only served to claude.ai
-browser sessions, so it needs `claude.browser_cookies = true`: the widget then decrypts
-the claude.ai session cookie from Chrome, Arc, Brave or Edge (macOS asks once for
-keychain access) and asks claude.ai once a day. Token expired? Run `claude` or `codex` once. Endpoints are
-undocumented and may change. Dollar rates live in `src/providers.rs`.
+Estimates can't see usage outside the local logs (cloud, claude.ai, other devices), and
+Claude's needs a few percentage ticks to calibrate. The renewal cookie is read from
+Chrome, Arc, Brave or Edge once a day; macOS asks once for keychain access. Expired
+token? Run `claude` or `codex` once. Endpoints are undocumented and may change. Dollar
+rates: `src/providers.rs`.
