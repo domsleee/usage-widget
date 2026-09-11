@@ -20,12 +20,16 @@ use providers::{Cycle, Meter, Provider, Unit, Usage, money};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, local_when, now_unix, until, until_short};
+use timeutil::{ago, local_when, now_unix, resets, until_short};
 
 const WIDTH: f32 = 270.0;
 const MARGIN: i8 = 12;
-/// Width of the meter-label column, so every reset countdown starts at the same x.
-const LABEL_COL: f32 = 50.0;
+/// Width of the meter-label column, so every reset time starts at the same x.
+const LABEL_COL: f32 = 36.0;
+/// Gap between usage windows shown side by side.
+const CELL_GAP: f32 = 6.0;
+/// Width of the percentage column on spend rows, so the amounts line up.
+const PCT_COL: f32 = 46.0;
 
 // Windows rounds the opaque window at the compositor level; macOS uses a
 // rounded panel over a transparent window.
@@ -295,24 +299,27 @@ fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
     }
 }
 
+const ESTIMATE_HOVER: &str = "Estimated: Codex reports whole percents, so the part of the next one \
+     comes from this Mac's Codex token use. Codex cloud and other devices \
+     aren't counted.";
+
+/// The percentage, coloured by level, with "~" when it includes a local estimate.
+fn percent_text(m: &Meter, size: f32, precision: usize, estimated: bool) -> RichText {
+    let pct = m.percent();
+    let mark = if estimated { "~" } else { "" };
+    RichText::new(format!("{mark}{pct:.precision$}%"))
+        .size(size)
+        .strong()
+        .color(level_color(pct))
+}
+
 /// "$523.54 / $1,000   52%" right-aligned, coloured by level.
 fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated: bool) {
-    let pct = m.percent();
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if m.total > 0.0 {
-            let mark = if estimated { "~" } else { "" };
-            let resp = ui.label(
-                RichText::new(format!("{mark}{pct:.precision$}%"))
-                    .size(size)
-                    .strong()
-                    .color(level_color(pct)),
-            );
+            let resp = ui.label(percent_text(m, size, precision, estimated));
             if estimated {
-                resp.on_hover_text(
-                    "Estimated: Codex reports whole percents, so the part of the next one \
-                     comes from this Mac's Codex token use. Codex cloud and other devices \
-                     aren't counted.",
-                );
+                resp.on_hover_text(ESTIMATE_HOVER);
             }
             if m.unit != Unit::Percent {
                 ui.label(RichText::new(m.summary()).size(size - 1.0).color(TEXT));
@@ -323,7 +330,144 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated:
     });
 }
 
+/// The meter of a service that only reports spend with no sub-label (Copilot, or
+/// Claude and Codex on usage-based plans).
+fn spend_only(slot: &Slot) -> Option<&Meter> {
+    match slot.meters.as_deref() {
+        Some([m]) if m.unit == Unit::Dollars && m.label.is_none() && m.total > 0.0 => Some(m),
+        _ => None,
+    }
+}
+
 fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot, precision: usize) {
+    if let Some(m) = spend_only(slot) {
+        spend_row(ui, p, slot, m, precision);
+    } else {
+        header(ui, p, slot);
+        ui.add_space(6.0);
+        match (&slot.meters, &slot.error) {
+            (Some(meters), _) => meters_block(ui, meters, slot, precision),
+            (None, Some(err)) => {
+                ui.label(RichText::new(err).size(10.5).color(ERR));
+            }
+            (None, None) => {
+                ui.label(RichText::new("loading…").size(10.5).color(MUTED));
+            }
+        }
+    }
+    if slot.meters.is_some() {
+        if let Some(note) = &slot.note {
+            ui.add_space(5.0);
+            ui.label(RichText::new(note).size(10.0).color(META));
+        }
+        if let Some(err) = &slot.error {
+            ui.add_space(5.0);
+            ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
+        }
+    }
+}
+
+/// Name, amount and percentage on one line over one bar, as in the original
+/// widget. The plan and billing cycle move to the name's hover text.
+fn spend_row(ui: &mut egui::Ui, p: Provider, slot: &Slot, m: &Meter, precision: usize) {
+    let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
+        let mut hover: Vec<String> = slot.plan.iter().cloned().collect();
+        if let Some(c) = &slot.cycle {
+            hover.push(format!("{} {}", c.verb, local_when(c.at)));
+        }
+        hover.push(p.url().into());
+        let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
+        ui.hyperlink_to(name, p.url())
+            .on_hover_text(hover.join("\n"));
+        if slot.loading {
+            ui.add(egui::Spinner::new().size(10.0).color(MUTED));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let col = Vec2::new(PCT_COL, row.y);
+            ui.allocate_ui_with_layout(col, Layout::right_to_left(Align::Center), |ui| {
+                ui.label(percent_text(m, 11.0, precision, false));
+            });
+            ui.label(RichText::new(m.summary()).size(11.0).color(TEXT));
+        });
+    });
+    ui.add_space(3.0);
+    bar(ui, m.fraction(), level_color(m.percent()));
+}
+
+/// Several usage windows sit side by side, each with its reset on its label line.
+/// A lone window, spend and "unlimited" get a full-width row.
+fn meters_block(ui: &mut egui::Ui, meters: &[Meter], slot: &Slot, precision: usize) {
+    let estimated = |m: &Meter| m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
+    let is_window = |m: &Meter| m.unit == Unit::Percent && m.total > 0.0;
+    let windows: Vec<&Meter> = meters.iter().filter(|m| is_window(m)).collect();
+    let side_by_side = windows.len() > 1;
+    // Two or four windows split into pairs; otherwise rows of three.
+    let cols = if matches!(windows.len(), 2 | 4) { 2 } else { 3 };
+
+    let mut blocks = 0;
+    if side_by_side {
+        for chunk in windows.chunks(cols) {
+            if blocks > 0 {
+                ui.add_space(6.0);
+            }
+            blocks += 1;
+            window_cells(ui, chunk, cols, precision, &estimated);
+        }
+    }
+    for m in meters.iter().filter(|m| !(side_by_side && is_window(m))) {
+        if blocks > 0 {
+            ui.add_space(6.0);
+        }
+        blocks += 1;
+        meter_row(ui, m, precision, estimated(m));
+    }
+}
+
+fn window_cells(
+    ui: &mut egui::Ui,
+    windows: &[&Meter],
+    cols: usize,
+    precision: usize,
+    estimated: &dyn Fn(&Meter) -> bool,
+) {
+    let width = (ui.available_width() - CELL_GAP * (cols - 1) as f32) / cols as f32;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = CELL_GAP;
+        for m in windows {
+            ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(width);
+                window_cell(ui, m, precision, estimated(m));
+            });
+        }
+    });
+}
+
+/// Label and reset time on one line, then the bar and percentage.
+fn window_cell(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
+    let line = Vec2::new(ui.available_width(), 12.0);
+    ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Max), |ui| {
+        if let Some(label) = &m.label {
+            ui.label(RichText::new(label).size(9.5).color(LABEL));
+        }
+        if let Some(ts) = m.resets_at {
+            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
+                ui.label(RichText::new(resets(ts)).size(9.0).color(META))
+                    .on_hover_text(local_when(ts));
+            });
+        }
+    });
+    ui.add_space(3.0);
+    bar(ui, m.fraction(), level_color(m.percent()));
+    ui.add_space(3.0);
+    let resp = ui.label(percent_text(m, 12.0, precision, estimated));
+    if estimated {
+        resp.on_hover_text(ESTIMATE_HOVER);
+    }
+}
+
+/// Service name, then plan and billing cycle in small text.
+fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
     // A fixed-height, bottom-aligned row (`with_layout` would take all the height left).
     let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
@@ -352,38 +496,9 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot, precision: usize)
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
     });
-    ui.add_space(6.0);
-
-    match (&slot.meters, &slot.error) {
-        (Some(meters), _) => {
-            for (i, m) in meters.iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(6.0);
-                }
-                let estimated = m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
-                meter_row(ui, m, precision, estimated);
-            }
-        }
-        (None, Some(err)) => {
-            ui.label(RichText::new(err).size(10.5).color(ERR));
-        }
-        (None, None) => {
-            ui.label(RichText::new("loading…").size(10.5).color(MUTED));
-        }
-    }
-    if slot.meters.is_some() {
-        if let Some(note) = &slot.note {
-            ui.add_space(5.0);
-            ui.label(RichText::new(note).size(10.0).color(META));
-        }
-        if let Some(err) = &slot.error {
-            ui.add_space(5.0);
-            ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
-        }
-    }
 }
 
-/// Label, reset countdown and amount on one line, over a thin bar.
+/// Label, reset time and amount on one line, over a thin bar.
 fn meter_row(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
     ui.horizontal(|ui| {
         let size = Vec2::new(LABEL_COL, ui.spacing().interact_size.y);
@@ -394,17 +509,13 @@ fn meter_row(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
             }
         });
         if let Some(ts) = m.resets_at {
-            ui.label(
-                RichText::new(format!("reset {}", until(ts)))
-                    .size(10.0)
-                    .color(META),
-            )
-            .on_hover_text(local_when(ts));
+            ui.label(RichText::new(resets(ts)).size(9.5).color(META))
+                .on_hover_text(local_when(ts));
         }
         amounts(ui, m, 12.0, precision, estimated);
     });
     if m.total > 0.0 {
-        ui.add_space(2.0);
+        ui.add_space(3.0);
         bar(ui, m.fraction(), level_color(m.percent()));
     }
 }
@@ -515,10 +626,15 @@ impl eframe::App for App {
             // min_rect is always expanded to fill the window.
             let content = ui.vertical(|ui| {
                 for (i, p) in self.providers.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(12.0);
-                    }
                     let slot = self.slots.get(p).cloned().unwrap_or_default();
+                    if i > 0 {
+                        // One-line spend rows stack a little tighter, as in the original.
+                        ui.add_space(if spend_only(&slot).is_some() {
+                            10.0
+                        } else {
+                            12.0
+                        });
+                    }
                     provider_block(ui, *p, &slot, self.precision);
                 }
                 if self.providers.is_empty() {

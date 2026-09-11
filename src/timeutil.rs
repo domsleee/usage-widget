@@ -19,7 +19,10 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
 
 /// Remaining time until a timestamp: "3d 4h", "4h 11m", "12m" or "now".
 pub fn until(ts: i64) -> String {
-    let diff = ts - now_unix();
+    countdown(ts - now_unix())
+}
+
+fn countdown(diff: i64) -> String {
     if diff <= 0 {
         return "now".into();
     }
@@ -75,6 +78,30 @@ where
     format!("{day} {time}")
 }
 
+/// When a usage window resets: a countdown within a day ("2h 10m"), otherwise the
+/// local weekday and 24-hour time ("Tue 19:01", "Wed 6:00").
+pub fn resets(ts: i64) -> String {
+    match Local
+        .timestamp_opt((ts + 30).div_euclid(60) * 60, 0)
+        .single()
+    {
+        Some(t) => reset_label(ts - now_unix(), &t),
+        None => until(ts),
+    }
+}
+
+fn reset_label<Tz: TimeZone>(secs: i64, t: &DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if secs < 86_400 {
+        countdown(secs)
+    } else {
+        // No leading zero on the hour: side-by-side windows have little room.
+        t.format("%a %-H:%M").to_string()
+    }
+}
+
 /// Coarse remaining time for long spans like a billing cycle: "11d", "7h", "12m"
 /// or "now". Rounds down, so it never promises more time than is left.
 pub fn until_short(ts: i64) -> String {
@@ -127,6 +154,24 @@ mod tests {
         assert_eq!(when(&at("2026-09-11T20:00:00Z"), today), "tomorrow 6am");
         assert_eq!(when(&at("2026-09-15T20:00:00Z"), today), "Wednesday 6am");
         assert_eq!(when(&at("2026-09-19T02:00:00Z"), today), "Sat 19 Sep 12pm");
+    }
+
+    #[test]
+    fn reset_labels() {
+        let tz = FixedOffset::east_opt(10 * 3600).unwrap();
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&tz);
+        // Within a day: a countdown.
+        assert_eq!(
+            reset_label(2 * 3600 + 10 * 60, &at("2026-09-11T07:01:00Z")),
+            "2h 10m"
+        );
+        assert_eq!(reset_label(12 * 60, &at("2026-09-11T05:03:00Z")), "12m");
+        // Further out: the weekday and 24-hour time.
+        assert_eq!(
+            reset_label(4 * 86_400 + 8 * 3600, &at("2026-09-15T09:01:00Z")),
+            "Tue 19:01"
+        );
+        assert_eq!(reset_label(86_400, &at("2026-09-11T22:00:00Z")), "Sat 8:00");
     }
 
     #[test]

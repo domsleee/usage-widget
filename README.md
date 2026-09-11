@@ -2,9 +2,9 @@
 
 Always-on-top widget for GitHub Copilot, Claude and Codex usage, plans and renewals.
 
-| Windows · dollar usage | macOS · usage windows |
+| Dollar budgets | Plan usage windows |
 | --- | --- |
-| <img width="323" height="237" alt="Windows widget showing Copilot, Claude and Codex dollar usage and a combined total" src="docs/usage-widget-windows.png" /> | <img width="270" height="220" alt="macOS widget showing Claude and Codex plans, renewal dates, usage bars and reset countdowns" src="docs/usage-widget.png" /> |
+| <img width="270" height="147" alt="Widget showing Copilot, Claude and Codex spend against their budgets, one line each, with a combined total" src="docs/usage-widget-dollars.png" /> | <img width="270" height="173" alt="Widget showing Claude and Codex plans with renewal dates, usage windows side by side and reset times" src="docs/usage-widget.png" /> |
 
 ## Install
 
