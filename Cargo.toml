@@ -21,6 +21,9 @@ toml = "1.1.6"
 lto = "thin"
 strip = true
 
+[target.'cfg(windows)'.dependencies]
+winit = "0.30"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 aes = "0.8"
 cbc = "0.1"

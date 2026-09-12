@@ -24,7 +24,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 use timeutil::{ago, local_when, now_unix, resets, until_short};
 
-const WIDTH: f32 = 270.0;
+const WIDTH: f32 = if cfg!(windows) { 320.0 } else { 270.0 };
 const MARGIN: i8 = 12;
 /// Width of the meter-label column, so every reset time starts at the same x.
 const LABEL_COL: f32 = 36.0;
@@ -81,6 +81,17 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, config: Config, config_error: Option<String>) -> Self {
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowExtWindows;
+            // egui enables this for frameless windows; winit reserves a visible
+            // 1px strip at the top to draw it, even with the DWM border disabled.
+            if let Some(window) = cc.winit_window() {
+                window.set_undecorated_shadow(false);
+            }
+            configure_windows_fonts(&cc.egui_ctx);
+        }
+
         let providers: Vec<Provider> = Provider::ALL
             .into_iter()
             .filter(|p| config.enabled(*p))
@@ -219,7 +230,7 @@ fn spawn_worker(
     });
 }
 
-/// Windows 11: round the window corners and drop the 1px accent border, so the
+/// Windows 11: round the window corners and drop the accent border, so the
 /// frameless window looks like a floating card, and apply the opacity.
 #[cfg(windows)]
 fn apply_window_style(frame: &eframe::Frame, opacity: u32) {
@@ -262,6 +273,43 @@ fn apply_window_style(frame: &eframe::Frame, opacity: u32) {
             4,
         );
     }
+}
+
+#[cfg(windows)]
+fn configure_windows_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::{FontTweak, HintingTarget, SmoothHinting};
+
+    let Some(windows) = std::env::var_os("WINDIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&windows)
+        .join("Fonts")
+        .join("segoeui.ttf");
+    let Ok(data) = std::fs::read(path) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    let font = egui::FontData::from_owned(data).tweak(FontTweak {
+        hinting: Some(true),
+        hinting_target: HintingTarget::Smooth(SmoothHinting {
+            symmetric_rendering: false,
+            preserve_linear_metrics: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    fonts.font_data.insert("Segoe UI".into(), font.into());
+    fonts
+        .families
+        .get_mut(&egui::FontFamily::Proportional)
+        .unwrap()
+        .insert(0, "Segoe UI".into());
+    ctx.set_fonts(fonts);
+}
+
+fn text_size(size: f32) -> f32 {
+    // Keep supporting text legible on Windows displays running at 100% scaling.
+    if cfg!(windows) { size.max(11.0) } else { size }
 }
 
 /// macOS: whole-window opacity through the NSWindow's alpha, matching the layered
@@ -323,7 +371,7 @@ fn percent_text(m: &Meter, size: f32, precision: usize, estimated: bool) -> Rich
     let pct = m.percent();
     let mark = if estimated { "~" } else { "" };
     RichText::new(format!("{mark}{pct:.precision$}%"))
-        .size(size)
+        .size(text_size(size))
         .strong()
         .color(level_color(pct))
 }
@@ -337,10 +385,18 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated:
                 resp.on_hover_text(ESTIMATE_HOVER);
             }
             if m.unit != Unit::Percent {
-                ui.label(RichText::new(m.summary()).size(size - 1.0).color(TEXT));
+                ui.label(
+                    RichText::new(m.summary())
+                        .size(text_size(size - 1.0))
+                        .color(TEXT),
+                );
             }
         } else {
-            ui.label(RichText::new("unlimited").size(size).color(MUTED));
+            ui.label(
+                RichText::new("unlimited")
+                    .size(text_size(size))
+                    .color(MUTED),
+            );
         }
     });
 }
@@ -363,21 +419,25 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot, precision: usize)
         match (&slot.meters, &slot.error) {
             (Some(meters), _) => meters_block(ui, meters, slot, precision),
             (None, Some(err)) => {
-                ui.label(RichText::new(err).size(10.5).color(ERR));
+                ui.label(RichText::new(err).size(text_size(10.5)).color(ERR));
             }
             (None, None) => {
-                ui.label(RichText::new("loading…").size(10.5).color(MUTED));
+                ui.label(RichText::new("loading…").size(text_size(10.5)).color(MUTED));
             }
         }
     }
     if slot.meters.is_some() {
         if let Some(note) = &slot.note {
             ui.add_space(5.0);
-            ui.label(RichText::new(note).size(10.0).color(META));
+            ui.label(RichText::new(note).size(text_size(10.0)).color(META));
         }
         if let Some(err) = &slot.error {
             ui.add_space(5.0);
-            ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
+            ui.label(
+                RichText::new(format!("stale: {err}"))
+                    .size(text_size(10.0))
+                    .color(ERR),
+            );
         }
     }
 }
@@ -463,11 +523,11 @@ fn window_cell(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) 
     let line = Vec2::new(ui.available_width(), 12.0);
     ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Max), |ui| {
         if let Some(label) = &m.label {
-            ui.label(RichText::new(label).size(9.5).color(LABEL));
+            ui.label(RichText::new(label).size(text_size(9.5)).color(LABEL));
         }
         if let Some(ts) = m.resets_at {
             ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                ui.label(RichText::new(resets(ts)).size(9.0).color(META))
+                ui.label(RichText::new(resets(ts)).size(text_size(9.0)).color(META))
                     .on_hover_text(local_when(ts));
             });
         }
@@ -496,7 +556,7 @@ fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
             hover = Some(format!("{} {}", c.verb, local_when(c.at)));
         }
         if !info.is_empty() {
-            let font = egui::FontId::proportional(10.0);
+            let font = egui::FontId::proportional(text_size(10.0));
             let galley = ui.painter().layout_no_wrap(info.join(" · "), font, META);
             let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
             // egui aligns text boxes, not baselines: bottom-aligned, the smaller text
@@ -524,7 +584,7 @@ fn meter_row(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
             }
         });
         if let Some(ts) = m.resets_at {
-            ui.label(RichText::new(resets(ts)).size(9.5).color(META))
+            ui.label(RichText::new(resets(ts)).size(text_size(9.5)).color(META))
                 .on_hover_text(local_when(ts));
         }
         amounts(ui, m, 12.0, precision, estimated);
@@ -637,7 +697,7 @@ impl eframe::App for App {
                         "refreshes every {} min",
                         self.interval.as_secs() / 60
                     ))
-                    .size(10.0)
+                    .size(text_size(10.0))
                     .color(MUTED),
                 );
                 if ui.button("Edit config").clicked() {
@@ -672,12 +732,12 @@ impl eframe::App for App {
                 if self.providers.is_empty() {
                     ui.label(
                         RichText::new("Every service is disabled in the config.")
-                            .size(10.5)
+                            .size(text_size(10.5))
                             .color(MUTED),
                     );
                 }
                 if let Some(err) = &self.config_error {
-                    ui.label(RichText::new(err).size(10.0).color(ERR));
+                    ui.label(RichText::new(err).size(text_size(10.0)).color(ERR));
                 }
 
                 ui.add_space(10.0);
@@ -689,12 +749,12 @@ impl eframe::App for App {
                         .last_updated()
                         .map(|t| format!("updated {}", ago(t)))
                         .unwrap_or_else(|| "fetching…".into());
-                    ui.label(RichText::new(updated).size(9.5).color(MUTED));
+                    ui.label(RichText::new(updated).size(text_size(9.5)).color(MUTED));
 
                     if let Some(t) = self.total() {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let text = format!("${} / ${}", money(t.used), money(t.total));
-                            ui.label(RichText::new(text).size(10.0).color(MUTED))
+                            ui.label(RichText::new(text).size(text_size(10.0)).color(MUTED))
                                 .on_hover_text("Total across services");
                         });
                     }
