@@ -11,7 +11,7 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct Lookup {
     rx: Receiver<Result<Cycle, String>>,
@@ -48,7 +48,6 @@ pub fn start(ctx: egui::Context) -> Lookup {
     let cancelled = Arc::new(AtomicBool::new(false));
     let control = Control {
         cancelled: cancelled.clone(),
-        deadline: Instant::now() + Duration::from_secs(420),
     };
     let thread = thread::spawn(move || {
         let _ = tx.send(run(&control));
@@ -59,6 +58,13 @@ pub fn start(ctx: egui::Context) -> Lookup {
         cancelled,
         thread: Some(thread),
     }
+}
+
+fn node_version(name: &str) -> Vec<u32> {
+    name.trim_start_matches('v')
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
 }
 
 fn node_candidates() -> Vec<PathBuf> {
@@ -81,7 +87,13 @@ fn node_candidates() -> Vec<PathBuf> {
             .flatten()
             .map(|e| e.path())
             .collect();
-        versions.sort();
+        versions.sort_by_key(|path| {
+            node_version(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default(),
+            )
+        });
         paths.extend(versions.into_iter().rev().map(|p| p.join("bin/node")));
     }
     for root in [
@@ -174,10 +186,11 @@ fn run(control: &Control) -> Result<Cycle, String> {
     }
     control.output(
         Command::new(&node)
+            .env("USAGE_WIDGET_HELPER", "1")
             .arg(folder.join("claude-renewal.mjs"))
             .arg("--config")
             .arg(&config_path),
-        Duration::from_secs(360),
+        Duration::from_secs(450),
     )?;
     let (config, error) = crate::config::load();
     if let Some(error) = error {
@@ -189,4 +202,14 @@ fn run(control: &Control) -> Result<Cycle, String> {
         .as_deref()
         .ok_or("Lookup did not save a renewal date")?;
     crate::providers::manual_claude_cycle(date, chrono::Local::now().date_naive())
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    #[test]
+    fn nvm_prefers_newest_numeric_version() {
+        let mut versions = ["v9.11.2", "v22.9.0", "v22.10.0", "v8.0.0"];
+        versions.sort_by_key(|name| super::node_version(name));
+        assert_eq!(versions.last(), Some(&"v22.10.0"));
+    }
 }

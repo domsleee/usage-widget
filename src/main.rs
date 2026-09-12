@@ -23,7 +23,7 @@ use providers::{Cycle, Meter, Provider, Unit, Usage, money};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, local_when, now_unix, resets, until_short};
+use timeutil::{ago, local_when, now_unix, resets};
 
 const WIDTH: f32 = if cfg!(windows) { 320.0 } else { 270.0 };
 const MARGIN: i8 = 12;
@@ -50,6 +50,7 @@ struct Update {
     provider: Provider,
     result: Result<Usage, String>,
     at: i64,
+    started: std::time::Instant,
 }
 
 #[derive(Clone, Default)]
@@ -76,6 +77,7 @@ struct App {
     config_error: Option<String>,
     renewal_lookup: Option<renewal_lookup::Lookup>,
     renewal_error: Option<String>,
+    renewal_applied_at: Option<std::time::Instant>,
     #[cfg(target_os = "macos")]
     menubar: Option<menubar::MenuBar>,
     #[cfg(target_os = "macos")]
@@ -138,6 +140,7 @@ impl App {
             config_error,
             renewal_lookup: None,
             renewal_error: None,
+            renewal_applied_at: None,
             #[cfg(target_os = "macos")]
             menubar,
             #[cfg(target_os = "macos")]
@@ -160,7 +163,13 @@ impl App {
             match u.result {
                 Ok(usage) => {
                     slot.plan = usage.plan;
-                    slot.cycle = usage.cycle;
+                    if u.provider != Provider::Claude
+                        || self
+                            .renewal_applied_at
+                            .is_none_or(|applied| u.started > applied)
+                    {
+                        slot.cycle = usage.cycle;
+                    }
                     slot.note = usage.note;
                     slot.estimated = usage.estimated;
                     slot.meters = Some(usage.meters);
@@ -181,6 +190,7 @@ impl App {
                 self.renewal_lookup = None;
                 match result {
                     Ok(cycle) => {
+                        self.renewal_applied_at = Some(std::time::Instant::now());
                         if let Some(slot) = self.slots.get_mut(&Provider::Claude) {
                             slot.cycle = Some(cycle);
                         }
@@ -232,6 +242,7 @@ fn spawn_worker(
     std::thread::spawn(move || {
         let mut config = config;
         loop {
+            let started = std::time::Instant::now();
             // The browser helper updates this setting while the widget is open.
             let (latest, error) = config::load();
             if error.is_none() {
@@ -248,6 +259,7 @@ fn spawn_worker(
                             provider: p,
                             result,
                             at: now_unix(),
+                            started,
                         });
                         ctx.request_repaint();
                     });
@@ -567,7 +579,7 @@ fn spend_row(
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
         let mut hover: Vec<String> = slot.plan.iter().cloned().collect();
         if let Some(c) = &slot.cycle {
-            hover.push(format!("{} {}", c.verb, local_when(c.at)));
+            hover.push(format!("{} {}", c.verb, c.when()));
         }
         hover.push(p.url().into());
         let status = if p == Provider::Claude && slot.cycle.is_some() {
@@ -695,8 +707,12 @@ fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot, renewal: &mut RenewalButt
         let mut hover = None;
         if let Some(c) = &slot.cycle {
             // A countdown, recomputed every frame so it stays right as time passes.
-            info.push(format!("{} {}", c.verb, until_short(c.at)));
-            hover = Some(format!("{} {}", c.verb, local_when(c.at)));
+            info.push(format!(
+                "{} {}",
+                c.verb,
+                c.countdown(chrono::Local::now().date_naive())
+            ));
+            hover = Some(format!("{} {}", c.verb, c.when()));
         }
         if p == Provider::Claude && slot.cycle.is_some() {
             if renewal.running {
@@ -727,7 +743,7 @@ fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot, renewal: &mut RenewalButt
                     ui.id().with("claude-renewal"),
                     Sense::click_and_drag(),
                 );
-                if response.drag_started() {
+                if response.drag_started_by(egui::PointerButton::Primary) {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 renewal.context_menu(&response);
@@ -986,7 +1002,8 @@ mod lookup_tests {
 
     #[test]
     fn completion_applies_date_and_refreshes_without_restart() {
-        let (_updates, rx) = mpsc::channel();
+        let (updates, rx) = mpsc::channel();
+        let stale_started = std::time::Instant::now();
         let (refresh_tx, refresh_rx) = mpsc::channel();
         let (lookup_tx, lookup_rx) = mpsc::channel();
         let mut app = App {
@@ -1000,6 +1017,7 @@ mod lookup_tests {
             config_error: None,
             renewal_lookup: Some(renewal_lookup::Lookup::from_receiver(lookup_rx)),
             renewal_error: None,
+            renewal_applied_at: None,
             #[cfg(target_os = "macos")]
             menubar: None,
             #[cfg(target_os = "macos")]
@@ -1007,6 +1025,7 @@ mod lookup_tests {
         };
         lookup_tx
             .send(Ok(Cycle {
+                date_only: false,
                 verb: "renews".into(),
                 at: 1_790_000_000,
             }))
@@ -1018,6 +1037,26 @@ mod lookup_tests {
             1_790_000_000
         );
         assert!(refresh_rx.try_recv().is_ok());
+
+        updates
+            .send(Update {
+                provider: Provider::Claude,
+                result: Ok(Usage {
+                    plan: None,
+                    cycle: None,
+                    note: None,
+                    estimated: vec![],
+                    meters: vec![],
+                }),
+                at: now_unix(),
+                started: stale_started,
+            })
+            .unwrap();
+        app.drain();
+        assert_eq!(
+            app.slots[&Provider::Claude].cycle.as_ref().unwrap().at,
+            1_790_000_000
+        );
 
         let (lookup_tx, lookup_rx) = mpsc::channel();
         app.renewal_lookup = Some(renewal_lookup::Lookup::from_receiver(lookup_rx));
@@ -1207,5 +1246,6 @@ mod display_tests {
         }
         assert_eq!(super::percent_label(87.0, 0, true), "~87.00%");
         assert_eq!(super::percent_label(87.0, 0, false), "87%");
+        assert_eq!(super::percent_label(87.999, 3, true), "~87.990%");
     }
 }

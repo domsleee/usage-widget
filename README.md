@@ -94,6 +94,12 @@ right-click the renewal text to cancel an active lookup. Progress and failures
 appear beside the renewal text. Estimated usage always shows at least two decimal
 places so it cannot round up to the next reported percentage.
 
+Installation has its own two-minute timeout. Each browser lookup gets a separate
+budget, including five minutes for sign-in and a fresh minute for the workspace
+API. Date-only renewals use calendar-day labels, including “today”, without
+claiming a billing time. Fractional usage reported by a service is kept as-is;
+local estimates apply only to whole-percent readings.
+
 ## Credentials
 
 Reuses the CLIs' stored credentials; never writes them.

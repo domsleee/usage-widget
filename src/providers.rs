@@ -78,6 +78,41 @@ pub struct Usage {
 pub struct Cycle {
     pub verb: String,
     pub at: i64,
+    #[serde(default)]
+    pub date_only: bool,
+}
+
+impl Cycle {
+    pub fn countdown(&self, today: chrono::NaiveDate) -> String {
+        if self.date_only {
+            let date = chrono::DateTime::from_timestamp(self.at, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .date_naive();
+            let days = (date - today).num_days();
+            if days == 0 {
+                "today".into()
+            } else if days > 0 {
+                format!("{days}d")
+            } else {
+                "date passed".into()
+            }
+        } else {
+            crate::timeutil::until_short(self.at)
+        }
+    }
+
+    pub fn when(&self) -> String {
+        if self.date_only {
+            chrono::DateTime::from_timestamp(self.at, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .format("%a %d %b %Y")
+                .to_string()
+        } else {
+            crate::timeutil::local_when(self.at)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +306,7 @@ fn copilot() -> Result<Usage, String> {
         .as_str()
         .and_then(parse_rfc3339)
         .map(|at| Cycle {
+            date_only: false,
             verb: "resets".into(),
             at,
         });
@@ -542,7 +578,12 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
             state.renewal_attempt = now;
             match crate::claude_web::cycle() {
                 Ok(c) => state.renewal = Some((now, c)),
-                Err(e) => renewal_problem = Some(e),
+                Err(e) => {
+                    renewal_problem = Some(renewal_problem.map_or_else(
+                        || e.clone(),
+                        |manual| format!("{manual}; browser lookup: {e}"),
+                    ))
+                }
             }
             state.save();
         }
@@ -588,7 +629,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
             .filter(|m| {
                 m.unit == Unit::Percent && matches!(m.label.as_deref(), Some("5h" | "week"))
             })
-            .filter_map(|m| Some((m.label.clone()?, m.used.round(), m.resets_at?)))
+            .filter_map(|m| Some((m.label.clone()?, whole_percent(m.used)?, m.resets_at?)))
             .collect();
         let refs: Vec<(&str, f64, i64)> = readings
             .iter()
@@ -644,7 +685,7 @@ pub(crate) fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Resul
         .filter(|d| d.format("%Y-%m-%d").to_string() == date)
         .ok_or("set claude.renewal_date to a valid YYYY-MM-DD date")?;
     if parsed < today {
-        return Err("update claude.renewal_date in config; the date has passed".into());
+        return Err("the renewal date has passed; use the refresh icon beside Claude to look it up again, or update claude.renewal_date".into());
     }
     let at = Local
         .from_local_datetime(&parsed.and_hms_opt(0, 0, 0).unwrap())
@@ -652,6 +693,7 @@ pub(crate) fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Resul
         .ok_or("claude.renewal_date has no local midnight; choose another date")?
         .timestamp();
     Ok(Cycle {
+        date_only: true,
         verb: "renews".into(),
         at,
     })
@@ -882,9 +924,10 @@ fn codex(estimate: bool) -> Result<Usage, String> {
             .iter_mut()
             .find(|m| m.label.as_deref() == Some("week") && m.unit == Unit::Percent)
             && let Some(window) = week.resets_at
-            && let Some(fraction) = crate::codex_estimate::fraction(week.used, window, plan_type)
+            && let Some(reported) = whole_percent(week.used)
+            && let Some(fraction) = crate::codex_estimate::fraction(reported, window, plan_type)
         {
-            week.used += fraction;
+            week.used = reported + fraction.clamp(0.0, 0.99);
             estimated.extend(week.label.clone());
         }
     }
@@ -913,9 +956,15 @@ fn codex_cycle(headers: &[(&str, &str)], account_id: &str) -> Option<Cycle> {
         "renews"
     };
     Some(Cycle {
+        date_only: false,
         verb: verb.into(),
         at,
     })
+}
+
+// Fractional service readings are already more precise than this estimator.
+fn whole_percent(value: f64) -> Option<f64> {
+    (value.is_finite() && (value - value.round()).abs() < 1e-9).then(|| value.round())
 }
 
 fn codex_plan(json: &Value) -> Option<String> {
@@ -1005,6 +1054,19 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 10, 12).unwrap()
         );
         assert!(manual_claude_cycle("2026-09-12", today).is_ok());
+        assert_eq!(
+            manual_claude_cycle("2026-09-12", today)
+                .unwrap()
+                .countdown(today),
+            "today"
+        );
+        assert_eq!(
+            manual_claude_cycle("2026-09-14", today)
+                .unwrap()
+                .countdown(today),
+            "2d"
+        );
+        assert!(!cycle.when().contains("12am"));
         for date in ["2026-09-11", "2026-02-30", "2026-9-15", "invalid", ""] {
             assert!(manual_claude_cycle(date, today).is_err(), "{date}");
         }
@@ -1012,6 +1074,9 @@ mod tests {
 
     #[test]
     fn formatting() {
+        assert_eq!(whole_percent(71.37), None);
+        assert_eq!(whole_percent(87.0), Some(87.0));
+        assert_eq!(whole_percent(55.00000000000001), Some(55.0));
         assert_eq!(money(62_440.0 * COPILOT_USD_PER_CREDIT), "624.40");
         assert_eq!(money(12_500.0 * CODEX_USD_PER_CREDIT), "500");
         assert_eq!(money(518.94), "518.94");

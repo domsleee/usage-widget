@@ -86,6 +86,7 @@ mod mac {
 
         if let Some(at) = timestamp(&json["plan_ending_at"]) {
             return Ok(Cycle {
+                date_only: false,
                 verb: "ends".into(),
                 at,
             });
@@ -93,6 +94,7 @@ mod mac {
         timestamp(&json["next_charge_at"])
             .or_else(|| timestamp(&json["next_charge_date"]))
             .map(|at| Cycle {
+                date_only: false,
                 verb: "renews".into(),
                 at,
             })

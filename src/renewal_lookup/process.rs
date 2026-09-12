@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 pub(super) struct Control {
     pub cancelled: Arc<AtomicBool>,
-    pub deadline: Instant,
 }
 
 // Drain both pipes even after the diagnostic limit so verbose children cannot
@@ -31,8 +30,29 @@ fn capture(mut reader: impl Read) -> Vec<u8> {
 
 fn failure(result: &Output) -> String {
     let text = String::from_utf8_lossy(&result.stderr);
-    match text.lines().find(|line| !line.trim().is_empty()) {
-        Some(line) => line.trim().chars().take(240).collect(),
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let cause = lines
+        .iter()
+        .rev()
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.contains("npm error") || lower.contains("npm err!"))
+                && !lower.contains("log")
+                && !lower.contains("command")
+        })
+        .copied()
+        .or_else(|| lines.last().copied());
+    match cause {
+        Some(line) => {
+            let mut message: String = line.trim().chars().take(240).collect();
+            if line.trim().chars().count() > 240 || result.stderr.len() >= 8192 {
+                message.push('…');
+            }
+            message
+        }
         None => format!("Renewal helper failed ({}).", result.status),
     }
 }
@@ -55,7 +75,7 @@ impl Control {
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Could not start renewal helper: {e}"))?;
         let tree = match ProcessTree::new(&child) {
@@ -70,7 +90,7 @@ impl Control {
         let stderr = child.stderr.take().unwrap();
         let stdout = thread::spawn(move || capture(stdout));
         let stderr = thread::spawn(move || capture(stderr));
-        let deadline = self.deadline.min(Instant::now() + limit);
+        let deadline = Instant::now() + limit;
         let status = loop {
             if self.cancelled.load(Ordering::Relaxed) {
                 break Err("Lookup cancelled".to_string());
@@ -183,7 +203,6 @@ mod tests {
             let cancelled = Arc::new(AtomicBool::new(false));
             let control = Control {
                 cancelled: cancelled.clone(),
-                deadline: Instant::now() + Duration::from_secs(10),
             };
             let setter = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(700));
@@ -209,7 +228,6 @@ mod tests {
             .unwrap();
         let control = Control {
             cancelled: Arc::new(AtomicBool::new(false)),
-            deadline: Instant::now() + Duration::from_secs(10),
         };
         assert!(
             control
@@ -220,5 +238,41 @@ mod tests {
                 .unwrap_err()
                 .contains("failed")
         );
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn install_time_does_not_reduce_the_next_stage_budget() {
+        let node = crate::renewal_lookup::node_candidates()
+            .into_iter()
+            .find(|p| p.is_file())
+            .unwrap();
+        let control = Control {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        for _ in 0..2 {
+            control
+                .output(
+                    Command::new(&node).args(["-e", "setTimeout(()=>process.exit(0),600)"]),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+        }
+    }
+    #[test]
+    fn verbose_npm_failure_retains_the_cause() {
+        let node = crate::renewal_lookup::node_candidates()
+            .into_iter()
+            .find(|p| p.is_file())
+            .unwrap();
+        let control = Control {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let message = control.output(Command::new(&node).args(["-e", "console.error('npm warn '+ 'x'.repeat(12000));console.error('npm error code ECONNREFUSED');console.error('npm error A complete log can be found in a file');process.exitCode=1"]), Duration::from_secs(5)).unwrap_err();
+        assert!(message.contains("ECONNREFUSED"), "{message}");
+        assert!(message.len() < 260);
     }
 }

@@ -90,7 +90,7 @@ export function readyForLookup(tab) {
   if (tab.type !== 'page' || !tab.title || /just a moment|verif.*human|security verification/i.test(tab.title)) return false;
   try {
     const url = new URL(tab.url);
-    return url.origin === 'https://claude.ai' && /^\/(settings|new|chat)(\/|$)/.test(url.pathname);
+    return url.origin === 'https://claude.ai' && /^\/(settings|new|chat|chats|recents|projects|project)(\/|$)/.test(url.pathname);
   } catch { return false; }
 }
 
@@ -192,6 +192,12 @@ export async function closeBrowser(browser, chrome) {
   }
 }
 
+export function watchParent(input, onClose) {
+  input.once('end', onClose);
+  input.resume();
+  return () => { input.removeListener('end', onClose); input.pause(); };
+}
+
 async function main() {
   const { values } = parseArgs({ options: {
     config: { type: 'string' }, profile: { type: 'string' },
@@ -208,13 +214,17 @@ async function main() {
   const profile = resolve(values.profile || join(dirname(configPath), 'claude-browser'));
   const chrome = await openBrowser(profile, values.browser);
   let browser;
+  // The widget owns the write end of stdin. EOF also detects abrupt parent
+  // exit on Unix, where a Windows job object is unavailable.
+  const parentClosed = () => { closeBrowser(browser, chrome).finally(() => process.exit(1)); };
+  const stopWatching = process.env.USAGE_WIDGET_HELPER === '1' ? watchParent(process.stdin, parentClosed) : () => {};
   try {
     console.log('Complete verification and sign in to Claude in Chrome. Waiting up to 5 minutes…');
-    const deadline = Date.now() + 300_000;
+    const signInDeadline = phaseDeadline(300_000);
     // Read only Chrome's tab metadata until sign-in is complete. Attaching a
     // browser automation framework during a production challenge is unsupported.
     let ready;
-    while (Date.now() < deadline) {
+    while (Date.now() < signInDeadline) {
       ready = (await chrome.tabs()).find(readyForLookup);
       if (ready) break;
       await sleep(1000);
@@ -225,7 +235,8 @@ async function main() {
     const page = await selectPage(context, ready);
     if (!page) throw new Error('Claude tab changed during sign-in. Please retry.');
     let organizations;
-    while (Date.now() < deadline) {
+    const apiDeadline = phaseDeadline(60_000);
+    while (Date.now() < apiDeadline) {
       if (page.isClosed()) throw new Error('Browser closed before the lookup finished.');
       // Same-origin requests use the browser session; no login cookies leave Chrome.
       if (readyForLookup({ type: 'page', title: await page.title().catch(() => ''), url: page.url() })) {
@@ -239,7 +250,7 @@ async function main() {
       }
       await sleep(1000);
     }
-    if (!Array.isArray(organizations) || !organizations.length) throw new Error('Timed out waiting for Claude sign-in. Config was not changed.');
+    if (!Array.isArray(organizations) || !organizations.length) throw new Error('Claude opened, but its workspace API did not respond. Config was not changed. Please retry.');
     const active = await page.evaluate(() => {
       const value = document.cookie.split('; ').find(cookie => cookie.startsWith('lastActiveOrg='));
       return value ? decodeURIComponent(value.slice('lastActiveOrg='.length)) : undefined;
@@ -253,8 +264,13 @@ async function main() {
     console.log(`Saved claude.renewal_date = "${date}" to ${configPath}`);
     console.log('Renewal saved. The widget applies button lookups automatically.');
   } finally {
+    stopWatching();
     await closeBrowser(browser, chrome);
   }
+}
+
+export function phaseDeadline(budget, now = Date.now()) {
+  return now + budget;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

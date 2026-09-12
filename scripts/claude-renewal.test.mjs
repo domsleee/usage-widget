@@ -123,3 +123,54 @@ test('tab selection tolerates navigation after sign-in', async () => {
   const closed = { url: () => 'https://claude.ai/settings/billing', isClosed: () => true };
   assert.equal(await selectPage({ pages: () => [closed, changed] }, { url: 'https://claude.ai/settings/billing' }), changed);
 });
+
+test('first lookup preserves the actual widget config template', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../src/config.rs', import.meta.url), 'utf8');
+  const template = source.match(/const TEMPLATE: &str = r#"([\s\S]*?)"#;/)?.[1];
+  assert.ok(template, 'Rust config template must be found');
+  const updated = updateConfig(template, '2026-10-12');
+  const expected = parse(template);
+  expected.claude.renewal_date = '2026-10-12';
+  assert.deepEqual(parse(updated), expected);
+  for (const line of template.split('\n').filter(line => line.trimStart().startsWith('#'))) assert.ok(updated.includes(line));
+});
+
+test('additional app routes are eligible but authentication pages are not', () => {
+  for (const route of ['/chats', '/recents', '/projects', '/project/123']) {
+    assert.equal(readyForLookup({ type: 'page', title: 'Claude', url: `https://claude.ai${route}` }), true);
+  }
+  for (const route of ['/login', '/login/callback', '/signup', '/oauth/authorize']) {
+    assert.equal(readyForLookup({ type: 'page', title: 'Claude', url: `https://claude.ai${route}` }), false);
+  }
+});
+
+test('closing the parent pipe closes the dedicated browser without CDP attachment', { timeout: 15000 }, async () => {
+  const { spawn } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const profile = await mkdtemp(join(tmpdir(), 'usage-widget-parent-test-'));
+  const moduleUrl = new URL('./claude-renewal.mjs', import.meta.url).href;
+  const script = `import {openBrowser, closeBrowser, watchParent} from ${JSON.stringify(moduleUrl)};
+    const chrome = await openBrowser(${JSON.stringify(profile)}, 'chrome', 'about:blank');
+    watchParent(process.stdin, () => closeBrowser(undefined, chrome).then(() => process.exit(0)));
+    for (let i=0; i<50; i++) { if ((await chrome.tabs()).length) break; await new Promise(r=>setTimeout(r,100)); }
+    process.stdout.write('ready');`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  let timer;
+  try {
+    const exit = once(child, 'exit');
+    await Promise.race([
+      once(child.stdout, 'data'),
+      exit.then(() => { throw new Error('Helper exited before browser readiness'); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Browser did not start')), 10000); }),
+    ]);
+    clearTimeout(timer);
+    child.stdin.end();
+    assert.equal((await exit)[0], 0);
+  } finally {
+    clearTimeout(timer);
+    child.stdin.end();
+    if (child.exitCode === null) child.kill();
+    await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  }
+});
