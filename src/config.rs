@@ -30,6 +30,9 @@ api = true
 # macOS: read your claude.ai login cookie from Chrome, Arc, Brave or Edge to
 # show the renewal day. macOS asks once for keychain access.
 browser_cookies = false
+# Optional next billing date (local calendar date), on any OS. Overrides browser
+# lookup. Update it after each renewal; it does not assume a monthly schedule.
+# renewal_date = "2026-10-12"
 # Claude reports whole percents. true = estimate the part of the next percent
 # from this machine's Claude Code token use (shown with "~"; it warms up over a
 # few ticks and can't see claude.ai or other devices).
@@ -66,6 +69,7 @@ pub struct Claude {
     pub enabled: bool,
     pub api: bool,
     pub browser_cookies: bool,
+    pub renewal_date: Option<String>,
     pub estimate: bool,
 }
 
@@ -110,6 +114,7 @@ impl Default for Claude {
             enabled: true,
             api: true,
             browser_cookies: false,
+            renewal_date: None,
             estimate: false,
         }
     }
@@ -152,19 +157,33 @@ pub fn load() -> (Config, Option<String>) {
     }
 }
 
-/// Writes the default config if there is none, then opens it. From a terminal,
-/// `$VISUAL` / `$EDITOR` win; otherwise the system text editor is used.
-pub fn open(from_terminal: bool) -> Result<PathBuf, String> {
+/// Writes the default config if there is none.
+pub fn ensure_exists() -> Result<PathBuf, String> {
+    use std::io::Write;
     let path = path().ok_or("cannot find the config directory")?;
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
-        std::fs::write(&path, TEMPLATE)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => file
+                .write_all(TEMPLATE.as_bytes())
+                .map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("cannot write {}: {e}", path.display())),
+        }
     }
+    Ok(path)
+}
 
+/// Opens the config using the requested terminal editor or the system editor.
+pub fn open(from_terminal: bool) -> Result<PathBuf, String> {
+    let path = ensure_exists()?;
     // Release builds on Windows have no console for a terminal editor to use.
     let editor = (from_terminal && !cfg!(windows))
         .then(|| {
@@ -219,5 +238,12 @@ mod tests {
         assert!(!c.enabled(Provider::Copilot));
         assert!(c.enabled(Provider::Claude) && c.claude.api);
         assert!(toml::from_str::<Config>("refresh_minutes = 5").is_err());
+    }
+
+    #[test]
+    fn manual_claude_renewal() {
+        let c: Config = toml::from_str("[claude]\nrenewal_date = \"2026-10-12\"").unwrap();
+        assert_eq!(c.claude.renewal_date.as_deref(), Some("2026-10-12"));
+        assert!(!c.claude.browser_cookies);
     }
 }

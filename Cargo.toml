@@ -23,6 +23,7 @@ strip = true
 
 [target.'cfg(windows)'.dependencies]
 winit = "0.30"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aes = "0.8"

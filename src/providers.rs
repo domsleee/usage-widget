@@ -523,8 +523,15 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         state.save();
     }
 
-    let mut renewal_problem = None;
-    if config.browser_cookies {
+    let manual_cycle = config
+        .renewal_date
+        .as_deref()
+        .map(|date| manual_claude_cycle(date, chrono::Local::now().date_naive()));
+    let mut renewal_problem = manual_cycle
+        .as_ref()
+        .and_then(|c| c.as_ref().err())
+        .cloned();
+    if config.browser_cookies && !matches!(&manual_cycle, Some(Ok(_))) {
         // Fetch daily and again once the saved date has passed; after a failure retry
         // at most hourly, so a denied keychain prompt doesn't return every refresh.
         let due = state
@@ -607,10 +614,13 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         }
         note
     });
-    let cycle = state
-        .renewal
-        .filter(|_| config.browser_cookies)
-        .map(|(_, c)| c);
+    let cycle = match manual_cycle {
+        Some(Ok(cycle)) => Some(cycle),
+        _ => state
+            .renewal
+            .filter(|_| config.browser_cookies)
+            .map(|(_, c)| c),
+    };
     // Say why the renewal date is missing, but only when there is none to show.
     let note = match renewal_problem.filter(|_| cycle.is_none()) {
         Some(e) => Some(note.map_or(format!("renewal: {e}"), |n| format!("{n} · renewal: {e}"))),
@@ -622,6 +632,28 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         note,
         estimated,
         meters,
+    })
+}
+
+/// A manually supplied next billing date, without guessing the billing cadence.
+pub(crate) fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Result<Cycle, String> {
+    use chrono::{Local, NaiveDate, TimeZone};
+
+    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .filter(|d| d.format("%Y-%m-%d").to_string() == date)
+        .ok_or("set claude.renewal_date to a valid YYYY-MM-DD date")?;
+    if parsed < today {
+        return Err("update claude.renewal_date in config; the date has passed".into());
+    }
+    let at = Local
+        .from_local_datetime(&parsed.and_hms_opt(0, 0, 0).unwrap())
+        .earliest()
+        .ok_or("claude.renewal_date has no local midnight; choose another date")?
+        .timestamp();
+    Ok(Cycle {
+        verb: "renews".into(),
+        at,
     })
 }
 
@@ -961,6 +993,22 @@ fn title_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_renewal_uses_local_dates_and_rejects_expired_or_invalid_dates() {
+        use chrono::{Local, NaiveDate, TimeZone};
+        let today = NaiveDate::from_ymd_opt(2026, 9, 12).unwrap();
+        let cycle = manual_claude_cycle("2026-10-12", today).unwrap();
+        assert_eq!(cycle.verb, "renews");
+        assert_eq!(
+            Local.timestamp_opt(cycle.at, 0).unwrap().date_naive(),
+            NaiveDate::from_ymd_opt(2026, 10, 12).unwrap()
+        );
+        assert!(manual_claude_cycle("2026-09-12", today).is_ok());
+        for date in ["2026-09-11", "2026-02-30", "2026-9-15", "invalid", ""] {
+            assert!(manual_claude_cycle(date, today).is_err(), "{date}");
+        }
+    }
 
     #[test]
     fn formatting() {

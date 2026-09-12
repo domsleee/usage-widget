@@ -11,6 +11,7 @@ mod estimate;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod providers;
+mod renewal_lookup;
 mod timeutil;
 
 use config::Config;
@@ -73,6 +74,8 @@ struct App {
     /// Decimal places for percentages.
     precision: usize,
     config_error: Option<String>,
+    renewal_lookup: Option<renewal_lookup::Lookup>,
+    renewal_error: Option<String>,
     #[cfg(target_os = "macos")]
     menubar: Option<menubar::MenuBar>,
     #[cfg(target_os = "macos")]
@@ -133,6 +136,8 @@ impl App {
             opacity,
             precision,
             config_error,
+            renewal_lookup: None,
+            renewal_error: None,
             #[cfg(target_os = "macos")]
             menubar,
             #[cfg(target_os = "macos")]
@@ -162,6 +167,27 @@ impl App {
                     slot.error = None;
                 }
                 Err(e) => slot.error = Some(e),
+            }
+        }
+        if let Some(rx) = &self.renewal_lookup {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Renewal lookup stopped unexpectedly. Try again.".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                self.renewal_lookup = None;
+                match result {
+                    Ok(cycle) => {
+                        if let Some(slot) = self.slots.get_mut(&Provider::Claude) {
+                            slot.cycle = Some(cycle);
+                        }
+                        self.refresh_now();
+                    }
+                    Err(error) => self.renewal_error = Some(error),
+                }
             }
         }
     }
@@ -204,7 +230,13 @@ fn spawn_worker(
 ) {
     let interval = config.refresh_interval();
     std::thread::spawn(move || {
+        let mut config = config;
         loop {
+            // The browser helper updates this setting while the widget is open.
+            let (latest, error) = config::load();
+            if error.is_none() {
+                config.claude.renewal_date = latest.claude.renewal_date;
+            }
             std::thread::scope(|s| {
                 for &p in &providers {
                     let tx = tx.clone();
@@ -363,17 +395,33 @@ fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
 }
 
 const ESTIMATE_HOVER: &str = "Estimated: Codex reports whole percents, so the part of the next one \
-     comes from this Mac's Codex token use. Codex cloud and other devices \
+     comes from this computer's Codex token use. Codex cloud and other devices \
      aren't counted.";
 
 /// The percentage, coloured by level, with "~" when it includes a local estimate.
 fn percent_text(m: &Meter, size: f32, precision: usize, estimated: bool) -> RichText {
     let pct = m.percent();
-    let mark = if estimated { "~" } else { "" };
-    RichText::new(format!("{mark}{pct:.precision$}%"))
+    RichText::new(percent_label(pct, precision, estimated))
         .size(text_size(size))
         .strong()
         .color(level_color(pct))
+}
+
+fn percent_label(pct: f64, precision: usize, estimated: bool) -> String {
+    // Estimates must retain their fractional part even when the user chooses
+    // whole-percent display for authoritative readings.
+    let precision = if estimated {
+        precision.max(2)
+    } else {
+        precision
+    };
+    let pct = if estimated {
+        pct.min(pct.floor() + 0.99)
+    } else {
+        pct
+    };
+    let mark = if estimated { "~" } else { "" };
+    format!("{mark}{pct:.precision$}%")
 }
 
 /// "$523.54 / $1,000   52%" right-aligned, coloured by level.
@@ -410,11 +458,74 @@ fn spend_only(slot: &Slot) -> Option<&Meter> {
     }
 }
 
-fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot, precision: usize) {
+struct RenewalButton<'a> {
+    running: bool,
+    error: Option<&'a str>,
+    clicked: bool,
+    cancelled: bool,
+}
+
+impl RenewalButton<'_> {
+    fn show(&mut self, ui: &mut egui::Ui, provider: Provider, has_cycle: bool) {
+        if provider != Provider::Claude || has_cycle {
+            return;
+        }
+        if self.running {
+            let spinner = ui.add(egui::Spinner::new().size(10.0).color(MUTED));
+            let response =
+                ui.interact(spinner.rect, ui.id().with("cancel-renewal"), Sense::click());
+            self.context_menu(&response);
+            response.on_hover_text(
+                "Looking up renewal — complete sign-in in Chrome. Right-click to cancel.",
+            );
+        } else {
+            let tooltip = self.error.map_or_else(
+                || "Look up Claude renewal in Chrome".to_string(),
+                |error| format!("Renewal lookup failed: {error}\nClick to retry"),
+            );
+            self.clicked |= refresh_button(ui, &tooltip, self.error.is_some());
+        }
+    }
+
+    fn context_menu(&mut self, response: &egui::Response) {
+        response.context_menu(|ui| {
+            let label = if self.running {
+                "Looking up…"
+            } else {
+                "Look up renewal"
+            };
+            if ui
+                .add_enabled(!self.running, egui::Button::new(label))
+                .clicked()
+            {
+                self.clicked = true;
+                ui.close();
+            }
+            if self.running {
+                ui.label("Complete sign-in in Chrome");
+                if ui.button("Cancel lookup").clicked() {
+                    self.cancelled = true;
+                    ui.close();
+                }
+            }
+            if let Some(error) = self.error {
+                ui.label(RichText::new(error).color(ERR));
+            }
+        });
+    }
+}
+
+fn provider_block(
+    ui: &mut egui::Ui,
+    p: Provider,
+    slot: &Slot,
+    precision: usize,
+    renewal: &mut RenewalButton<'_>,
+) {
     if let Some(m) = spend_only(slot) {
-        spend_row(ui, p, slot, m, precision);
+        spend_row(ui, p, slot, m, precision, renewal);
     } else {
-        header(ui, p, slot);
+        header(ui, p, slot, renewal);
         ui.add_space(6.0);
         match (&slot.meters, &slot.error) {
             (Some(meters), _) => meters_block(ui, meters, slot, precision),
@@ -444,7 +555,14 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot, precision: usize)
 
 /// Name, amount and percentage on one line over one bar, as in the original
 /// widget. The plan and billing cycle move to the name's hover text.
-fn spend_row(ui: &mut egui::Ui, p: Provider, slot: &Slot, m: &Meter, precision: usize) {
+fn spend_row(
+    ui: &mut egui::Ui,
+    p: Provider,
+    slot: &Slot,
+    m: &Meter,
+    precision: usize,
+    renewal: &mut RenewalButton<'_>,
+) {
     let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
         let mut hover: Vec<String> = slot.plan.iter().cloned().collect();
@@ -452,9 +570,33 @@ fn spend_row(ui: &mut egui::Ui, p: Provider, slot: &Slot, m: &Meter, precision: 
             hover.push(format!("{} {}", c.verb, local_when(c.at)));
         }
         hover.push(p.url().into());
-        let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-        ui.hyperlink_to(name, p.url())
+        let status = if p == Provider::Claude && slot.cycle.is_some() {
+            if renewal.running {
+                " · looking up…"
+            } else if renewal.error.is_some() {
+                " · lookup failed"
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+        if p == Provider::Claude
+            && let Some(error) = renewal.error
+        {
+            hover.push(error.into());
+        }
+        let name = RichText::new(format!("{}{status}", p.name()))
+            .size(13.0)
+            .strong()
+            .color(TEXT);
+        let response = ui
+            .hyperlink_to(name, p.url())
             .on_hover_text(hover.join("\n"));
+        if p == Provider::Claude && slot.cycle.is_some() {
+            renewal.context_menu(&response);
+        }
+        renewal.show(ui, p, slot.cycle.is_some());
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
@@ -542,12 +684,13 @@ fn window_cell(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) 
 }
 
 /// Service name, then plan and billing cycle in small text.
-fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
+fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot, renewal: &mut RenewalButton<'_>) {
     // A fixed-height, bottom-aligned row (`with_layout` would take all the height left).
     let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.hyperlink_to(name, p.url()).on_hover_text(p.url());
+        renewal.show(ui, p, slot.cycle.is_some());
         let mut info: Vec<String> = slot.plan.iter().cloned().collect();
         let mut hover = None;
         if let Some(c) = &slot.cycle {
@@ -555,14 +698,47 @@ fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
             info.push(format!("{} {}", c.verb, until_short(c.at)));
             hover = Some(format!("{} {}", c.verb, local_when(c.at)));
         }
+        if p == Provider::Claude && slot.cycle.is_some() {
+            if renewal.running {
+                info.push("looking up…".into());
+            } else if renewal.error.is_some() {
+                info.push("lookup failed".into());
+            }
+        }
         if !info.is_empty() {
             let font = egui::FontId::proportional(text_size(10.0));
+            let prefix_width = slot.plan.as_ref().map_or(0.0, |plan| {
+                ui.painter()
+                    .layout_no_wrap(format!("{plan} · "), font.clone(), META)
+                    .size()
+                    .x
+            });
             let galley = ui.painter().layout_no_wrap(info.join(" · "), font, META);
             let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
             // egui aligns text boxes, not baselines: bottom-aligned, the smaller text
             // sits 1pt below the name's baseline (measured), so lift it by that.
             ui.painter()
                 .galley(rect.min - Vec2::new(0.0, 1.0), galley, META);
+            let resp = if p == Provider::Claude && slot.cycle.is_some() {
+                let renewal_rect =
+                    egui::Rect::from_min_max(rect.min + Vec2::new(prefix_width, 0.0), rect.max);
+                let response = ui.interact(
+                    renewal_rect,
+                    ui.id().with("claude-renewal"),
+                    Sense::click_and_drag(),
+                );
+                if response.drag_started() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                renewal.context_menu(&response);
+                response.on_hover_text(
+                    renewal
+                        .error
+                        .unwrap_or("Right-click for renewal lookup actions"),
+                )
+            } else {
+                resp
+            };
             if let Some(hover) = hover {
                 resp.on_hover_text(hover);
             }
@@ -596,10 +772,16 @@ fn meter_row(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
 }
 
 /// A small circular-arrow refresh button drawn with the painter (no icon font needed).
-fn refresh_button(ui: &mut egui::Ui) -> bool {
+fn refresh_button(ui: &mut egui::Ui, tooltip: &str, error: bool) -> bool {
     let size = 11.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size + 2.0), Sense::click());
-    let color = if resp.hovered() { TEXT } else { MUTED };
+    let color = if error {
+        ERR
+    } else if resp.hovered() {
+        TEXT
+    } else {
+        MUTED
+    };
     let c = rect.center();
     let r = size * 0.38;
     let stroke = Stroke::new(1.4, color);
@@ -627,7 +809,9 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
     ui.painter()
         .add(Shape::convex_polygon(tri, color, Stroke::NONE));
 
-    resp.on_hover_text("Refresh now").clicked()
+    resp.on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 impl eframe::App for App {
@@ -655,6 +839,12 @@ impl eframe::App for App {
         let mut refresh = false;
         let mut edit_config = false;
         let mut quit = false;
+        let mut renewal = RenewalButton {
+            running: self.renewal_lookup.is_some(),
+            error: self.renewal_error.as_deref(),
+            clicked: false,
+            cancelled: false,
+        };
 
         #[cfg(target_os = "macos")]
         if let Some(bar) = &self.menubar {
@@ -727,7 +917,7 @@ impl eframe::App for App {
                             12.0
                         });
                     }
-                    provider_block(ui, *p, &slot, self.precision);
+                    provider_block(ui, *p, &slot, self.precision, &mut renewal);
                 }
                 if self.providers.is_empty() {
                     ui.label(
@@ -742,7 +932,7 @@ impl eframe::App for App {
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if refresh_button(ui) {
+                    if refresh_button(ui, "Refresh now", false) {
                         refresh = true;
                     }
                     let updated = self
@@ -770,8 +960,16 @@ impl eframe::App for App {
             }
         });
 
+        let lookup_renewal = renewal.clicked;
+        if renewal.cancelled {
+            self.renewal_lookup = None;
+        }
         if refresh {
             self.refresh_now();
+        }
+        if lookup_renewal {
+            self.renewal_error = None;
+            self.renewal_lookup = Some(renewal_lookup::start(ctx.clone()));
         }
         if edit_config && let Err(e) = config::open(false) {
             self.config_error = Some(e);
@@ -779,6 +977,59 @@ impl eframe::App for App {
         if quit {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    #[test]
+    fn completion_applies_date_and_refreshes_without_restart() {
+        let (_updates, rx) = mpsc::channel();
+        let (refresh_tx, refresh_rx) = mpsc::channel();
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        let mut app = App {
+            providers: vec![Provider::Claude],
+            slots: HashMap::from([(Provider::Claude, Slot::default())]),
+            rx,
+            refresh_tx,
+            interval: Duration::from_secs(300),
+            opacity: 100,
+            precision: 1,
+            config_error: None,
+            renewal_lookup: Some(renewal_lookup::Lookup::from_receiver(lookup_rx)),
+            renewal_error: None,
+            #[cfg(target_os = "macos")]
+            menubar: None,
+            #[cfg(target_os = "macos")]
+            shown: true,
+        };
+        lookup_tx
+            .send(Ok(Cycle {
+                verb: "renews".into(),
+                at: 1_790_000_000,
+            }))
+            .unwrap();
+        app.drain();
+        assert!(app.renewal_lookup.is_none());
+        assert_eq!(
+            app.slots[&Provider::Claude].cycle.as_ref().unwrap().at,
+            1_790_000_000
+        );
+        assert!(refresh_rx.try_recv().is_ok());
+
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        app.renewal_lookup = Some(renewal_lookup::Lookup::from_receiver(lookup_rx));
+        lookup_tx.send(Err("Sign-in cancelled".into())).unwrap();
+        app.drain();
+        assert!(app.renewal_lookup.is_none());
+        assert_eq!(app.renewal_error.as_deref(), Some("Sign-in cancelled"));
+        assert!(refresh_rx.try_recv().is_err());
+        assert_eq!(
+            app.slots[&Provider::Claude].cycle.as_ref().unwrap().at,
+            1_790_000_000
+        );
     }
 }
 
@@ -944,4 +1195,17 @@ fn finish(result: Result<String, String>) -> eframe::Result {
     }
     println!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod display_tests {
+    #[test]
+    fn estimates_do_not_round_into_the_next_reported_percent() {
+        for precision in [0, 1, 2] {
+            assert_eq!(super::percent_label(87.99, precision, true), "~87.99%");
+            assert_eq!(super::percent_label(87.999, precision, true), "~87.99%");
+        }
+        assert_eq!(super::percent_label(87.0, 0, true), "~87.00%");
+        assert_eq!(super::percent_label(87.0, 0, false), "87%");
+    }
 }

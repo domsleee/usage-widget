@@ -43,12 +43,56 @@ enabled = true      # false hides a service; same key under each
 enabled = true
 api = true          # false = read Claude Code's cache only
 browser_cookies = false  # macOS: read the claude.ai login cookie for the renewal date
+# renewal_date = "2026-10-12"  # optional manual next billing date, including Windows
 estimate = false    # estimate between percentage ticks from local logs; shown with ~
 
 [codex]
 enabled = true
 estimate = false    # as for Claude
 ```
+
+`claude.renewal_date` uses your local calendar date and overrides browser lookup.
+Update it after each renewal; the widget does not assume a monthly billing schedule.
+An invalid or past date shows a note while usage meters keep working.
+
+### Look up Claude's renewal date with Playwright
+
+When Claude's renewal date is missing, click the tiny circular-arrow icon beside
+**Claude**. Once the date is shown, right-click the renewal text and choose
+**Look up renewal** instead (right-click the Claude name on spend-only rows).
+With Node.js and Chrome
+installed, it sets up the helper automatically, opens Chrome for sign-in, and
+applies the saved date without restarting the widget. The icon becomes a spinner
+while a lookup is running, or turns red on failure; hover for details and click to retry.
+
+To run the helper separately from this checkout:
+
+```powershell
+npm ci --prefix scripts
+npm --prefix scripts run claude-renewal
+```
+
+The helper opens regular Chrome with a separate profile. Complete any verification
+and sign in to Claude there on the first run. Playwright attaches only after the
+Claude app opens; it does not run during verification or sign-in. The profile
+remembers that session for future lookups. The helper checks the workspace
+against Claude Code's account, reads the subscription date, and saves
+`claude.renewal_date` in your config. Run it again
+after each renewal; this is an on-demand lookup, with no extension or background
+browser polling. Cancelled subscriptions leave the config unchanged.
+
+The helper preserves existing settings, formatting and comments, and keeps the
+first backup as `config.toml.before-renewal`. Unsupported TOML layouts are left
+unchanged with an error. The browser profile is
+stored in `claude-browser` beside the config. Use `-- --browser msedge` for Edge;
+`-- --config <path> --profile <directory>` allows separate test settings and login.
+
+While the helper is open, its dedicated browser exposes a debugging endpoint to
+local processes on this computer. It closes immediately after reading the date.
+Widget lookups have a timeout and stop their processes when the widget closes;
+right-click the renewal text to cancel an active lookup. Progress and failures
+appear beside the renewal text. Estimated usage always shows at least two decimal
+places so it cannot round up to the next reported percentage.
 
 ## Credentials
 
