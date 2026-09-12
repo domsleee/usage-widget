@@ -127,5 +127,9 @@ This updates usage as you use Claude Code, without extra requests. Without it,
 the widget uses cached data and polls at most every 15 minutes, subject to rate limits.
 
 Estimates only cover local logs; Claude needs a few percentage ticks to calibrate.
+With `estimate = true`, daily JSONL history retains readings, token counts,
+calibration and predictions until manually removed. It excludes conversations and
+credentials. See [estimate history](docs/estimate-history.md) for paths, token
+totals and replay rules.
 Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,
 with a keychain access prompt on first use. Dollar rates: `src/providers.rs`.

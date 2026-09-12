@@ -32,17 +32,66 @@ fn rate_card(model: &str) -> (f64, f64, f64) {
 
 /// The estimated share of the next point already used (0.0 to 0.99), given the
 /// server's whole `pct` for the weekly window that resets at `window`.
-pub fn fraction(pct: f64, window: i64, plan: &str) -> Option<f64> {
+pub fn fraction(
+    pct: f64,
+    window: i64,
+    plan: &str,
+    observed_at: i64,
+) -> Result<Option<f64>, String> {
     let mut state = State::load();
     let mut events = state.scan();
+    let received_at = chrono::Utc::now().to_rfc3339();
     events.sort_by(|a, b| a.ts.cmp(&b.ts));
-    for e in &events {
-        state.week.apply(e.pct, e.window, &e.plan, e.credits);
-    }
-    state.week.observe(pct, window, plan);
-    let result = state.week.fraction(pct, window);
+    let mut batch = Batch {
+        before: state.week.clone(),
+        events,
+        pct,
+        window,
+        plan: plan.to_string(),
+        source: "usage_api".into(),
+        source_at: None,
+        observed_at,
+        estimate: None,
+    };
+    let (week, result) = batch.replay();
+    state.week = week;
+    batch.estimate = result.map(|fraction| pct.round() + fraction);
+    crate::estimate_history::append("codex", &received_at, &batch)?;
     state.save();
-    result
+    Ok(result)
+}
+
+/// One refresh in arrival order. The checkpoint supports replay after upgrading
+/// from an old cache, or when a previous batch/cache write was interrupted.
+#[derive(Serialize, Deserialize)]
+struct Batch {
+    before: Tracker,
+    events: Vec<Event>,
+    pct: f64,
+    window: i64,
+    plan: String,
+    source: String,
+    /// The API supplies no timestamp; don't invent one from the receipt time.
+    source_at: Option<i64>,
+    observed_at: i64,
+    /// Predicted percentage; null means the authoritative reading was displayed.
+    estimate: Option<f64>,
+}
+
+impl Batch {
+    fn replay(&self) -> (Tracker, Option<f64>) {
+        let mut tracker = self.before.clone();
+        for e in &self.events {
+            if let (Some(pct), Some(window)) = (e.pct, e.window) {
+                tracker.apply(pct, window, &e.plan, e.credits);
+            }
+        }
+        let result = crate::providers::whole_percent(self.pct).and_then(|pct| {
+            tracker.observe(pct, self.window, &self.plan);
+            tracker.fraction(pct, self.window)
+        });
+        (tracker, result)
+    }
 }
 
 /// Where the scan stopped in one session log, plus what it needs to turn the
@@ -57,12 +106,17 @@ struct Cursor {
     totals: [u64; 3],
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Event {
     ts: String,
+    session: String,
+    model: String,
+    /// Deltas and original cumulative counters (input includes cached input).
+    tokens: [u64; 3],
+    totals: [u64; 3],
     credits: f64,
-    pct: f64,
-    window: i64,
+    pct: Option<f64>,
+    window: Option<i64>,
     plan: String,
 }
 
@@ -234,16 +288,9 @@ fn parse_line(
     }
 
     let limits = &payload["rate_limits"];
-    let Some(week) = [&limits["primary"], &limits["secondary"]]
+    let week = [&limits["primary"], &limits["secondary"]]
         .into_iter()
-        .find(|w| w["window_minutes"].as_i64() == Some(WEEK_MINUTES))
-    else {
-        return;
-    };
-    let (Some(pct), Some(window)) = (week["used_percent"].as_f64(), week["resets_at"].as_i64())
-    else {
-        return;
-    };
+        .find(|w| w["window_minutes"].as_i64() == Some(WEEK_MINUTES));
     // `input_tokens` includes the cached ones.
     let (rate_in, rate_cached, rate_out) = rate_card(&cursor.model);
     let credits = (input.saturating_sub(cached) as f64 * rate_in
@@ -252,9 +299,13 @@ fn parse_line(
         / 1e6;
     events.push(Event {
         ts: v["timestamp"].as_str().unwrap_or_default().to_string(),
+        session: cursor.session.clone(),
+        model: cursor.model.clone(),
+        tokens: [input, cached, output],
+        totals: now,
         credits,
-        pct,
-        window,
+        pct: week.and_then(|w| w["used_percent"].as_f64()),
+        window: week.and_then(|w| w["resets_at"].as_i64()),
         plan: limits["plan_type"].as_str().unwrap_or_default().to_string(),
     });
 }
@@ -287,7 +338,10 @@ mod tests {
         let credits: Vec<f64> = events.iter().map(|e| e.credits).collect();
         assert_eq!(credits, [250.0, 25.0 + 1250.0]);
         assert_eq!(events[1].plan, "prolite");
-        assert_eq!((events[1].pct, events[1].window), (72.0, 99));
+        assert_eq!((events[1].pct, events[1].window), (Some(72.0), Some(99)));
+        assert_eq!(events[1].tokens, [1_000_000, 1_000_000, 1_000_000]);
+        assert_eq!(events[1].totals, [2_000_000, 1_000_000, 1_000_000]);
+        assert_eq!(events[1].model, "gpt-6-astra");
     }
 
     #[test]
@@ -319,5 +373,65 @@ mod tests {
         );
         let credits: Vec<f64> = events.iter().map(|e| e.credits).collect();
         assert_eq!(credits, [100.0, 0.0, 100.0]);
+    }
+
+    #[test]
+    fn preserves_tokens_without_a_limit_reading() {
+        let mut line: Value = serde_json::from_str(&count_line(100, 20, 10)).unwrap();
+        line["payload"]["rate_limits"] = Value::Null;
+        line["payload"]["conversation"] = Value::String("must not be recorded".into());
+        let (mut cursor, mut sessions, mut events) =
+            (Cursor::default(), HashMap::new(), Vec::new());
+        parse_line(&line.to_string(), &mut cursor, &mut sessions, &mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens, [100, 20, 10]);
+        assert_eq!(events[0].pct, None);
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("must not be recorded")
+        );
+    }
+
+    #[test]
+    fn saved_batch_replays_from_existing_calibration_with_late_events() {
+        let window = 1_789_462_965;
+        let mut before = Tracker::default();
+        for pct in [10.0, 11.0, 12.0, 13.0] {
+            before.apply(pct, window, "plus", 20.0);
+        }
+        let event = |pct, credits| Event {
+            ts: "2026-09-12T08:50:19Z".into(),
+            session: "session-1".into(),
+            model: "gpt-5.6-sol".into(),
+            tokens: [100, 0, 0],
+            totals: [200, 0, 0],
+            credits,
+            pct: Some(pct),
+            window: Some(window),
+            plan: "plus".into(),
+        };
+        let mut batch = Batch {
+            before,
+            events: vec![event(12.0, 10.0), event(13.0, 5.0)],
+            pct: 13.0,
+            window,
+            plan: "plus".into(),
+            source: "usage_api".into(),
+            source_at: None,
+            observed_at: 1_789_203_100,
+            estimate: None,
+        };
+        let (_, original) = batch.replay();
+        assert!((original.unwrap() - 5.0 / (70.0 / 3.0)).abs() < 1e-9);
+        batch.estimate = original.map(|f| batch.pct + f);
+        let saved = serde_json::to_string(&batch).unwrap();
+        let restored: Batch = serde_json::from_str(&saved).unwrap();
+        let (_, replayed) = restored.replay();
+        assert_eq!(replayed.map(|f| restored.pct + f), restored.estimate);
+        // Source precision is retained, and already-fractional readings get no guess.
+        batch.pct = 13.25;
+        assert_eq!(batch.replay().1, None);
+        assert!(serde_json::to_string(&batch).unwrap().contains("13.25"));
     }
 }

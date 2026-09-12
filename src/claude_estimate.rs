@@ -33,24 +33,87 @@ fn prices(model: &str) -> [f64; 4] {
 
 /// For each `(label, whole percent, window reset time)` reading, taken at
 /// `observed_at`, the estimated share of the next point already used.
-pub fn fractions(readings: &[(&str, f64, i64)], observed_at: i64, plan: &str) -> Vec<Option<f64>> {
+pub fn fractions(
+    readings: &[(&str, f64, i64)],
+    observed_at: i64,
+    plan: &str,
+    source: &str,
+) -> Result<Vec<Option<f64>>, String> {
     let mut state = State::load();
     let mut events = state.scan();
-    events.sort_by(|a, b| a.0.total_cmp(&b.0));
-    // Use logged before the reading was taken led up to it; the rest came after.
-    let split = events.partition_point(|e| e.0 <= observed_at as f64);
-    let result = readings
+    let received_at = chrono::Utc::now().to_rfc3339();
+    events.sort_by_key(|e| e.ts);
+    let mut batch = Batch {
+        before: state.windows.clone(),
+        events,
+        readings: readings
+            .iter()
+            .map(|&(label, pct, window)| (label.to_string(), pct, window))
+            .collect(),
+        source_at: observed_at,
+        source: source.to_string(),
+        plan: plan.to_string(),
+        estimates: Vec::new(),
+    };
+    let (windows, result) = batch.replay();
+    state.windows = windows;
+    batch.estimates = readings
         .iter()
-        .map(|&(label, pct, window)| {
-            let tracker = state.windows.entry(label.to_string()).or_default();
-            events[..split].iter().for_each(|e| tracker.spend(e.1));
-            tracker.observe(pct, window, plan);
-            events[split..].iter().for_each(|e| tracker.spend(e.1));
-            tracker.fraction(pct, window)
-        })
+        .zip(&result)
+        .map(|((_, pct, _), fraction)| fraction.map(|f| pct.round() + f))
         .collect();
+    crate::estimate_history::append("claude", &received_at, &batch)?;
     state.save();
-    result
+    Ok(result)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Batch {
+    before: HashMap<String, Tracker>,
+    events: Vec<Event>,
+    readings: Vec<(String, f64, i64)>,
+    source_at: i64,
+    source: String,
+    plan: String,
+    /// Predicted percentages, in reading order; null means no local estimate.
+    estimates: Vec<Option<f64>>,
+}
+
+impl Batch {
+    fn replay(&self) -> (HashMap<String, Tracker>, Vec<Option<f64>>) {
+        let mut windows = self.before.clone();
+        // Preserve the original estimator's second-resolution timestamp split.
+        let split = self.events.partition_point(|e| e.ts <= self.source_at);
+        let result = self
+            .readings
+            .iter()
+            .map(|(label, pct, window)| {
+                crate::providers::whole_percent(*pct).and_then(|pct| {
+                    let tracker = windows.entry(label.clone()).or_default();
+                    self.events[..split]
+                        .iter()
+                        .for_each(|e| tracker.spend(e.cost));
+                    tracker.observe(pct, *window, &self.plan);
+                    self.events[split..]
+                        .iter()
+                        .for_each(|e| tracker.spend(e.cost));
+                    tracker.fraction(pct, *window)
+                })
+            })
+            .collect();
+        (windows, result)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Event {
+    ts: i64,
+    source_at: String,
+    response_id: String,
+    model: String,
+    /// Input (excluding cache), cache creation, cache read, output.
+    tokens: [u64; 4],
+    cost: f64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -87,8 +150,8 @@ impl State {
         }
     }
 
-    /// New responses as `(unix time, priced cost)`, from transcripts that grew.
-    fn scan(&mut self) -> Vec<(f64, f64)> {
+    /// New responses from transcripts that grew.
+    fn scan(&mut self) -> Vec<Event> {
         let Some(root) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) else {
             return Vec::new();
         };
@@ -124,7 +187,7 @@ impl State {
     }
 }
 
-fn parse_line(line: &str, seen: &mut HashMap<String, i64>, events: &mut Vec<(f64, f64)>) {
+fn parse_line(line: &str, seen: &mut HashMap<String, i64>, events: &mut Vec<Event>) {
     if !line.contains("\"usage\"") || !line.contains("\"assistant\"") {
         return;
     }
@@ -146,14 +209,27 @@ fn parse_line(line: &str, seen: &mut HashMap<String, i64>, events: &mut Vec<(f64
         return;
     }
     // Anthropic's `input_tokens` excludes the cached ones.
-    let tokens = |k: &str| usage[k].as_u64().unwrap_or(0) as f64;
+    let tokens = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ]
+    .map(|k| usage[k].as_u64().unwrap_or(0));
     let p = prices(message["model"].as_str().unwrap_or_default());
-    let cost = (tokens("input_tokens") * p[0]
-        + tokens("cache_creation_input_tokens") * p[1]
-        + tokens("cache_read_input_tokens") * p[2]
-        + tokens("output_tokens") * p[3])
+    let cost = (tokens[0] as f64 * p[0]
+        + tokens[1] as f64 * p[1]
+        + tokens[2] as f64 * p[2]
+        + tokens[3] as f64 * p[3])
         / 1e6;
-    events.push((ts as f64, cost));
+    events.push(Event {
+        ts,
+        source_at: v["timestamp"].as_str().unwrap_or_default().to_string(),
+        response_id: id.to_string(),
+        model: message["model"].as_str().unwrap_or_default().to_string(),
+        tokens,
+        cost,
+    });
 }
 
 #[cfg(test)]
@@ -171,9 +247,60 @@ mod tests {
         parse_line(&line("a", "claude-opus-5"), &mut seen, &mut events);
         parse_line(&line("a", "claude-opus-5"), &mut seen, &mut events); // same response, next block
         parse_line(&line("b", "claude-haiku-4-5"), &mut seen, &mut events);
-        let costs: Vec<f64> = events.iter().map(|e| e.1).collect();
+        let costs: Vec<f64> = events.iter().map(|e| e.cost).collect();
         assert_eq!(costs, [5.0 + 6.25 + 0.5 + 25.0, 1.0 + 1.25 + 0.1 + 5.0]);
         // 2026-09-11T13:40:00Z is 1_789_134_000; 08:50:19 is 4h 49m 41s earlier.
-        assert_eq!(events[0].0, 1_789_116_619.0);
+        assert_eq!(events[0].ts, 1_789_116_619);
+        assert_eq!(events[0].source_at, "2026-09-11T08:50:19Z");
+        assert_eq!(events[0].response_id, "a");
+        assert_eq!(events[0].model, "claude-opus-5");
+        assert_eq!(events[0].tokens, [1_000_000; 4]);
+    }
+
+    #[test]
+    fn saved_batch_preserves_reading_boundary_and_replays_both_windows() {
+        let window = 1_789_462_965;
+        let mut tracker = Tracker::default();
+        tracker.observe(10.0, window, "Max 5x");
+        for pct in [11.0, 12.0, 13.0] {
+            tracker.spend(8.0);
+            tracker.observe(pct, window, "Max 5x");
+        }
+        let event = |ts, cost| Event {
+            ts,
+            source_at: format!("2026-09-12T08:50:{ts:02}.500Z"),
+            response_id: format!("response-{ts}"),
+            model: "claude-sonnet".into(),
+            tokens: [100, 0, 0, 10],
+            cost,
+        };
+        let mut batch = Batch {
+            before: HashMap::from([("5h".into(), tracker.clone()), ("week".into(), tracker)]),
+            events: vec![event(19, 8.0), event(21, 2.0)],
+            readings: vec![("5h".into(), 14.0, window), ("week".into(), 13.0, window)],
+            source_at: 20,
+            source: "statusline".into(),
+            plan: "Max 5x".into(),
+            estimates: vec![],
+        };
+        let (_, original) = batch.replay();
+        assert_eq!(original, [Some(0.25), Some(0.99)]);
+        batch.estimates = batch
+            .readings
+            .iter()
+            .zip(original)
+            .map(|((_, pct, _), f)| f.map(|f| pct + f))
+            .collect();
+        let restored: Batch =
+            serde_json::from_str(&serde_json::to_string(&batch).unwrap()).unwrap();
+        let replayed: Vec<_> = restored
+            .readings
+            .iter()
+            .zip(restored.replay().1)
+            .map(|((_, pct, _), f)| f.map(|f| pct + f))
+            .collect();
+        assert_eq!(replayed, restored.estimates);
+        batch.readings[0].1 = 14.25;
+        assert_eq!(batch.replay().1[0], None);
     }
 }

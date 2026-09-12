@@ -11,7 +11,7 @@ const MIN_POINTS: f64 = 3.0;
 /// Points a finished window must have gained to be remembered for the next one.
 const MIN_POINTS_FINISHED: f64 = 5.0;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Tracker {
     /// The window being tracked, by its reset time.

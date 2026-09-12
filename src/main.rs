@@ -8,6 +8,7 @@ mod claude_web;
 mod codex_estimate;
 mod config;
 mod estimate;
+mod estimate_history;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod providers;
