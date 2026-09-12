@@ -148,11 +148,71 @@ impl App {
         }
     }
 
+    /// An App with no window and no menu bar, plus the far ends of its channels.
+    #[cfg(test)]
+    fn for_test(providers: Vec<Provider>) -> (Self, Sender<Update>, Receiver<()>) {
+        let (updates, rx) = mpsc::channel();
+        let (refresh_tx, refresh_rx) = mpsc::channel();
+        let slots = providers.iter().map(|p| (*p, Slot::default())).collect();
+        let app = Self {
+            providers,
+            slots,
+            rx,
+            refresh_tx,
+            interval: Duration::from_secs(300),
+            opacity: 100,
+            precision: 1,
+            config_error: None,
+            renewal_lookup: None,
+            renewal_error: None,
+            renewal_applied_at: None,
+            #[cfg(target_os = "macos")]
+            menubar: None,
+            #[cfg(target_os = "macos")]
+            shown: true,
+        };
+        (app, updates, refresh_rx)
+    }
+
     fn refresh_now(&mut self) {
         for slot in self.slots.values_mut() {
             slot.loading = true;
         }
         let _ = self.refresh_tx.send(());
+    }
+
+    /// Menu bar clicks. Called from `logic`, which runs before every `ui` pass and
+    /// also while the widget is hidden — when eframe runs no egui pass at all, so
+    /// handling these in `ui` would leave a hidden widget with no way back.
+    #[cfg(target_os = "macos")]
+    fn handle_menu(&mut self, ctx: &egui::Context) {
+        let Some(actions) = self.menubar.as_ref().map(menubar::MenuBar::take_actions) else {
+            return;
+        };
+        for action in actions {
+            self.apply_menu_action(action, ctx);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apply_menu_action(&mut self, action: menubar::Action, ctx: &egui::Context) {
+        match action {
+            menubar::Action::ToggleWidget => {
+                self.shown = !self.shown;
+                ctx.send_viewport_cmd(ViewportCommand::Visible(self.shown));
+                if let Some(bar) = &self.menubar {
+                    bar.set_widget_shown(self.shown);
+                }
+            }
+            menubar::Action::Refresh => self.refresh_now(),
+            menubar::Action::Open(p) => ctx.open_url(egui::OpenUrl::new_tab(p.url())),
+            menubar::Action::EditConfig => {
+                if let Err(e) = config::open(false) {
+                    self.config_error = Some(e);
+                }
+            }
+            menubar::Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+        }
     }
 
     fn drain(&mut self) {
@@ -831,6 +891,15 @@ fn refresh_button(ui: &mut egui::Ui, tooltip: &str, error: bool) -> bool {
 }
 
 impl eframe::App for App {
+    /// Runs before every `ui` pass, and is all that runs while the widget is
+    /// hidden: eframe leaves the egui state untouched then, so this is the only
+    /// chance to act on "Show widget".
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain();
+        #[cfg(target_os = "macos")]
+        self.handle_menu(_ctx);
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         if cfg!(target_os = "macos") {
             Color32::TRANSPARENT.to_normalized_gamma_f32()
@@ -843,7 +912,6 @@ impl eframe::App for App {
         // Cheap and idempotent; re-applied every frame because winit rewrites the
         // window styles whenever its own flags change (focus, level, visibility).
         apply_window_style(frame, self.opacity);
-        self.drain();
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(Duration::from_secs(30));
 
@@ -861,23 +929,6 @@ impl eframe::App for App {
             clicked: false,
             cancelled: false,
         };
-
-        #[cfg(target_os = "macos")]
-        if let Some(bar) = &self.menubar {
-            for action in bar.take_actions() {
-                match action {
-                    menubar::Action::ToggleWidget => {
-                        self.shown = !self.shown;
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(self.shown));
-                        bar.set_widget_shown(self.shown);
-                    }
-                    menubar::Action::Refresh => refresh = true,
-                    menubar::Action::Open(p) => ctx.open_url(egui::OpenUrl::new_tab(p.url())),
-                    menubar::Action::EditConfig => edit_config = true,
-                    menubar::Action::Quit => quit = true,
-                }
-            }
-        }
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -1002,27 +1053,10 @@ mod lookup_tests {
 
     #[test]
     fn completion_applies_date_and_refreshes_without_restart() {
-        let (updates, rx) = mpsc::channel();
         let stale_started = std::time::Instant::now();
-        let (refresh_tx, refresh_rx) = mpsc::channel();
         let (lookup_tx, lookup_rx) = mpsc::channel();
-        let mut app = App {
-            providers: vec![Provider::Claude],
-            slots: HashMap::from([(Provider::Claude, Slot::default())]),
-            rx,
-            refresh_tx,
-            interval: Duration::from_secs(300),
-            opacity: 100,
-            precision: 1,
-            config_error: None,
-            renewal_lookup: Some(renewal_lookup::Lookup::from_receiver(lookup_rx)),
-            renewal_error: None,
-            renewal_applied_at: None,
-            #[cfg(target_os = "macos")]
-            menubar: None,
-            #[cfg(target_os = "macos")]
-            shown: true,
-        };
+        let (mut app, updates, refresh_rx) = App::for_test(vec![Provider::Claude]);
+        app.renewal_lookup = Some(renewal_lookup::Lookup::from_receiver(lookup_rx));
         lookup_tx
             .send(Ok(Cycle {
                 date_only: false,
@@ -1247,5 +1281,64 @@ mod display_tests {
         assert_eq!(super::percent_label(87.0, 0, true), "~87.00%");
         assert_eq!(super::percent_label(87.0, 0, false), "87%");
         assert_eq!(super::percent_label(87.999, 3, true), "~87.990%");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod menu_tests {
+    use super::*;
+
+    /// The commands eframe would pick up, collected the way it collects them while
+    /// the widget is hidden and no egui pass runs.
+    fn commands(
+        ctx: &egui::Context,
+        app: &mut App,
+        action: menubar::Action,
+    ) -> Vec<ViewportCommand> {
+        ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            app.apply_menu_action(action, ctx);
+        })
+        .viewport_commands
+        .get(&egui::ViewportId::ROOT)
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    /// A hidden widget can be brought back: nothing but this runs while it is
+    /// hidden, so the command has to come from the menu action itself.
+    #[test]
+    fn toggling_hides_the_widget_and_shows_it_again() {
+        let ctx = egui::Context::default();
+        let (mut app, _updates, _refresh_rx) = App::for_test(vec![Provider::Claude]);
+
+        let hide = commands(&ctx, &mut app, menubar::Action::ToggleWidget);
+        assert!(!app.shown);
+        assert_eq!(hide, vec![ViewportCommand::Visible(false)]);
+
+        let show = commands(&ctx, &mut app, menubar::Action::ToggleWidget);
+        assert!(app.shown);
+        assert_eq!(show, vec![ViewportCommand::Visible(true)]);
+    }
+
+    #[test]
+    fn quitting_closes_the_window_even_while_hidden() {
+        let ctx = egui::Context::default();
+        let (mut app, _updates, _refresh_rx) = App::for_test(vec![Provider::Claude]);
+        app.shown = false;
+
+        let quit = commands(&ctx, &mut app, menubar::Action::Quit);
+
+        assert_eq!(quit, vec![ViewportCommand::Close]);
+    }
+
+    #[test]
+    fn refreshing_from_the_menu_asks_the_worker_for_new_numbers() {
+        let ctx = egui::Context::default();
+        let (mut app, _updates, refresh_rx) = App::for_test(vec![Provider::Claude]);
+
+        commands(&ctx, &mut app, menubar::Action::Refresh);
+
+        assert!(app.slots[&Provider::Claude].loading);
+        assert!(refresh_rx.try_recv().is_ok());
     }
 }
