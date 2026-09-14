@@ -126,6 +126,14 @@ pub struct Meter {
     pub resets_at: Option<i64>,
 }
 
+/// Monthly spend without rolling usage windows, including uncapped accounts.
+pub fn spend_meter(meters: &[Meter]) -> Option<&Meter> {
+    match meters {
+        [m] if m.unit == Unit::Dollars && m.label.is_none() => Some(m),
+        _ => None,
+    }
+}
+
 impl Meter {
     pub fn fraction(&self) -> f32 {
         if self.total <= 0.0 {
@@ -567,38 +575,8 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         state.save();
     }
 
-    let manual_cycle = config
-        .renewal_date
-        .as_deref()
-        .map(|date| manual_claude_cycle(date, chrono::Local::now().date_naive()));
-    let mut renewal_problem = manual_cycle
-        .as_ref()
-        .and_then(|c| c.as_ref().err())
-        .cloned();
-    if config.browser_cookies && !matches!(&manual_cycle, Some(Ok(_))) {
-        // Fetch daily and again once the saved date has passed; after a failure retry
-        // at most hourly, so a denied keychain prompt doesn't return every refresh.
-        let due = state
-            .renewal
-            .as_ref()
-            .is_none_or(|(fetched, c)| now - fetched >= 86_400 || now >= c.at);
-        if due && now - state.renewal_attempt >= 3600 {
-            state.renewal_attempt = now;
-            match crate::claude_web::cycle() {
-                Ok(c) => state.renewal = Some((now, c)),
-                Err(e) => {
-                    renewal_problem = Some(renewal_problem.map_or_else(
-                        || e.clone(),
-                        |manual| format!("{manual}; browser lookup: {e}"),
-                    ))
-                }
-            }
-            state.save();
-        }
-    }
-
     let rate_limited = now < state.blocked_until;
-    let snap = [cache, state.last]
+    let snap = [cache.as_ref(), state.last.as_ref()]
         .into_iter()
         .flatten()
         .max_by_key(|s| s.at);
@@ -664,22 +642,8 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         }
     }
 
-    let labels: Vec<&str> = meters.iter().filter_map(|m| m.label.as_deref()).collect();
-    let note = claude_staleness(now, live_at, snap_at, &labels).map(|mut note| {
-        if rate_limited {
-            note += &format!(" · rate limited · retry {}", until(state.blocked_until));
-        } else if let Some(p) = problem {
-            note += &format!(" · {p}");
-        }
-        note
-    });
-    let cycle = match manual_cycle {
-        Some(Ok(cycle)) => Some(cycle),
-        _ => state
-            .renewal
-            .filter(|_| config.browser_cookies)
-            .map(|(_, c)| c),
-    };
+    let note = claude_note(now, live_at, snap_at, &meters, state.blocked_until, problem);
+    let (cycle, renewal_problem) = claude_renewal(config, &mut state, now, &meters);
     // Say why the renewal date is missing, but only when there is none to show.
     let note = match renewal_problem.filter(|_| cycle.is_none()) {
         Some(e) => Some(note.map_or(format!("renewal: {e}"), |n| format!("{n} · renewal: {e}"))),
@@ -696,6 +660,79 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         estimated,
         meters,
     })
+}
+
+fn claude_note(
+    now: i64,
+    live_at: Option<i64>,
+    snap_at: Option<i64>,
+    meters: &[Meter],
+    blocked_until: i64,
+    problem: Option<String>,
+) -> Option<String> {
+    let labels: Vec<&str> = meters.iter().filter_map(|m| m.label.as_deref()).collect();
+    let stale = claude_staleness(now, live_at, snap_at, &labels)?;
+    let mut notes = Vec::new();
+    if spend_meter(meters).is_none() {
+        notes.push(stale);
+    }
+    if now < blocked_until {
+        notes.push(format!("rate limited · retry {}", until(blocked_until)));
+    } else if let Some(problem) = problem {
+        notes.push(problem);
+    }
+    (!notes.is_empty()).then(|| notes.join(" · "))
+}
+
+fn claude_renewal(
+    config: &crate::config::Claude,
+    state: &mut ClaudeState,
+    now: i64,
+    meters: &[Meter],
+) -> (Option<Cycle>, Option<String>) {
+    // Monthly spend needs neither a manual subscription date nor browser lookup.
+    if spend_meter(meters).is_some() {
+        return (None, None);
+    }
+    let manual_cycle = config
+        .renewal_date
+        .as_deref()
+        .map(|date| manual_claude_cycle(date, chrono::Local::now().date_naive()));
+    let mut renewal_problem = manual_cycle
+        .as_ref()
+        .and_then(|c| c.as_ref().err())
+        .cloned();
+    if config.browser_cookies && !matches!(&manual_cycle, Some(Ok(_))) {
+        // Fetch daily and again once the saved date has passed; after a failure retry
+        // at most hourly, so a denied keychain prompt doesn't return every refresh.
+        let due = state
+            .renewal
+            .as_ref()
+            .is_none_or(|(fetched, c)| now - fetched >= 86_400 || now >= c.at);
+        if due && now - state.renewal_attempt >= 3600 {
+            state.renewal_attempt = now;
+            match crate::claude_web::cycle() {
+                Ok(c) => state.renewal = Some((now, c)),
+                Err(e) => {
+                    renewal_problem = Some(renewal_problem.map_or_else(
+                        || e.clone(),
+                        |manual| format!("{manual}; browser lookup: {e}"),
+                    ))
+                }
+            }
+            state.save();
+        }
+    }
+
+    let cycle = match manual_cycle {
+        Some(Ok(cycle)) => Some(cycle),
+        _ => state
+            .renewal
+            .as_ref()
+            .filter(|_| config.browser_cookies)
+            .map(|(_, c)| c.clone()),
+    };
+    (cycle, renewal_problem)
 }
 
 /// A manually supplied next billing date, without guessing the billing cadence.
@@ -1270,6 +1307,69 @@ mod tests {
             note(Some(now - 1800), Some(now - 3600), &labels).as_deref(),
             Some("30m old")
         );
+    }
+
+    #[test]
+    fn monthly_spend_hides_age_but_keeps_stale_errors() {
+        let now = now_unix();
+        for total in [0.0, 100.0] {
+            let meters = claude_meters(&serde_json::json!({
+                "extra_usage": { "used_credits": 10, "monthly_limit": total }
+            }));
+            assert!(spend_meter(&meters).is_some());
+            let note =
+                |at, blocked, problem| claude_note(now, None, Some(at), &meters, blocked, problem);
+            assert_eq!(note(now - 1800, 0, None), None);
+            assert_eq!(note(now - 60, now + 900, None), None);
+            assert_eq!(note(now - 60, 0, Some("offline".into())), None);
+            assert!(
+                note(now - 1800, now + 900, None)
+                    .unwrap()
+                    .starts_with("rate limited")
+            );
+            assert_eq!(
+                note(now - 1800, 0, Some("offline".into())).as_deref(),
+                Some("offline")
+            );
+        }
+        let mixed = claude_meters(&serde_json::json!({
+            "five_hour": { "utilization": 20 },
+            "extra_usage": { "used_credits": 10, "monthly_limit": 100 }
+        }));
+        assert!(spend_meter(&mixed).is_none());
+        assert_eq!(
+            claude_note(now, None, Some(now - 1800), &mixed, 0, None).as_deref(),
+            Some("30m old")
+        );
+    }
+
+    #[test]
+    fn monthly_spend_skips_manual_and_browser_renewal() {
+        for total in [0.0, 100.0] {
+            for date in ["invalid", "2099-01-01"] {
+                let config = crate::config::Claude {
+                    browser_cookies: true,
+                    renewal_date: Some(date.into()),
+                    ..Default::default()
+                };
+                let mut state = ClaudeState::default();
+                state.renewal = Some((
+                    0,
+                    Cycle {
+                        verb: "renews".into(),
+                        at: 1,
+                        date_only: true,
+                    },
+                ));
+                let meters = claude_meters(&serde_json::json!({
+                    "extra_usage": { "used_credits": 10, "monthly_limit": total }
+                }));
+                let (cycle, error) = claude_renewal(&config, &mut state, now_unix(), &meters);
+                assert!(cycle.is_none());
+                assert!(error.is_none());
+                assert_eq!(state.renewal_attempt, 0);
+            }
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Cycle, Meter, Provider, Unit, Usage, money};
+use providers::{Cycle, Meter, Provider, Unit, Usage, money, spend_meter};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -224,6 +224,13 @@ impl App {
             match u.result {
                 Ok(usage) => {
                     slot.plan = usage.plan;
+                    let monthly_claude =
+                        u.provider == Provider::Claude && spend_meter(&usage.meters).is_some();
+                    if monthly_claude {
+                        self.renewal_lookup = None;
+                        self.renewal_error = None;
+                        self.renewal_applied_at = None;
+                    }
                     if u.provider != Provider::Claude
                         || self
                             .renewal_applied_at
@@ -525,10 +532,7 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated:
 /// The meter of a service that only reports spend with no sub-label (Copilot, or
 /// Claude and Codex on usage-based plans).
 fn spend_only(slot: &Slot) -> Option<&Meter> {
-    match slot.meters.as_deref() {
-        Some([m]) if m.unit == Unit::Dollars && m.label.is_none() && m.total > 0.0 => Some(m),
-        _ => None,
-    }
+    spend_meter(slot.meters.as_deref()?).filter(|m| m.total > 0.0)
 }
 
 struct RenewalButton<'a> {
@@ -539,8 +543,11 @@ struct RenewalButton<'a> {
 }
 
 impl RenewalButton<'_> {
-    fn show(&mut self, ui: &mut egui::Ui, provider: Provider, has_cycle: bool) {
-        if provider != Provider::Claude || has_cycle {
+    fn show(&mut self, ui: &mut egui::Ui, provider: Provider, slot: &Slot) {
+        if provider != Provider::Claude
+            || slot.cycle.is_some()
+            || slot.meters.as_deref().and_then(spend_meter).is_some()
+        {
             return;
         }
         if self.running {
@@ -596,7 +603,7 @@ fn provider_block(
     renewal: &mut RenewalButton<'_>,
 ) {
     if let Some(m) = spend_only(slot) {
-        spend_row(ui, p, slot, m, precision, renewal);
+        spend_row(ui, p, slot, m, precision);
     } else {
         header(ui, p, slot, renewal);
         ui.add_space(6.0);
@@ -628,14 +635,7 @@ fn provider_block(
 
 /// Name, amount and percentage on one line over one bar, as in the original
 /// widget. The plan and billing cycle move to the name's hover text.
-fn spend_row(
-    ui: &mut egui::Ui,
-    p: Provider,
-    slot: &Slot,
-    m: &Meter,
-    precision: usize,
-    renewal: &mut RenewalButton<'_>,
-) {
+fn spend_row(ui: &mut egui::Ui, p: Provider, slot: &Slot, m: &Meter, precision: usize) {
     let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
         let mut hover: Vec<String> = slot.plan.iter().cloned().collect();
@@ -643,33 +643,10 @@ fn spend_row(
             hover.push(format!("{} {}", c.verb, c.when()));
         }
         hover.push(p.url().into());
-        let status = if p == Provider::Claude && slot.cycle.is_some() {
-            if renewal.running {
-                " · looking up…"
-            } else if renewal.error.is_some() {
-                " · lookup failed"
-            } else {
-                ""
-            }
-        } else {
-            ""
-        };
-        if p == Provider::Claude
-            && let Some(error) = renewal.error
-        {
-            hover.push(error.into());
-        }
-        let name = RichText::new(format!("{}{status}", p.name()))
-            .size(13.0)
-            .strong()
-            .color(TEXT);
-        let response = ui
-            .hyperlink_to(name, p.url())
+        // Usage-based plans reset monthly and need no subscription renewal lookup.
+        let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
+        ui.hyperlink_to(name, p.url())
             .on_hover_text(hover.join("\n"));
-        if p == Provider::Claude && slot.cycle.is_some() {
-            renewal.context_menu(&response);
-        }
-        renewal.show(ui, p, slot.cycle.is_some());
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
@@ -763,7 +740,7 @@ fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot, renewal: &mut RenewalButt
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.hyperlink_to(name, p.url()).on_hover_text(p.url());
-        renewal.show(ui, p, slot.cycle.is_some());
+        renewal.show(ui, p, slot);
         let mut info: Vec<String> = slot.plan.iter().cloned().collect();
         let mut hover = None;
         if let Some(c) = &slot.cycle {
@@ -1051,6 +1028,47 @@ impl eframe::App for App {
 #[cfg(test)]
 mod lookup_tests {
     use super::*;
+
+    #[test]
+    fn monthly_spend_cancels_pending_renewal() {
+        for total in [0.0, 100.0] {
+            let (mut app, updates, _) = App::for_test(vec![Provider::Claude]);
+            let (_lookup_tx, lookup_rx) = mpsc::channel();
+            app.renewal_lookup = Some(renewal_lookup::Lookup::from_receiver(lookup_rx));
+            app.renewal_error = Some("previous failure".into());
+            app.renewal_applied_at = Some(std::time::Instant::now());
+            app.slots.get_mut(&Provider::Claude).unwrap().cycle = Some(Cycle {
+                verb: "renews".into(),
+                at: 1,
+                date_only: true,
+            });
+            updates
+                .send(Update {
+                    provider: Provider::Claude,
+                    result: Ok(Usage {
+                        plan: None,
+                        cycle: None,
+                        note: None,
+                        estimated: Vec::new(),
+                        meters: vec![Meter {
+                            label: None,
+                            used: 10.0,
+                            total,
+                            unit: Unit::Dollars,
+                            resets_at: None,
+                        }],
+                    }),
+                    at: now_unix(),
+                    started: std::time::Instant::now(),
+                })
+                .unwrap();
+            app.drain();
+            assert!(app.renewal_lookup.is_none());
+            assert!(app.renewal_error.is_none());
+            assert!(app.renewal_applied_at.is_none());
+            assert!(app.slots[&Provider::Claude].cycle.is_none());
+        }
+    }
 
     #[test]
     fn completion_applies_date_and_refreshes_without_restart() {
