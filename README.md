@@ -124,7 +124,7 @@ case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-
 ```
 
 This updates usage as you use Claude Code, without extra requests. Without it,
-the widget uses cached data and polls at most every 15 minutes, subject to rate limits.
+the widget uses cached data and polls at most every 3 minutes, subject to rate limits.
 
 Estimates only cover local logs; Claude needs a few percentage ticks to calibrate.
 With `estimate = true`, daily JSONL history retains readings, token counts,

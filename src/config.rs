@@ -24,7 +24,7 @@ enabled = true
 [claude]
 enabled = true
 # Usage comes from Claude Code's own cache (~/.claude.json). When that is over
-# 15 minutes old, ask Anthropic directly, at most every 15 minutes.
+# 3 minutes old, ask Anthropic directly, at most every 3 minutes.
 # false = never call Anthropic, only read the cache.
 api = true
 # macOS: read your claude.ai login cookie from Chrome, Arc, Brave or Edge to

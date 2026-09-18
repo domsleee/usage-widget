@@ -389,11 +389,15 @@ fn claude_keychain_credentials() -> Result<Value, String> {
     serde_json::from_slice(&out.stdout).map_err(|e| format!("bad JSON in keychain entry: {e}"))
 }
 
-/// Anthropic gives each OAuth token only a handful of usage calls before
-/// answering 429 for up to an hour, and Claude Code spends the same budget.
-/// Claude Code caches its own responses in ~/.claude.json, so read that and call
-/// the API only when it is stale, and no more than once per this many seconds.
+/// Anthropic limits usage calls per OAuth token, and Claude Code spends the same
+/// budget. Claude Code caches its own responses in ~/.claude.json, so read that
+/// and call the API only when it is stale, and no more than once per this many
+/// seconds. Clients that identify as Claude Code are reported safe at this rate.
+const CLAUDE_POLL_SECS: i64 = 180;
+/// Older Claude data is flagged as old, and a 429 pauses calls at least this long.
 const CLAUDE_FRESH_SECS: i64 = 15 * 60;
+/// Sent when ~/.claude.json doesn't name a version; it need not be exact.
+const CLAUDE_CODE_VERSION: &str = "2.1.276";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Snapshot {
@@ -517,15 +521,19 @@ fn claude_staleness(
 }
 
 fn claude_should_call(api: bool, now: i64, newest: Option<i64>, state: &ClaudeState) -> bool {
-    let fresh = newest.is_some_and(|at| now - at < CLAUDE_FRESH_SECS);
-    api && !fresh && now >= state.blocked_until && now - state.last_attempt >= CLAUDE_FRESH_SECS
+    let fresh = newest.is_some_and(|at| now - at < CLAUDE_POLL_SECS);
+    api && !fresh && now >= state.blocked_until && now - state.last_attempt >= CLAUDE_POLL_SECS
 }
 
 fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
     let api = config.api;
     let creds = claude_credentials();
     let oauth = creds.as_ref().map(|c| &c["claudeAiOauth"]);
-    let (cache, account) = claude_code_state();
+    let ClaudeCodeState {
+        cache,
+        account,
+        version,
+    } = claude_code_state();
     let mut state = ClaudeState::load();
     let now = now_unix();
     // Our saved response is only good for the account it was fetched for.
@@ -543,7 +551,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
     let mut problem = None;
     if claude_should_call(api, now, newest, &state) {
         state.last_attempt = now;
-        match claude_api(oauth) {
+        match claude_api(oauth, version.as_deref()) {
             Ok(usage) => {
                 state.last = Some(Snapshot {
                     at: now,
@@ -713,16 +721,25 @@ pub(crate) fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Resul
     })
 }
 
-/// From ~/.claude.json: Claude Code's latest /api/oauth/usage response, if it
-/// belongs to the logged-in account, and that account's id.
-fn claude_code_state() -> (Option<Snapshot>, Option<String>) {
+/// What ~/.claude.json says about the logged-in Claude Code install.
+#[derive(Default)]
+struct ClaudeCodeState {
+    /// Claude Code's latest /api/oauth/usage response, if it belongs to `account`.
+    cache: Option<Snapshot>,
+    account: Option<String>,
+    /// The newest Claude Code version that has run, e.g. "2.1.276".
+    version: Option<String>,
+}
+
+fn claude_code_state() -> ClaudeCodeState {
     let Some(v) = home()
         .ok()
         .and_then(|h| read_json_file(&h.join(".claude.json")).ok())
     else {
-        return (None, None);
+        return ClaudeCodeState::default();
     };
     let account = v["oauthAccount"]["accountUuid"].as_str().map(String::from);
+    let version = v["lastReleaseNotesSeen"].as_str().map(String::from);
     let c = &v["cachedUsageUtilization"];
     // Ignore a cache left behind by another account.
     let cache = (account.is_none() || c["accountUuid"].as_str() == account.as_deref())
@@ -734,7 +751,11 @@ fn claude_code_state() -> (Option<Snapshot>, Option<String>) {
             })
         })
         .flatten();
-    (cache, account)
+    ClaudeCodeState {
+        cache,
+        account,
+        version,
+    }
 }
 
 enum ClaudeError {
@@ -743,7 +764,19 @@ enum ClaudeError {
     Other(String),
 }
 
-fn claude_api(oauth: Result<&Value, &String>) -> Result<Value, ClaudeError> {
+/// The usage endpoint answers unknown clients with 429s after a few calls but
+/// gives Claude Code a generous limit, so identify as Claude Code.
+fn claude_user_agent(version: Option<&str>) -> String {
+    let version = version
+        .filter(|v| {
+            v.split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .unwrap_or(CLAUDE_CODE_VERSION);
+    format!("claude-code/{version}")
+}
+
+fn claude_api(oauth: Result<&Value, &String>, version: Option<&str>) -> Result<Value, ClaudeError> {
     use ClaudeError::Other;
     let oauth = oauth.map_err(|e| Other(e.clone()))?;
     let token = oauth["accessToken"]
@@ -756,11 +789,13 @@ fn claude_api(oauth: Result<&Value, &String>) -> Result<Value, ClaudeError> {
     }
 
     let auth = format!("Bearer {token}");
+    let user_agent = claude_user_agent(version);
     let (status, json, retry_after) = get_json_retry(
         "https://api.anthropic.com/api/oauth/usage",
         &[
             ("Authorization", &auth),
             ("anthropic-beta", "oauth-2025-04-20"),
+            ("User-Agent", &user_agent),
         ],
     )
     .map_err(Other)?;
@@ -1242,10 +1277,16 @@ mod tests {
         let now = 1_000_000;
         let idle = ClaudeState::default();
         assert!(!claude_should_call(true, now, Some(now - 60), &idle));
+        assert!(!claude_should_call(
+            true,
+            now,
+            Some(now - CLAUDE_POLL_SECS + 1),
+            &idle
+        ));
         assert!(claude_should_call(
             true,
             now,
-            Some(now - CLAUDE_FRESH_SECS),
+            Some(now - CLAUDE_POLL_SECS),
             &idle
         ));
         assert!(claude_should_call(true, now, None, &idle));
@@ -1260,6 +1301,15 @@ mod tests {
             ..Default::default()
         };
         assert!(!claude_should_call(true, now, None, &recent));
+    }
+
+    #[test]
+    fn claude_user_agent_names_claude_code() {
+        assert_eq!(claude_user_agent(Some("2.1.300")), "claude-code/2.1.300");
+        let fallback = format!("claude-code/{CLAUDE_CODE_VERSION}");
+        assert_eq!(claude_user_agent(None), fallback);
+        assert_eq!(claude_user_agent(Some("2.1.x")), fallback);
+        assert_eq!(claude_user_agent(Some("")), fallback);
     }
 
     #[test]
