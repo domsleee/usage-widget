@@ -1148,6 +1148,11 @@ usage: usage-widget [config | --startup | --no-startup]"
         None => {}
     }
 
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    if detach_from_terminal() {
+        return Ok(());
+    }
+
     let (config, config_error) = config::load();
     let options = eframe::NativeOptions {
         persist_window: true,
@@ -1175,6 +1180,45 @@ usage: usage-widget [config | --startup | --no-startup]"
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, config, config_error)))),
     )
+}
+
+/// Release builds on Windows have no console; this is the macOS equivalent. Started
+/// from a terminal, the widget relaunches itself with no terminal and returns the
+/// prompt. The relaunched copy has no terminal, so it runs the widget. If the
+/// relaunch fails, the widget runs in the foreground instead.
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn detach_from_terminal() -> bool {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    unsafe extern "C" {
+        fn setsid() -> i32;
+    }
+
+    let from_terminal = std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal();
+    if !from_terminal {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // A new session, so Ctrl+C or closing the terminal does not reach the widget.
+    unsafe {
+        cmd.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().is_ok()
 }
 
 /// Whole-window opacity through a layered window. Per-pixel transparency is not
