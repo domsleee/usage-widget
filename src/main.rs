@@ -20,6 +20,9 @@ const WIDTH: f32 = 250.0;
 const MARGIN: i8 = 12;
 const DEFAULT_REFRESH_MINS: u64 = 5;
 const DEFAULT_OPACITY_PERCENT: u32 = 85;
+/// Size presets in the right-click menu, applied as egui's zoom factor on top of
+/// the monitor's display scaling. Ctrl +/- also works; either way it persists.
+const SIZES: [f32; 6] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5];
 
 // The window is opaque and painted entirely in BG; Windows rounds the corners
 // at the compositor level (see `apply_windows_chrome`), so nothing else shows.
@@ -48,6 +51,8 @@ struct App {
     rx: Receiver<Update>,
     refresh_tx: Sender<()>,
     interval: Duration,
+    /// False until the window has been placed on screen and made topmost (see `settle_window`).
+    settled: bool,
 }
 
 impl App {
@@ -72,6 +77,7 @@ impl App {
             rx,
             refresh_tx,
             interval,
+            settled: false,
         }
     }
 
@@ -164,12 +170,40 @@ fn spawn_worker(
     });
 }
 
+#[cfg(windows)]
+fn hwnd(frame: &eframe::Frame) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(win) => Some(win.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32)
+    -> i32;
+}
+
+#[cfg(windows)]
+const HWND_TOPMOST: isize = -1;
+#[cfg(windows)]
+const SWP_NOSIZE: u32 = 0x1;
+#[cfg(windows)]
+const SWP_NOMOVE: u32 = 0x2;
+#[cfg(windows)]
+const SWP_NOACTIVATE: u32 = 0x10;
+
 /// Windows 11: round the window corners and drop the 1px accent border, so the
 /// frameless window looks like a floating card without needing transparency.
+/// Also puts the window back on top if something has dropped its topmost style.
 #[cfg(windows)]
 fn apply_windows_chrome(frame: &eframe::Frame) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+    }
     #[link(name = "dwmapi")]
     unsafe extern "system" {
         fn DwmSetWindowAttribute(
@@ -185,15 +219,25 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
     const DWMWCP_ROUND: u32 = 2;
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
 
-    let Ok(handle) = frame.window_handle() else {
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_TOPMOST: isize = 0x8;
+
+    let Some(hwnd) = hwnd(frame) else {
         return;
     };
-    let RawWindowHandle::Win32(win) = handle.as_raw() else {
-        return;
-    };
-    let hwnd = win.hwnd.get();
     set_opacity(hwnd);
     unsafe {
+        if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST == 0 {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -211,6 +255,75 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
 
 #[cfg(not(windows))]
 fn apply_windows_chrome(_frame: &eframe::Frame) {}
+
+/// Runs when the window is first visible and after each self-resize. Pulls it
+/// fully onto the nearest monitor's work area, since the saved position can point
+/// at a monitor that is no longer there (e.g. after hotdesking), and forces it to
+/// the top of the z-order: winit creates it hidden and the topmost level otherwise
+/// does not take effect until the window is first activated. Returns false until
+/// the window is visible.
+#[cfg(windows)]
+fn settle_window(frame: &eframe::Frame) -> bool {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MonitorInfo {
+        size: u32,
+        monitor: Rect,
+        work: Rect,
+        flags: u32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn MonitorFromRect(rect: *const Rect, flags: u32) -> isize;
+        fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    }
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
+    let Some(hwnd) = hwnd(frame) else {
+        return true;
+    };
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            return false;
+        }
+        let mut r = Rect::default();
+        let mut info = MonitorInfo {
+            size: size_of::<MonitorInfo>() as u32,
+            ..Default::default()
+        };
+        let mut flags = SWP_NOSIZE | SWP_NOACTIVATE;
+        let (mut x, mut y) = (r.left, r.top);
+        if GetWindowRect(hwnd, &mut r) != 0
+            && GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut info) != 0
+        {
+            let work = info.work;
+            x = r.left.min(work.right - (r.right - r.left)).max(work.left);
+            y = r.top.min(work.bottom - (r.bottom - r.top)).max(work.top);
+        } else {
+            flags |= SWP_NOMOVE;
+        }
+        if (x, y) == (r.left, r.top) {
+            flags |= SWP_NOMOVE;
+        }
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, flags);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn settle_window(_frame: &eframe::Frame) -> bool {
+    true
+}
 
 fn level_color(percent: f64) -> Color32 {
     if percent < 60.0 {
@@ -351,6 +464,12 @@ impl eframe::App for App {
         self.drain();
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(Duration::from_secs(30));
+        if !self.settled {
+            self.settled = settle_window(frame);
+            if !self.settled {
+                ctx.request_repaint();
+            }
+        }
 
         let panel = egui::Frame::NONE
             .fill(BG)
@@ -377,6 +496,17 @@ impl eframe::App for App {
                         ui.close();
                     }
                 }
+                ui.separator();
+                ui.menu_button("Size", |ui| {
+                    let current = ctx.zoom_factor();
+                    for z in SIZES {
+                        let label = format!("{:.0}%", z * 100.0);
+                        if ui.radio((current - z).abs() < 0.01, label).clicked() {
+                            ctx.set_zoom_factor(z);
+                            ui.close();
+                        }
+                    }
+                });
                 ui.separator();
                 ui.label(
                     RichText::new(format!(
@@ -426,11 +556,15 @@ impl eframe::App for App {
                 });
             });
 
-            // Grow or shrink the window to fit the content.
+            // Grow or shrink the window to fit the content. Sizes are in points, so
+            // this also resizes the window when the zoom factor changes.
             let wanted = content.response.rect.height() + 2.0 * MARGIN as f32;
-            let current = ctx.viewport_rect().height();
-            if (wanted - current).abs() > 1.5 {
+            let current = ctx.viewport_rect().size();
+            if (wanted - current.y).abs() > 1.5 || (WIDTH - current.x).abs() > 1.5 {
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(WIDTH, wanted)));
+                // The card grows downwards as data arrives (or on zoom), which can
+                // push it past the screen edge, so re-check placement next frame.
+                self.settled = false;
             }
         });
 
@@ -457,13 +591,16 @@ usage: usage-widget [--startup | --no-startup]"
         None => {}
     }
 
+    if !claim_single_instance() {
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         persist_window: true,
         viewport: ViewportBuilder::default()
             .with_app_id("usage-widget")
             .with_title("Usage")
             .with_inner_size([WIDTH, 180.0])
-            .with_min_inner_size([WIDTH, 60.0])
             .with_decorations(false)
             .with_always_on_top()
             .with_taskbar(false)
@@ -508,6 +645,33 @@ fn set_opacity(hwnd: isize) {
             SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
         }
     }
+}
+
+/// Holds a named mutex for the life of the process; returns false if another
+/// instance already holds it (e.g. launched again, or at login while running).
+#[cfg(windows)]
+fn claim_single_instance() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(attrs: *const core::ffi::c_void, owner: i32, name: *const u16) -> isize;
+        fn GetLastError() -> u32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    let name: Vec<u16> = r"Local\usage-widget-single-instance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // The handle is deliberately never closed; Windows releases it on exit.
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS
+    }
+}
+
+#[cfg(not(windows))]
+fn claim_single_instance() -> bool {
+    true
 }
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
