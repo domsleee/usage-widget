@@ -23,11 +23,6 @@ const DEFAULT_OPACITY_PERCENT: u32 = 85;
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
 const SIZES: [f32; 6] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5];
-/// Gap, in 96-DPI pixels, kept between the card and the screen edges or taskbar
-/// when it is snapped or pulled back on screen.
-const SNAP_PAD: i32 = 8;
-/// How close, in 96-DPI pixels, a dragged card has to get to an edge to snap.
-const SNAP_RANGE: i32 = 16;
 
 // The window is opaque and painted entirely in BG; Windows rounds the corners
 // at the compositor level (see `apply_windows_chrome`), so nothing else shows.
@@ -261,20 +256,22 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
 #[cfg(not(windows))]
 fn apply_windows_chrome(_frame: &eframe::Frame) {}
 
+/// Runs when the window is first visible and after each self-resize. Pulls it
+/// fully onto the nearest monitor's work area, since the saved position can point
+/// at a monitor that is no longer there (e.g. after hotdesking), and forces it to
+/// the top of the z-order: winit creates it hidden and the topmost level otherwise
+/// does not take effect until the window is first activated. Returns false until
+/// the window is visible.
 #[cfg(windows)]
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-/// Work area (the monitor minus the taskbar) of the monitor nearest to `r`, inset
-/// by the snap padding at that window's DPI.
-#[cfg(windows)]
-fn padded_work_area(hwnd: isize, r: &Rect) -> Option<Rect> {
+fn settle_window(frame: &eframe::Frame) -> bool {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
     #[repr(C)]
     #[derive(Default)]
     struct MonitorInfo {
@@ -285,59 +282,12 @@ fn padded_work_area(hwnd: isize, r: &Rect) -> Option<Rect> {
     }
     #[link(name = "user32")]
     unsafe extern "system" {
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn MonitorFromRect(rect: *const Rect, flags: u32) -> isize;
         fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     }
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
-
-    let mut info = MonitorInfo {
-        size: size_of::<MonitorInfo>() as u32,
-        ..Default::default()
-    };
-    if unsafe { GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &mut info) } == 0 {
-        return None;
-    }
-    let pad = scaled(hwnd, SNAP_PAD);
-    let w = info.work;
-    Some(Rect {
-        left: w.left + pad,
-        top: w.top + pad,
-        right: w.right - pad,
-        bottom: w.bottom - pad,
-    })
-}
-
-/// Converts 96-DPI pixels to the window's current DPI.
-#[cfg(windows)]
-fn scaled(hwnd: isize, px: i32) -> i32 {
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn GetDpiForWindow(hwnd: isize) -> u32;
-    }
-    let dpi = match unsafe { GetDpiForWindow(hwnd) } {
-        0 => 96,
-        d => d as i32,
-    };
-    px * dpi / 96
-}
-
-/// Runs when the window is first visible and after each self-resize. Pulls it
-/// fully onto the nearest monitor's work area, since the saved position can point
-/// at a monitor that is no longer there (e.g. after hotdesking), and forces it to
-/// the top of the z-order: winit creates it hidden and the topmost level otherwise
-/// does not take effect until the window is first activated. Also (re)installs
-/// edge snapping. Returns false until the window is visible.
-#[cfg(windows)]
-fn settle_window(frame: &eframe::Frame) -> bool {
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn IsWindowVisible(hwnd: isize) -> i32;
-        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
-    }
-    #[link(name = "comctl32")]
-    unsafe extern "system" {
-        fn SetWindowSubclass(hwnd: isize, proc: SubclassProc, id: usize, data: usize) -> i32;
-    }
 
     let Some(hwnd) = hwnd(frame) else {
         return true;
@@ -346,15 +296,17 @@ fn settle_window(frame: &eframe::Frame) -> bool {
         if IsWindowVisible(hwnd) == 0 {
             return false;
         }
-        // Idempotent: re-adding the same proc and id only updates its data.
-        SetWindowSubclass(hwnd, snap_proc, 1, 0);
-
         let mut r = Rect::default();
+        let mut info = MonitorInfo {
+            size: size_of::<MonitorInfo>() as u32,
+            ..Default::default()
+        };
         let mut flags = SWP_NOSIZE | SWP_NOACTIVATE;
         let (mut x, mut y) = (r.left, r.top);
         if GetWindowRect(hwnd, &mut r) != 0
-            && let Some(work) = padded_work_area(hwnd, &r)
+            && GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut info) != 0
         {
+            let work = info.work;
             x = r.left.min(work.right - (r.right - r.left)).max(work.left);
             y = r.top.min(work.bottom - (r.bottom - r.top)).max(work.top);
         } else {
@@ -366,52 +318,6 @@ fn settle_window(frame: &eframe::Frame) -> bool {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, flags);
     }
     true
-}
-
-#[cfg(windows)]
-type SubclassProc = unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
-
-/// While the window is being dragged, nudges the proposed position onto the
-/// padded screen edges or taskbar when it comes within `SNAP_RANGE`. Windows
-/// recomputes the position from the cursor on every move, so pulling further
-/// away releases it.
-#[cfg(windows)]
-unsafe extern "system" fn snap_proc(
-    hwnd: isize,
-    msg: u32,
-    wparam: usize,
-    lparam: isize,
-    _id: usize,
-    _data: usize,
-) -> isize {
-    #[link(name = "comctl32")]
-    unsafe extern "system" {
-        fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
-    }
-    const WM_MOVING: u32 = 0x0216;
-
-    if msg == WM_MOVING && lparam != 0 {
-        let r = unsafe { &mut *(lparam as *mut Rect) };
-        if let Some(work) = padded_work_area(hwnd, r) {
-            let range = scaled(hwnd, SNAP_RANGE);
-            let offset = |lo: i32, hi: i32, min: i32, max: i32| {
-                if (lo - min).abs() <= range {
-                    min - lo
-                } else if (hi - max).abs() <= range {
-                    max - hi
-                } else {
-                    0
-                }
-            };
-            let dx = offset(r.left, r.right, work.left, work.right);
-            let dy = offset(r.top, r.bottom, work.top, work.bottom);
-            r.left += dx;
-            r.right += dx;
-            r.top += dy;
-            r.bottom += dy;
-        }
-    }
-    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 #[cfg(not(windows))]

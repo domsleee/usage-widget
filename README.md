@@ -50,8 +50,10 @@ usage-widget
 `--no-startup` removes it. The widget stays out of the taskbar and Alt-Tab, so quit
 it from its right-click menu.
 
-To upgrade, run the `cargo install` line again, quit the widget and start it again.
-Only one copy runs at a time, so launching it while it is already running does nothing.
+To upgrade, quit the widget first (Windows will not let a running exe be replaced),
+then run the `cargo install` line again and start `usage-widget`. There is no need to
+re-run `--startup`. Only one copy runs at a time, so launching it while it is already
+running does nothing.
 
 From a clone, `install.ps1` does the same three steps using the local checkout.
 
@@ -59,7 +61,6 @@ From a clone, `install.ps1` does the same three steps using the local checkout.
 
 - Drag anywhere on the widget to move it. Position is remembered between runs, and
   if the saved spot is off screen (say, a monitor is gone) it is moved back on.
-  While dragging it snaps to the screen edges and the taskbar with a small gap.
 - Right-click for refresh, size, links to each service's usage page, and Quit.
 - Size scales the widget from 50% to 150% on top of your display scaling (Ctrl +/-
   also works). Handy when a high-DPI monitor makes it too big. It is remembered.

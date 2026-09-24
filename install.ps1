@@ -11,6 +11,10 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Reuse the checkout's build cache; by default cargo install rebuilds every
 # dependency in a fresh temp directory, which takes 10+ minutes.
 $env:CARGO_TARGET_DIR = Join-Path $root "target"
+
+# A running exe cannot be replaced, so stop the widget before installing.
+Get-Process usage-widget -ErrorAction SilentlyContinue | Stop-Process -Force
+
 cargo install --path $root
 if ($LASTEXITCODE -ne 0) { throw "cargo install failed" }
 
@@ -25,7 +29,6 @@ if (Test-Path $oldLnk) { Remove-Item $oldLnk }
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 Set-ItemProperty -Path $runKey -Name "usage-widget" -Value "`"$exe`"" -Type String
 
-Get-Process usage-widget -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Process -FilePath $exe
 
 Write-Host "Installed $exe"
