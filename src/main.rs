@@ -25,7 +25,7 @@ const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
-const SIZES: [f32; 6] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5];
+const SIZES: [f32; 8] = [0.25, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 // The window is opaque and painted entirely in BG; Windows rounds the corners
 // at the compositor level (see `apply_windows_chrome`), so nothing else shows.
