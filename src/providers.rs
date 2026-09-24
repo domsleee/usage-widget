@@ -34,6 +34,15 @@ impl Provider {
         }
     }
 
+    /// Three-letter tag for the minimized view.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Provider::Copilot => "COP",
+            Provider::Claude => "CLD",
+            Provider::Codex => "CDX",
+        }
+    }
+
     pub fn url(self) -> &'static str {
         match self {
             Provider::Copilot => "https://github.com/settings/copilot/features",

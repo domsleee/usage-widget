@@ -33,6 +33,8 @@ one-line headless prompt (`claude -p` on Haiku, at most once every 15 minutes) s
 Claude Code refreshes the token itself, and retries. An expired Codex token is only
 reported; running `codex` once refreshes it.
 
+Logos are from [Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
+
 These endpoints are the same ones the CLIs and web settings pages use. They are not
 formally documented and may change.
 
@@ -61,7 +63,10 @@ From a clone, `install.ps1` does the same three steps using the local checkout.
 
 - Drag anywhere on the widget to move it. Position is remembered between runs, and
   if the saved spot is off screen (say, a monitor is gone) it is moved back on.
-- Right-click for refresh, size, links to each service's usage page, and Quit.
+- Right-click for refresh, minimize, size, links to each service's usage page, and Quit.
+- Minimize shrinks it to one line (`COP 87%  CLD 83%  CDX 99%` with each service's logo),
+  showing the most-used window per service. Maximize from the same menu restores it.
+  The widget reopens in whichever mode it was left in.
 - Size scales the widget from 50% to 150% on top of your display scaling (Ctrl +/-
   also works). Handy when a high-DPI monitor makes it too big. It is remembered.
 - Click a service name to open its usage page.
