@@ -10,9 +10,25 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 ureq = { version = "3", default-features = false, features = ["json", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dirs = "7"
 base64 = "0.22"
 raw-window-handle = "0.6"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+toml = "1.1.6"
 
 [profile.release]
 lto = "thin"
 strip = true
+
+[target.'cfg(windows)'.dependencies]
+winit = "0.30"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aes = "0.8"
+cbc = "0.1"
+objc2 = "0.6"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+sha1 = "0.10"
+tray-icon = "0.24.2"
+winit = "0.30"
