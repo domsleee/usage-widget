@@ -596,6 +596,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         account,
         version,
         org,
+        plan: profile_plan,
     } = claude_code_state();
     let mut state = ClaudeState::load();
     let now = now_unix();
@@ -648,6 +649,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         state.save();
     }
     let oauth = claude_oauth(&creds);
+    let plan = profile_plan.or_else(|| oauth.ok().and_then(claude_plan));
 
     let rate_limited = now < state.blocked_until;
     let snap = [cache.as_ref(), state.last.as_ref()]
@@ -683,7 +685,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
     let mut estimated = Vec::new();
     let mut history_problem = None;
     if config.estimate {
-        let plan = oauth.ok().and_then(claude_plan).unwrap_or_default();
+        let plan = plan.clone().unwrap_or_default();
         // Rounded: statusline figures carry float noise (55.00000000000001).
         let readings: Vec<(String, f64, i64)> = meters
             .iter()
@@ -728,7 +730,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         None => note,
     };
     Ok(Usage {
-        plan: oauth.ok().and_then(claude_plan),
+        plan,
         cycle,
         note,
         estimated,
@@ -851,6 +853,8 @@ struct ClaudeCodeState {
     version: Option<String>,
     /// The claude.ai organization Claude Code is logged in to.
     org: Option<String>,
+    /// The plan per Claude Code's profile, which it refreshes as it runs.
+    plan: Option<String>,
 }
 
 fn claude_code_state() -> ClaudeCodeState {
@@ -863,6 +867,9 @@ fn claude_code_state() -> ClaudeCodeState {
     let account = v["oauthAccount"]["accountUuid"].as_str().map(String::from);
     let version = v["lastReleaseNotesSeen"].as_str().map(String::from);
     let org = v["oauthAccount"]["organizationUuid"].as_str().map(String::from);
+    let plan = v["oauthAccount"]["organizationType"]
+        .as_str()
+        .and_then(|kind| plan_name(kind, v["oauthAccount"]["organizationRateLimitTier"].as_str()));
     let c = &v["cachedUsageUtilization"];
     // Ignore a cache left behind by another account.
     let cache = (account.is_none() || c["accountUuid"].as_str() == account.as_deref())
@@ -879,6 +886,7 @@ fn claude_code_state() -> ClaudeCodeState {
         account,
         version,
         org,
+        plan,
     }
 }
 
@@ -995,15 +1003,25 @@ fn claude_api(oauth: Result<&Value, &String>, version: Option<&str>) -> Result<V
     }
 }
 
+/// The plan from the OAuth credentials. These are written at login, so a plan
+/// change since then only shows in Claude Code's profile (`ClaudeCodeState::plan`).
 fn claude_plan(oauth: &Value) -> Option<String> {
-    let name = title_case(
-        oauth["subscriptionType"]
-            .as_str()
-            .filter(|s| !s.is_empty())?,
-    );
-    // rateLimitTier looks like "default_claude_max_5x"; keep the "5x".
-    let tier = oauth["rateLimitTier"]
-        .as_str()
+    plan_name(
+        oauth["subscriptionType"].as_str()?,
+        oauth["rateLimitTier"].as_str(),
+    )
+}
+
+/// "Max 5x" from a subscription kind ("max", or the profile's "claude_max") and a
+/// rate-limit tier like "default_claude_max_5x".
+fn plan_name(kind: &str, tier: Option<&str>) -> Option<String> {
+    let kind = kind.strip_prefix("claude_").unwrap_or(kind);
+    if kind.is_empty() {
+        return None;
+    }
+    let name = title_case(kind);
+    // Keep the "5x".
+    let tier = tier
         .and_then(|t| t.rsplit('_').next())
         .filter(|t| {
             t.strip_suffix('x')
@@ -1617,6 +1635,15 @@ mod tests {
             Some("Max 20x")
         );
         assert_eq!(claude("pro", "default_claude_ai").as_deref(), Some("Pro"));
+        // Claude Code's profile names the kind "claude_pro" / "claude_max".
+        assert_eq!(
+            plan_name("claude_pro", Some("default_claude_ai")).as_deref(),
+            Some("Pro")
+        );
+        assert_eq!(
+            plan_name("claude_max", Some("default_claude_max_20x")).as_deref(),
+            Some("Max 20x")
+        );
         assert_eq!(claude("", "").as_deref(), None);
 
         let copilot = |plan: &str, sku: &str| {
