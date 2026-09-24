@@ -125,7 +125,15 @@ pub fn money(v: f64) -> String {
 // ---------------------------------------------------------------------------
 
 fn agent() -> ureq::Agent {
+    use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+    // The OS TLS stack (SChannel on Windows) trusting the OS certificate store, so
+    // corporate TLS-inspecting proxies whose root is installed there just work.
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
     ureq::Agent::config_builder()
+        .tls_config(tls)
         .timeout_global(Some(Duration::from_secs(25)))
         .http_status_as_error(false)
         .user_agent(UA)
@@ -161,7 +169,7 @@ fn no_window(cmd: &mut Command) {
 }
 
 fn home() -> Result<PathBuf, String> {
-    dirs::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())
+    std::env::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())
 }
 
 fn read_json_file(path: &PathBuf) -> Result<Value, String> {

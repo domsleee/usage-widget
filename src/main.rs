@@ -58,6 +58,7 @@ struct App {
     settled: bool,
     /// Compact single-line view. Persisted, so the widget reopens the way it was left.
     minimized: bool,
+    logos: HashMap<Provider, egui::TextureHandle>,
 }
 
 impl App {
@@ -66,7 +67,6 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
         spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
-        egui_extras::install_image_loaders(&cc.egui_ctx);
         // Selectable labels grab clicks and drags, so right-click and drag-to-move
         // would not work over text.
         cc.egui_ctx
@@ -93,6 +93,7 @@ impl App {
             interval,
             settled: false,
             minimized,
+            logos: load_logos(&cc.egui_ctx),
         }
     }
 
@@ -677,19 +678,73 @@ fn egui_menu(
     action
 }
 
+/// Opens a link in the default browser.
+#[cfg(windows)]
+fn open_url(url: &str) {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            op: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    const SW_SHOWNORMAL: i32 = 1;
+    unsafe {
+        ShellExecuteW(
+            0,
+            wide("open").as_ptr(),
+            wide(url).as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener).arg(url).spawn();
+}
+
 /// NUL-terminated UTF-16 for Win32 string parameters.
 #[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Monochrome brand marks from Simple Icons (CC0), filled white so they can be tinted.
-fn logo(p: Provider) -> egui::ImageSource<'static> {
-    match p {
-        Provider::Copilot => egui::include_image!("../assets/copilot.svg"),
-        Provider::Claude => egui::include_image!("../assets/claude.svg"),
-        Provider::Codex => egui::include_image!("../assets/codex.svg"),
-    }
+/// Side of the square logo masks in assets/*.alpha.
+const LOGO_PX: usize = 64;
+
+/// Uploads the provider logos as white textures so they can be tinted. The marks
+/// are the Simple Icons SVGs (CC0) in assets/, rasterized once with resvg to
+/// 64x64 8-bit alpha masks so no SVG renderer is needed at runtime.
+fn load_logos(ctx: &egui::Context) -> HashMap<Provider, egui::TextureHandle> {
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    Provider::ALL
+        .into_iter()
+        .map(|p| {
+            let alpha: &[u8] = match p {
+                Provider::Copilot => include_bytes!("../assets/copilot.alpha"),
+                Provider::Claude => include_bytes!("../assets/claude.alpha"),
+                Provider::Codex => include_bytes!("../assets/codex.alpha"),
+            };
+            let rgba: Vec<u8> = alpha.iter().flat_map(|&a| [255, 255, 255, a]).collect();
+            let image = egui::ColorImage::from_rgba_unmultiplied([LOGO_PX, LOGO_PX], &rgba);
+            (p, ctx.load_texture(p.name(), image, options))
+        })
+        .collect()
 }
 
 fn logo_color(p: Provider) -> Color32 {
@@ -700,18 +755,20 @@ fn logo_color(p: Provider) -> Color32 {
 }
 
 /// The minimized view: "<logo> COP 42%  <logo> CLD 17%  <logo> CDX 99%" on one line.
-fn compact_row(ui: &mut egui::Ui, slots: &HashMap<Provider, Slot>) {
+fn compact_row(
+    ui: &mut egui::Ui,
+    slots: &HashMap<Provider, Slot>,
+    logos: &HashMap<Provider, egui::TextureHandle>,
+) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     for (i, p) in Provider::ALL.iter().enumerate() {
         if i > 0 {
             ui.add_space(8.0);
         }
         let slot = slots.get(p).cloned().unwrap_or_default();
-        ui.add(
-            egui::Image::new(logo(*p))
-                .fit_to_exact_size(Vec2::splat(13.0))
-                .tint(logo_color(*p)),
-        );
+        if let Some(logo) = logos.get(p) {
+            ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(*p)));
+        }
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
         // The most-used meter is the one that matters when space is this tight.
         let pct = slot
@@ -830,7 +887,7 @@ impl eframe::App for App {
             // Wrap the content so its real size can be measured: the panel's own
             // min_rect is always expanded to fill the window.
             let content = if minimized {
-                ui.horizontal(|ui| compact_row(ui, &self.slots))
+                ui.horizontal(|ui| compact_row(ui, &self.slots, &self.logos))
             } else {
                 ui.vertical(|ui| {
                     for (i, p) in Provider::ALL.iter().enumerate() {
@@ -887,7 +944,7 @@ impl eframe::App for App {
         match action {
             Some(MenuAction::Refresh) => refresh = true,
             Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
-            Some(MenuAction::Open(p)) => ctx.open_url(egui::OpenUrl::new_tab(p.url())),
+            Some(MenuAction::Open(p)) => open_url(p.url()),
             Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
             Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
             None => {}
