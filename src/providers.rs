@@ -463,7 +463,7 @@ struct ClaudeState {
 
 impl ClaudeState {
     fn path() -> Option<PathBuf> {
-        dirs::cache_dir().map(|d| d.join("usage-widget").join("claude.json"))
+        crate::paths::cache_dir().map(|d| d.join("usage-widget").join("claude.json"))
     }
 
     fn load() -> Self {

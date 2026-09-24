@@ -11,6 +11,7 @@ mod estimate;
 mod estimate_history;
 #[cfg(target_os = "macos")]
 mod menubar;
+mod paths;
 mod providers;
 mod renewal_lookup;
 mod timeutil;

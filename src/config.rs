@@ -135,7 +135,7 @@ impl Config {
 }
 
 pub fn path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("usage-widget").join("config.toml"))
+    crate::paths::config_dir().map(|d| d.join("usage-widget").join("config.toml"))
 }
 
 /// Loads the config. A missing file means defaults; a broken one means defaults

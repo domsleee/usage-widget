@@ -132,7 +132,7 @@ struct State {
 
 impl State {
     fn path() -> Option<PathBuf> {
-        dirs::cache_dir().map(|d| d.join("usage-widget").join("codex-estimate.json"))
+        crate::paths::cache_dir().map(|d| d.join("usage-widget").join("codex-estimate.json"))
     }
 
     fn load() -> Self {
@@ -156,7 +156,7 @@ impl State {
     /// size against where the last scan stopped, so a failed read is retried and a
     /// file that shrank (rewritten) is read again from the start.
     fn scan(&mut self) -> Vec<Event> {
-        let Some(root) = dirs::home_dir().map(|h| h.join(".codex").join("sessions")) else {
+        let Some(root) = std::env::home_dir().map(|h| h.join(".codex").join("sessions")) else {
             return Vec::new();
         };
         let horizon = SystemTime::now() - HISTORY;

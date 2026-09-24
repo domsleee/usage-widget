@@ -132,7 +132,7 @@ mod mac {
     /// browser profile that has them, until it returns true. Each browser's key is
     /// read from the keychain only when one of its profiles is reached.
     fn each_session(mut f: impl FnMut(String, String) -> bool) -> Result<(), String> {
-        let base = dirs::home_dir()
+        let base = std::env::home_dir()
             .ok_or("cannot resolve home directory")?
             .join("Library/Application Support");
         for (dir, service) in BROWSERS {
@@ -220,26 +220,103 @@ mod mac {
             ));
         }
         let password = String::from_utf8_lossy(&out.stdout);
-        let mut key = [0u8; 16];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.trim().as_bytes(), b"saltysalt", 1003, &mut key);
-        Ok(key)
+        pbkdf2_sha1(password.trim().as_bytes(), b"saltysalt", 1003)
+            .ok_or_else(|| "cannot derive the browser's cookie key".into())
     }
 
     /// Chromium's macOS cookie format: "v10" + AES-128-CBC with a blank IV. Since
     /// cookie store version 24 the plaintext starts with SHA-256 of the host.
     fn decrypt(value: &[u8], key: &[u8; 16], version: u32) -> Option<String> {
-        use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
-        let mut buf = value.strip_prefix(b"v10")?.to_vec();
-        let plain = cbc::Decryptor::<aes::Aes128>::new_from_slices(key, &[b' '; 16])
-            .ok()?
-            .decrypt_padded_mut::<Pkcs7>(&mut buf)
-            .ok()?;
+        let plain = aes_cbc(K_CC_DECRYPT, key, value.strip_prefix(b"v10")?)?;
         let plain = if version >= 24 {
             plain.get(32..)?
         } else {
-            plain
+            &plain
         };
         String::from_utf8(plain.to_vec()).ok()
+    }
+
+    // The crypto comes from CommonCrypto, which is part of macOS.
+    const K_CC_PBKDF2: u32 = 2;
+    const K_CC_PRF_HMAC_SHA1: u32 = 1;
+    #[cfg(test)]
+    const K_CC_ENCRYPT: u32 = 0;
+    const K_CC_DECRYPT: u32 = 1;
+    const K_CC_ALGORITHM_AES: u32 = 0;
+    const K_CC_OPTION_PKCS7_PADDING: u32 = 1;
+
+    unsafe extern "C" {
+        fn CCKeyDerivationPBKDF(
+            algorithm: u32,
+            password: *const u8,
+            password_len: usize,
+            salt: *const u8,
+            salt_len: usize,
+            prf: u32,
+            rounds: u32,
+            derived_key: *mut u8,
+            derived_key_len: usize,
+        ) -> i32;
+        fn CCCrypt(
+            op: u32,
+            algorithm: u32,
+            options: u32,
+            key: *const u8,
+            key_len: usize,
+            iv: *const u8,
+            data_in: *const u8,
+            data_in_len: usize,
+            data_out: *mut u8,
+            data_out_available: usize,
+            data_out_moved: *mut usize,
+        ) -> i32;
+    }
+
+    fn pbkdf2_sha1(password: &[u8], salt: &[u8], rounds: u32) -> Option<[u8; 16]> {
+        let mut key = [0u8; 16];
+        // SAFETY: every pointer is paired with the length of the buffer it points to.
+        let status = unsafe {
+            CCKeyDerivationPBKDF(
+                K_CC_PBKDF2,
+                password.as_ptr(),
+                password.len(),
+                salt.as_ptr(),
+                salt.len(),
+                K_CC_PRF_HMAC_SHA1,
+                rounds,
+                key.as_mut_ptr(),
+                key.len(),
+            )
+        };
+        (status == 0).then_some(key)
+    }
+
+    /// AES-128-CBC with PKCS#7 padding and Chromium's IV of 16 spaces.
+    fn aes_cbc(op: u32, key: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
+        let iv = [b' '; 16];
+        // Padding adds at most one block.
+        let mut out = vec![0u8; data.len() + 16];
+        let mut moved = 0;
+        // SAFETY: every pointer is paired with the length of the buffer it points to.
+        let status = unsafe {
+            CCCrypt(
+                op,
+                K_CC_ALGORITHM_AES,
+                K_CC_OPTION_PKCS7_PADDING,
+                key.as_ptr(),
+                key.len(),
+                iv.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                &mut moved,
+            )
+        };
+        (status == 0).then(|| {
+            out.truncate(moved);
+            out
+        })
     }
 
     fn unhex(s: &str) -> Option<Vec<u8>> {
@@ -252,22 +329,24 @@ mod mac {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+
+        #[test]
+        fn derives_keys_like_pbkdf2_hmac_sha1() {
+            // RFC 6070, two rounds, first 16 bytes.
+            assert_eq!(
+                pbkdf2_sha1(b"password", b"salt", 2),
+                unhex("ea6c014dc72d6f8ccd1ed92ace1d41f0")
+                    .and_then(|k| k.try_into().ok())
+            );
+        }
 
         #[test]
         fn decrypts_chromium_cookie() {
             let key = [7u8; 16];
             let mut plain = vec![0xAB; 32]; // stands in for sha256(host)
             plain.extend_from_slice(b"sk-ant-sid01-test");
-            let len = plain.len();
-            plain.resize(len + 16, 0);
             let mut value = b"v10".to_vec();
-            value.extend_from_slice(
-                cbc::Encryptor::<aes::Aes128>::new_from_slices(&key, &[b' '; 16])
-                    .unwrap()
-                    .encrypt_padded_mut::<Pkcs7>(&mut plain, len)
-                    .unwrap(),
-            );
+            value.extend_from_slice(&aes_cbc(K_CC_ENCRYPT, &key, &plain).unwrap());
             assert_eq!(
                 decrypt(&value, &key, 24).as_deref(),
                 Some("sk-ant-sid01-test")

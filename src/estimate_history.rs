@@ -29,7 +29,7 @@ pub fn append(provider: &str, received_at: &str, batch: &impl Serialize) -> Resu
         batch,
     };
     let write = || -> io::Result<()> {
-        let root = dirs::data_local_dir()
+        let root = crate::paths::data_local_dir()
             .ok_or_else(|| io::Error::other("local data directory unavailable"))?
             .join("usage-widget")
             .join("history");

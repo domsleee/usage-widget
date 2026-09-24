@@ -77,7 +77,7 @@ fn node_candidates() -> Vec<PathBuf> {
         PathBuf::from("/opt/homebrew/bin/node"),
         PathBuf::from("/usr/local/bin/node"),
     ]);
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = std::env::home_dir() {
         paths.extend([
             home.join(".volta/bin").join(exe),
             home.join(".fnm/aliases/default/bin").join(exe),
@@ -99,7 +99,7 @@ fn node_candidates() -> Vec<PathBuf> {
     }
     for root in [
         std::env::var_os("FNM_DIR").map(PathBuf::from),
-        dirs::data_dir().map(|p| p.join("fnm")),
+        crate::paths::data_dir().map(|p| p.join("fnm")),
     ]
     .into_iter()
     .flatten()

@@ -130,7 +130,7 @@ struct State {
 
 impl State {
     fn path() -> Option<PathBuf> {
-        dirs::cache_dir().map(|d| d.join("usage-widget").join("claude-estimate.json"))
+        crate::paths::cache_dir().map(|d| d.join("usage-widget").join("claude-estimate.json"))
     }
 
     fn load() -> Self {
@@ -152,7 +152,7 @@ impl State {
 
     /// New responses from transcripts that grew.
     fn scan(&mut self) -> Vec<Event> {
-        let Some(root) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) else {
+        let Some(root) = std::env::home_dir().map(|h| h.join(".claude").join("projects")) else {
             return Vec::new();
         };
         let now = SystemTime::now();
