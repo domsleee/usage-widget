@@ -1,6 +1,6 @@
 [package]
 name = "usage-widget"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Tiny always-on-top desktop widget showing Copilot, Claude and Codex usage"
 publish = false

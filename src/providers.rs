@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const UA: &str = "usage-widget/0.1 (+https://github.com/pepsi-enjoyer/usage-widget)";
+const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
 /// Copilot premium-request credits: 50,000 credits = $500.
 const COPILOT_USD_PER_CREDIT: f64 = 500.0 / 50_000.0;
