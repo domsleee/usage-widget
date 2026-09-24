@@ -5,8 +5,9 @@ use crate::timeutil::now_unix;
 use base64::Engine;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const UA: &str = "usage-widget/0.1 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
@@ -138,6 +139,18 @@ fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), String>
     Ok((status, json))
 }
 
+/// Stops a console window flashing up when a CLI is run from the windowless exe.
+fn no_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 fn home() -> Result<PathBuf, String> {
     dirs::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())
 }
@@ -188,12 +201,7 @@ fn github_token() -> Result<String, String> {
     }
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    no_window(&mut cmd);
     let out = cmd
         .output()
         .map_err(|e| format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"))?;
@@ -253,7 +261,99 @@ fn copilot() -> Result<Vec<Meter>, String> {
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
+/// Minimum gap between headless `claude` runs, so a persistent auth failure does
+/// not spend a prompt on every refresh.
+const CLAUDE_REFRESH_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+enum ClaudeError {
+    /// The stored token is expired or was rejected; a token refresh may fix it.
+    Auth(String),
+    Other(String),
+}
+
+impl From<String> for ClaudeError {
+    fn from(e: String) -> Self {
+        ClaudeError::Other(e)
+    }
+}
+
+impl From<&str> for ClaudeError {
+    fn from(e: &str) -> Self {
+        ClaudeError::Other(e.into())
+    }
+}
+
+impl From<ClaudeError> for String {
+    fn from(e: ClaudeError) -> Self {
+        match e {
+            ClaudeError::Auth(e) | ClaudeError::Other(e) => e,
+        }
+    }
+}
+
 fn claude() -> Result<Vec<Meter>, String> {
+    match claude_once() {
+        Err(ClaudeError::Auth(msg)) => match refresh_claude_token() {
+            Ok(()) => claude_once().map_err(String::from),
+            Err(why) => Err(format!("{msg} ({why})")),
+        },
+        r => r.map_err(String::from),
+    }
+}
+
+/// Claude Code only refreshes its OAuth token while it runs, so an idle machine
+/// ends up with an expired one. A one-line headless prompt on the smallest model
+/// makes it refresh and write the new token back to `.credentials.json`.
+fn refresh_claude_token() -> Result<(), String> {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < CLAUDE_REFRESH_COOLDOWN) {
+            return Err("auto-refresh tried recently".into());
+        }
+        *last = Some(Instant::now());
+    }
+
+    let args = [
+        "-p",
+        "--model",
+        "haiku",
+        "--max-turns",
+        "1",
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "reply with ok",
+    ];
+    let spawn = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        no_window(&mut cmd);
+        cmd.spawn()
+    };
+    // npm installs ship a claude.cmd shim, which Command only finds by full name.
+    let mut child = spawn("claude")
+        .or_else(|_| spawn("claude.cmd"))
+        .map_err(|e| format!("could not run claude: {e}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err("headless claude failed".into()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
+            _ => {
+                let _ = child.kill();
+                return Err("headless claude timed out".into());
+            }
+        }
+    }
+}
+
+fn claude_once() -> Result<Vec<Meter>, ClaudeError> {
     let path = home()?.join(".claude").join(".credentials.json");
     let creds = read_json_file(&path)?;
     let oauth = &creds["claudeAiOauth"];
@@ -262,7 +362,9 @@ fn claude() -> Result<Vec<Meter>, String> {
         .ok_or("no claudeAiOauth.accessToken; log in with `claude`")?;
     if let Some(exp_ms) = i64_of(&oauth["expiresAt"]) {
         if exp_ms / 1000 < now_unix() {
-            return Err("Claude token expired; run `claude` once to refresh".into());
+            return Err(ClaudeError::Auth(
+                "Claude token expired; run `claude` once to refresh".into(),
+            ));
         }
     }
 
@@ -276,8 +378,12 @@ fn claude() -> Result<Vec<Meter>, String> {
     )?;
     match status {
         200 => {}
-        401 | 403 => return Err("Claude token rejected; run `claude` once to refresh".into()),
-        s => return Err(format!("Anthropic returned HTTP {s}")),
+        401 | 403 => {
+            return Err(ClaudeError::Auth(
+                "Claude token rejected; run `claude` once to refresh".into(),
+            ));
+        }
+        s => return Err(format!("Anthropic returned HTTP {s}").into()),
     }
 
     let mut meters = Vec::new();

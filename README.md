@@ -27,9 +27,11 @@ What is shown depends on the plan:
 - Claude: 5-hour and 7-day windows when the plan has them, plus monthly spend against the cap when present.
 - Codex: 5-hour and weekly rate-limit windows when present, plus the workspace spend limit when present.
 
-Tokens are read from disk on every refresh and never written back. If Claude Code or
-Codex have not run for a while their access token expires and the widget says so.
-Running `claude` or `codex` once refreshes it.
+Tokens are read from disk on every refresh and never written back by the widget. If
+Claude Code has not run for a while its access token expires; the widget then runs a
+one-line headless prompt (`claude -p` on Haiku, at most once every 15 minutes) so
+Claude Code refreshes the token itself, and retries. An expired Codex token is only
+reported; running `codex` once refreshes it.
 
 These endpoints are the same ones the CLIs and web settings pages use. They are not
 formally documented and may change.
@@ -48,14 +50,18 @@ usage-widget
 `--no-startup` removes it. The widget stays out of the taskbar and Alt-Tab, so quit
 it from its right-click menu.
 
-To upgrade, run the `cargo install` line again and restart the widget.
+To upgrade, run the `cargo install` line again, quit the widget and start it again.
+Only one copy runs at a time, so launching it while it is already running does nothing.
 
 From a clone, `install.ps1` does the same three steps using the local checkout.
 
 ## Using it
 
-- Drag anywhere on the widget to move it. Position is remembered between runs.
-- Right-click for refresh, links to each service's usage page, and Quit.
+- Drag anywhere on the widget to move it. Position is remembered between runs, and
+  if the saved spot is off screen (say, a monitor is gone) it is moved back on.
+- Right-click for refresh, size, links to each service's usage page, and Quit.
+- Size scales the widget from 50% to 150% on top of your display scaling (Ctrl +/-
+  also works). Handy when a high-DPI monitor makes it too big. It is remembered.
 - Click a service name to open its usage page.
 - Set `USAGE_WIDGET_REFRESH_MINS` to change the refresh interval (default 5).
 - Set `USAGE_WIDGET_OPACITY` (20-100) to change the window opacity (default 85).
