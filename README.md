@@ -69,6 +69,5 @@ From a clone, `install.ps1` does the same three steps using the local checkout.
   The widget reopens in whichever mode it was left in.
 - Size scales the widget from 50% to 150% on top of your display scaling (Ctrl +/-
   also works). Handy when a high-DPI monitor makes it too big. It is remembered.
-- Click a service name to open its usage page.
 - Set `USAGE_WIDGET_REFRESH_MINS` to change the refresh interval (default 5).
 - Set `USAGE_WIDGET_OPACITY` (20-100) to change the window opacity (default 85).
