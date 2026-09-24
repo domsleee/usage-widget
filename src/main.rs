@@ -20,6 +20,9 @@ const WIDTH: f32 = 250.0;
 const MARGIN: i8 = 12;
 const DEFAULT_REFRESH_MINS: u64 = 5;
 const DEFAULT_OPACITY_PERCENT: u32 = 85;
+const MINI_MARGIN_X: i8 = 10;
+const MINI_MARGIN_Y: i8 = 6;
+const MINIMIZED_KEY: &str = "minimized";
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
 const SIZES: [f32; 6] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5];
@@ -53,6 +56,8 @@ struct App {
     interval: Duration,
     /// False until the window has been placed on screen and made topmost (see `settle_window`).
     settled: bool,
+    /// Compact single-line view. Persisted, so the widget reopens the way it was left.
+    minimized: bool,
 }
 
 impl App {
@@ -61,6 +66,11 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
         spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        let minimized = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, MINIMIZED_KEY))
+            .unwrap_or(false);
 
         let mut slots = HashMap::new();
         for p in Provider::ALL {
@@ -78,6 +88,7 @@ impl App {
             refresh_tx,
             interval,
             settled: false,
+            minimized,
         }
     }
 
@@ -420,15 +431,25 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
 #[derive(Clone, Copy)]
 enum MenuAction {
     Refresh,
+    ToggleMinimized,
     Open(Provider),
     Size(f32),
     Quit,
 }
 
+fn minimize_label(minimized: bool) -> &'static str {
+    if minimized { "Maximize" } else { "Minimize" }
+}
+
 /// Shows the right-click menu as a native popup at the cursor and blocks until
 /// it is dismissed. Unlike an egui menu it is not clipped to the window.
 #[cfg(windows)]
-fn native_menu(frame: &eframe::Frame, zoom: f32, refresh_mins: u64) -> Option<MenuAction> {
+fn native_menu(
+    frame: &eframe::Frame,
+    zoom: f32,
+    refresh_mins: u64,
+    minimized: bool,
+) -> Option<MenuAction> {
     #[repr(C)]
     #[derive(Default)]
     struct Point {
@@ -463,6 +484,7 @@ fn native_menu(frame: &eframe::Frame, zoom: f32, refresh_mins: u64) -> Option<Me
     const WM_NULL: u32 = 0;
     const ID_REFRESH: usize = 1;
     const ID_QUIT: usize = 2;
+    const ID_MINIMIZE: usize = 3;
     const ID_OPEN: usize = 10;
     const ID_SIZE: usize = 100;
 
@@ -473,6 +495,7 @@ fn native_menu(frame: &eframe::Frame, zoom: f32, refresh_mins: u64) -> Option<Me
         };
         let menu = CreatePopupMenu();
         add(menu, MF_STRING, ID_REFRESH, "Refresh now");
+        add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
         add(menu, MF_SEPARATOR, 0, "");
         for (i, p) in Provider::ALL.iter().enumerate() {
             add(
@@ -523,6 +546,7 @@ fn native_menu(frame: &eframe::Frame, zoom: f32, refresh_mins: u64) -> Option<Me
 
         match id {
             ID_REFRESH => Some(MenuAction::Refresh),
+            ID_MINIMIZE => Some(MenuAction::ToggleMinimized),
             ID_QUIT => Some(MenuAction::Quit),
             _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
@@ -536,10 +560,18 @@ fn native_menu(frame: &eframe::Frame, zoom: f32, refresh_mins: u64) -> Option<Me
 }
 
 #[cfg(not(windows))]
-fn egui_menu(ui: &mut egui::Ui, zoom: f32, refresh_mins: u64) -> Option<MenuAction> {
+fn egui_menu(
+    ui: &mut egui::Ui,
+    zoom: f32,
+    refresh_mins: u64,
+    minimized: bool,
+) -> Option<MenuAction> {
     let mut action = None;
     if ui.button("Refresh now").clicked() {
         action = Some(MenuAction::Refresh);
+    }
+    if ui.button(minimize_label(minimized)).clicked() {
+        action = Some(MenuAction::ToggleMinimized);
     }
     ui.separator();
     for p in Provider::ALL {
@@ -572,6 +604,56 @@ fn egui_menu(ui: &mut egui::Ui, zoom: f32, refresh_mins: u64) -> Option<MenuActi
 #[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Monochrome brand marks from Simple Icons (CC0), filled white so they can be tinted.
+fn logo(p: Provider) -> egui::ImageSource<'static> {
+    match p {
+        Provider::Copilot => egui::include_image!("../assets/copilot.svg"),
+        Provider::Claude => egui::include_image!("../assets/claude.svg"),
+        Provider::Codex => egui::include_image!("../assets/codex.svg"),
+    }
+}
+
+fn logo_color(p: Provider) -> Color32 {
+    match p {
+        Provider::Claude => Color32::from_rgb(217, 119, 87),
+        Provider::Copilot | Provider::Codex => TEXT,
+    }
+}
+
+/// The minimized view: "<logo> COP 42%  <logo> CLD 17%  <logo> CDX 99%" on one line.
+fn compact_row(ui: &mut egui::Ui, slots: &HashMap<Provider, Slot>) {
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    for (i, p) in Provider::ALL.iter().enumerate() {
+        if i > 0 {
+            ui.add_space(8.0);
+        }
+        let slot = slots.get(p).cloned().unwrap_or_default();
+        ui.add(
+            egui::Image::new(logo(*p))
+                .fit_to_exact_size(Vec2::splat(13.0))
+                .tint(logo_color(*p)),
+        );
+        ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
+        // The most-used meter is the one that matters when space is this tight.
+        let pct = slot
+            .meters
+            .iter()
+            .flatten()
+            .filter(|m| m.total > 0.0)
+            .map(Meter::percent)
+            .reduce(f64::max);
+        let text = match (pct, &slot.error) {
+            (Some(pct), _) => RichText::new(format!("{pct:.0}%")).color(level_color(pct)),
+            (None, Some(_)) => RichText::new("!").color(ERR),
+            (None, None) => RichText::new("…").color(MUTED),
+        };
+        let resp = ui.label(text.size(11.5).strong());
+        if let Some(err) = &slot.error {
+            resp.on_hover_text(format!("{}: {err}", p.name()));
+        }
+    }
 }
 
 /// A small circular-arrow refresh button drawn with the painter (no icon font needed).
@@ -610,6 +692,10 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         BG.to_normalized_gamma_f32()
     }
@@ -628,14 +714,18 @@ impl eframe::App for App {
             }
         }
 
-        let panel = egui::Frame::NONE
-            .fill(BG)
-            .inner_margin(Margin::same(MARGIN));
+        let margin = if self.minimized {
+            Margin::symmetric(MINI_MARGIN_X, MINI_MARGIN_Y)
+        } else {
+            Margin::same(MARGIN)
+        };
+        let panel = egui::Frame::NONE.fill(BG).inner_margin(margin);
 
         let mut refresh = false;
         let mut action = None;
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
+        let minimized = self.minimized;
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -647,11 +737,11 @@ impl eframe::App for App {
             // native popup menu that can extend past it.
             #[cfg(windows)]
             if bg.secondary_clicked() {
-                action = native_menu(frame, zoom, refresh_mins);
+                action = native_menu(frame, zoom, refresh_mins, minimized);
             }
             #[cfg(not(windows))]
             bg.context_menu(|ui| {
-                action = egui_menu(ui, zoom, refresh_mins);
+                action = egui_menu(ui, zoom, refresh_mins, minimized);
                 if action.is_some() {
                     ui.close();
                 }
@@ -659,44 +749,57 @@ impl eframe::App for App {
 
             ui.spacing_mut().item_spacing.y = 3.0;
 
-            // Wrap the content so its real height can be measured: the panel's own
+            // Wrap the content so its real size can be measured: the panel's own
             // min_rect is always expanded to fill the window.
-            let content = ui.vertical(|ui| {
-                for (i, p) in Provider::ALL.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(5.0);
+            let content = if minimized {
+                ui.horizontal(|ui| compact_row(ui, &self.slots))
+            } else {
+                ui.vertical(|ui| {
+                    for (i, p) in Provider::ALL.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(5.0);
+                        }
+                        let slot = self.slots.get(p).cloned().unwrap_or_default();
+                        provider_block(ui, *p, &slot);
                     }
-                    let slot = self.slots.get(p).cloned().unwrap_or_default();
-                    provider_block(ui, *p, &slot);
-                }
 
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if refresh_button(ui) {
-                        refresh = true;
-                    }
-                    let updated = self
-                        .last_updated()
-                        .map(|t| format!("updated {}", ago(t)))
-                        .unwrap_or_else(|| "fetching…".into());
-                    ui.label(RichText::new(updated).size(9.5).color(MUTED));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if refresh_button(ui) {
+                            refresh = true;
+                        }
+                        let updated = self
+                            .last_updated()
+                            .map(|t| format!("updated {}", ago(t)))
+                            .unwrap_or_else(|| "fetching…".into());
+                        ui.label(RichText::new(updated).size(9.5).color(MUTED));
 
-                    if let Some(t) = self.total() {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let text = format!("${} / ${}", money(t.used), money(t.total));
-                            ui.label(RichText::new(text).size(10.5).color(TEXT))
-                                .on_hover_text("Total across all three");
-                        });
-                    }
-                });
-            });
+                        if let Some(t) = self.total() {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let text = format!("${} / ${}", money(t.used), money(t.total));
+                                ui.label(RichText::new(text).size(10.5).color(TEXT))
+                                    .on_hover_text("Total across all three");
+                            });
+                        }
+                    });
+                })
+            };
 
             // Grow or shrink the window to fit the content. Sizes are in points, so
-            // this also resizes the window when the zoom factor changes.
-            let wanted = content.response.rect.height() + 2.0 * MARGIN as f32;
+            // this also resizes the window when the zoom factor changes. The compact
+            // row sizes the width to its content too; the full card has a fixed width.
+            let size = content.response.rect.size();
+            let wanted = Vec2::new(
+                if minimized {
+                    size.x + margin.sum().x
+                } else {
+                    WIDTH
+                },
+                size.y + margin.sum().y,
+            );
             let current = ctx.viewport_rect().size();
-            if (wanted - current.y).abs() > 1.5 || (WIDTH - current.x).abs() > 1.5 {
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(WIDTH, wanted)));
+            if (wanted - current).abs().max_elem() > 1.5 {
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(wanted));
                 // The card grows downwards as data arrives (or on zoom), which can
                 // push it past the screen edge, so re-check placement next frame.
                 self.settled = false;
@@ -705,6 +808,7 @@ impl eframe::App for App {
 
         match action {
             Some(MenuAction::Refresh) => refresh = true,
+            Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
             Some(MenuAction::Open(p)) => ctx.open_url(egui::OpenUrl::new_tab(p.url())),
             Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
             Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
