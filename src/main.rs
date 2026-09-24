@@ -25,7 +25,7 @@ const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
-const SIZES: [f32; 6] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5];
+const SIZES: [f32; 8] = [0.25, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 // The window is opaque and painted entirely in BG; Windows rounds the corners
 // at the compositor level (see `apply_windows_chrome`), so nothing else shows.
@@ -67,6 +67,10 @@ impl App {
         let (refresh_tx, refresh_rx) = mpsc::channel();
         spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Selectable labels grab clicks and drags, so right-click and drag-to-move
+        // would not work over text.
+        cc.egui_ctx
+            .all_styles_mut(|style| style.interaction.selectable_labels = false);
         let minimized = cc
             .storage
             .and_then(|s| eframe::get_value(s, MINIMIZED_KEY))
@@ -386,7 +390,7 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
 
     ui.horizontal(|ui| {
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-        ui.hyperlink_to(name, p.url()).on_hover_text(p.url());
+        ui.label(name);
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
@@ -736,7 +740,8 @@ impl eframe::App for App {
             // An egui menu is clipped to this small window, so Windows gets a
             // native popup menu that can extend past it.
             #[cfg(windows)]
-            if bg.secondary_clicked() {
+            // Checked on the raw pointer so a right-click over any widget counts.
+            if ui.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
                 action = native_menu(frame, zoom, refresh_mins, minimized);
             }
             #[cfg(not(windows))]
