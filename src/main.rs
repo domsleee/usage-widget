@@ -311,6 +311,7 @@ fn settle_window(frame: &eframe::Frame) -> bool {
         if IsWindowVisible(hwnd) == 0 {
             return false;
         }
+        watch_taskbar(hwnd);
         let mut r = Rect::default();
         let mut info = MonitorInfo {
             size: size_of::<MonitorInfo>() as u32,
@@ -333,6 +334,78 @@ fn settle_window(frame: &eframe::Frame) -> bool {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, flags);
     }
     true
+}
+
+/// The taskbar is topmost too, and whenever it is activated Windows raises it
+/// above every other topmost window, hiding the widget if it sits on the taskbar.
+/// Listens for foreground changes and puts the widget back on top whenever the
+/// taskbar comes forward. Only the first call installs the hook.
+#[cfg(windows)]
+fn watch_taskbar(hwnd: isize) {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    type WinEventProc = unsafe extern "system" fn(isize, u32, isize, i32, i32, u32, u32);
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetWinEventHook(
+            min: u32,
+            max: u32,
+            module: isize,
+            proc: WinEventProc,
+            pid: u32,
+            tid: u32,
+            flags: u32,
+        ) -> isize;
+        fn GetClassNameW(hwnd: isize, name: *mut u16, len: i32) -> i32;
+    }
+    const EVENT_SYSTEM_FOREGROUND: u32 = 0x3;
+    const WINEVENT_OUTOFCONTEXT: u32 = 0x0;
+
+    static WIDGET: AtomicIsize = AtomicIsize::new(0);
+
+    unsafe extern "system" fn on_foreground(
+        _hook: isize,
+        _event: u32,
+        foreground: isize,
+        _object: i32,
+        _child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        let mut buf = [0u16; 32];
+        let len = unsafe { GetClassNameW(foreground, buf.as_mut_ptr(), buf.len() as i32) };
+        let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+        // The primary monitor's taskbar, and the ones on other monitors.
+        if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" {
+            unsafe {
+                SetWindowPos(
+                    WIDGET.load(Ordering::Relaxed),
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    if WIDGET.swap(hwnd, Ordering::Relaxed) != 0 {
+        return;
+    }
+    // Out-of-context hooks are delivered through this (the UI) thread's message loop.
+    unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            0,
+            on_foreground,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+    }
 }
 
 #[cfg(not(windows))]
