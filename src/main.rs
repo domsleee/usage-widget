@@ -23,6 +23,11 @@ const DEFAULT_OPACITY_PERCENT: u32 = 85;
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
 const SIZES: [f32; 6] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5];
+/// Gap, in 96-DPI pixels, kept between the card and the screen edges or taskbar
+/// when it is snapped or pulled back on screen.
+const SNAP_PAD: i32 = 8;
+/// How close, in 96-DPI pixels, a dragged card has to get to an edge to snap.
+const SNAP_RANGE: i32 = 16;
 
 // The window is opaque and painted entirely in BG; Windows rounds the corners
 // at the compositor level (see `apply_windows_chrome`), so nothing else shows.
@@ -256,22 +261,20 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
 #[cfg(not(windows))]
 fn apply_windows_chrome(_frame: &eframe::Frame) {}
 
-/// Runs when the window is first visible and after each self-resize. Pulls it
-/// fully onto the nearest monitor's work area, since the saved position can point
-/// at a monitor that is no longer there (e.g. after hotdesking), and forces it to
-/// the top of the z-order: winit creates it hidden and the topmost level otherwise
-/// does not take effect until the window is first activated. Returns false until
-/// the window is visible.
 #[cfg(windows)]
-fn settle_window(frame: &eframe::Frame) -> bool {
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// Work area (the monitor minus the taskbar) of the monitor nearest to `r`, inset
+/// by the snap padding at that window's DPI.
+#[cfg(windows)]
+fn padded_work_area(hwnd: isize, r: &Rect) -> Option<Rect> {
     #[repr(C)]
     #[derive(Default)]
     struct MonitorInfo {
@@ -282,12 +285,59 @@ fn settle_window(frame: &eframe::Frame) -> bool {
     }
     #[link(name = "user32")]
     unsafe extern "system" {
-        fn IsWindowVisible(hwnd: isize) -> i32;
-        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn MonitorFromRect(rect: *const Rect, flags: u32) -> isize;
         fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     }
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
+    let mut info = MonitorInfo {
+        size: size_of::<MonitorInfo>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &mut info) } == 0 {
+        return None;
+    }
+    let pad = scaled(hwnd, SNAP_PAD);
+    let w = info.work;
+    Some(Rect {
+        left: w.left + pad,
+        top: w.top + pad,
+        right: w.right - pad,
+        bottom: w.bottom - pad,
+    })
+}
+
+/// Converts 96-DPI pixels to the window's current DPI.
+#[cfg(windows)]
+fn scaled(hwnd: isize, px: i32) -> i32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDpiForWindow(hwnd: isize) -> u32;
+    }
+    let dpi = match unsafe { GetDpiForWindow(hwnd) } {
+        0 => 96,
+        d => d as i32,
+    };
+    px * dpi / 96
+}
+
+/// Runs when the window is first visible and after each self-resize. Pulls it
+/// fully onto the nearest monitor's work area, since the saved position can point
+/// at a monitor that is no longer there (e.g. after hotdesking), and forces it to
+/// the top of the z-order: winit creates it hidden and the topmost level otherwise
+/// does not take effect until the window is first activated. Also (re)installs
+/// edge snapping. Returns false until the window is visible.
+#[cfg(windows)]
+fn settle_window(frame: &eframe::Frame) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+    }
+    #[link(name = "comctl32")]
+    unsafe extern "system" {
+        fn SetWindowSubclass(hwnd: isize, proc: SubclassProc, id: usize, data: usize) -> i32;
+    }
 
     let Some(hwnd) = hwnd(frame) else {
         return true;
@@ -296,17 +346,15 @@ fn settle_window(frame: &eframe::Frame) -> bool {
         if IsWindowVisible(hwnd) == 0 {
             return false;
         }
+        // Idempotent: re-adding the same proc and id only updates its data.
+        SetWindowSubclass(hwnd, snap_proc, 1, 0);
+
         let mut r = Rect::default();
-        let mut info = MonitorInfo {
-            size: size_of::<MonitorInfo>() as u32,
-            ..Default::default()
-        };
         let mut flags = SWP_NOSIZE | SWP_NOACTIVATE;
         let (mut x, mut y) = (r.left, r.top);
         if GetWindowRect(hwnd, &mut r) != 0
-            && GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut info) != 0
+            && let Some(work) = padded_work_area(hwnd, &r)
         {
-            let work = info.work;
             x = r.left.min(work.right - (r.right - r.left)).max(work.left);
             y = r.top.min(work.bottom - (r.bottom - r.top)).max(work.top);
         } else {
@@ -318,6 +366,52 @@ fn settle_window(frame: &eframe::Frame) -> bool {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, flags);
     }
     true
+}
+
+#[cfg(windows)]
+type SubclassProc = unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
+
+/// While the window is being dragged, nudges the proposed position onto the
+/// padded screen edges or taskbar when it comes within `SNAP_RANGE`. Windows
+/// recomputes the position from the cursor on every move, so pulling further
+/// away releases it.
+#[cfg(windows)]
+unsafe extern "system" fn snap_proc(
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+    _id: usize,
+    _data: usize,
+) -> isize {
+    #[link(name = "comctl32")]
+    unsafe extern "system" {
+        fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    const WM_MOVING: u32 = 0x0216;
+
+    if msg == WM_MOVING && lparam != 0 {
+        let r = unsafe { &mut *(lparam as *mut Rect) };
+        if let Some(work) = padded_work_area(hwnd, r) {
+            let range = scaled(hwnd, SNAP_RANGE);
+            let offset = |lo: i32, hi: i32, min: i32, max: i32| {
+                if (lo - min).abs() <= range {
+                    min - lo
+                } else if (hi - max).abs() <= range {
+                    max - hi
+                } else {
+                    0
+                }
+            };
+            let dx = offset(r.left, r.right, work.left, work.right);
+            let dy = offset(r.top, r.bottom, work.top, work.bottom);
+            r.left += dx;
+            r.right += dx;
+            r.top += dy;
+            r.bottom += dy;
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 #[cfg(not(windows))]
@@ -417,6 +511,163 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Refresh,
+    Open(Provider),
+    Size(f32),
+    Quit,
+}
+
+/// Shows the right-click menu as a native popup at the cursor and blocks until
+/// it is dismissed. Unlike an egui menu it is not clipped to the window.
+#[cfg(windows)]
+fn native_menu(frame: &eframe::Frame, zoom: f32, refresh_mins: u64) -> Option<MenuAction> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn CreatePopupMenu() -> isize;
+        fn AppendMenuW(menu: isize, flags: u32, id: usize, text: *const u16) -> i32;
+        fn TrackPopupMenu(
+            menu: isize,
+            flags: u32,
+            x: i32,
+            y: i32,
+            reserved: i32,
+            hwnd: isize,
+            rect: *const core::ffi::c_void,
+        ) -> i32;
+        fn DestroyMenu(menu: isize) -> i32;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    }
+    const MF_STRING: u32 = 0x0;
+    const MF_GRAYED: u32 = 0x1;
+    const MF_CHECKED: u32 = 0x8;
+    const MF_POPUP: u32 = 0x10;
+    const MF_SEPARATOR: u32 = 0x800;
+    const TPM_RIGHTBUTTON: u32 = 0x2;
+    const TPM_RETURNCMD: u32 = 0x100;
+    const WM_NULL: u32 = 0;
+    const ID_REFRESH: usize = 1;
+    const ID_QUIT: usize = 2;
+    const ID_OPEN: usize = 10;
+    const ID_SIZE: usize = 100;
+
+    let hwnd = hwnd(frame)?;
+    unsafe {
+        let add = |menu: isize, flags: u32, id: usize, text: &str| {
+            AppendMenuW(menu, flags, id, wide(text).as_ptr());
+        };
+        let menu = CreatePopupMenu();
+        add(menu, MF_STRING, ID_REFRESH, "Refresh now");
+        add(menu, MF_SEPARATOR, 0, "");
+        for (i, p) in Provider::ALL.iter().enumerate() {
+            add(
+                menu,
+                MF_STRING,
+                ID_OPEN + i,
+                &format!("Open {} usage", p.name()),
+            );
+        }
+        add(menu, MF_SEPARATOR, 0, "");
+        // Owned by `menu` once appended, so destroyed along with it.
+        let sizes = CreatePopupMenu();
+        for (i, z) in SIZES.iter().enumerate() {
+            let checked = if (zoom - z).abs() < 0.01 {
+                MF_CHECKED
+            } else {
+                0
+            };
+            add(
+                sizes,
+                MF_STRING | checked,
+                ID_SIZE + i,
+                &format!("{:.0}%", z * 100.0),
+            );
+        }
+        add(menu, MF_POPUP, sizes as usize, "Size");
+        add(menu, MF_SEPARATOR, 0, "");
+        let note = format!("Refreshes every {refresh_mins} min");
+        add(menu, MF_STRING | MF_GRAYED, 0, &note);
+        add(menu, MF_STRING, ID_QUIT, "Quit");
+
+        let mut pt = Point::default();
+        GetCursorPos(&mut pt);
+        // Without these two calls the menu does not close when clicking elsewhere
+        // (see the TrackPopupMenu remarks).
+        SetForegroundWindow(hwnd);
+        let id = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            std::ptr::null(),
+        ) as usize;
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+
+        match id {
+            ID_REFRESH => Some(MenuAction::Refresh),
+            ID_QUIT => Some(MenuAction::Quit),
+            _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
+                Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
+            }
+            _ if (ID_SIZE..ID_SIZE + SIZES.len()).contains(&id) => {
+                Some(MenuAction::Size(SIZES[id - ID_SIZE]))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn egui_menu(ui: &mut egui::Ui, zoom: f32, refresh_mins: u64) -> Option<MenuAction> {
+    let mut action = None;
+    if ui.button("Refresh now").clicked() {
+        action = Some(MenuAction::Refresh);
+    }
+    ui.separator();
+    for p in Provider::ALL {
+        if ui.button(format!("Open {} usage", p.name())).clicked() {
+            action = Some(MenuAction::Open(p));
+        }
+    }
+    ui.separator();
+    ui.menu_button("Size", |ui| {
+        for z in SIZES {
+            let label = format!("{:.0}%", z * 100.0);
+            if ui.radio((zoom - z).abs() < 0.01, label).clicked() {
+                action = Some(MenuAction::Size(z));
+            }
+        }
+    });
+    ui.separator();
+    ui.label(
+        RichText::new(format!("refreshes every {refresh_mins} min"))
+            .size(10.0)
+            .color(MUTED),
+    );
+    if ui.button("Quit").clicked() {
+        action = Some(MenuAction::Quit);
+    }
+    action
+}
+
+/// NUL-terminated UTF-16 for Win32 string parameters.
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// A small circular-arrow refresh button drawn with the painter (no icon font needed).
 fn refresh_button(ui: &mut egui::Ui) -> bool {
     let size = 11.0;
@@ -476,7 +727,9 @@ impl eframe::App for App {
             .inner_margin(Margin::same(MARGIN));
 
         let mut refresh = false;
-        let mut quit = false;
+        let mut action = None;
+        let zoom = ctx.zoom_factor();
+        let refresh_mins = self.interval.as_secs() / 60;
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -484,40 +737,16 @@ impl eframe::App for App {
             if bg.drag_started_by(PointerButton::Primary) {
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
+            // An egui menu is clipped to this small window, so Windows gets a
+            // native popup menu that can extend past it.
+            #[cfg(windows)]
+            if bg.secondary_clicked() {
+                action = native_menu(frame, zoom, refresh_mins);
+            }
+            #[cfg(not(windows))]
             bg.context_menu(|ui| {
-                if ui.button("Refresh now").clicked() {
-                    refresh = true;
-                    ui.close();
-                }
-                ui.separator();
-                for p in Provider::ALL {
-                    if ui.button(format!("Open {} usage", p.name())).clicked() {
-                        ctx.open_url(egui::OpenUrl::new_tab(p.url()));
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                ui.menu_button("Size", |ui| {
-                    let current = ctx.zoom_factor();
-                    for z in SIZES {
-                        let label = format!("{:.0}%", z * 100.0);
-                        if ui.radio((current - z).abs() < 0.01, label).clicked() {
-                            ctx.set_zoom_factor(z);
-                            ui.close();
-                        }
-                    }
-                });
-                ui.separator();
-                ui.label(
-                    RichText::new(format!(
-                        "refreshes every {} min",
-                        self.interval.as_secs() / 60
-                    ))
-                    .size(10.0)
-                    .color(MUTED),
-                );
-                if ui.button("Quit").clicked() {
-                    quit = true;
+                action = egui_menu(ui, zoom, refresh_mins);
+                if action.is_some() {
                     ui.close();
                 }
             });
@@ -568,11 +797,15 @@ impl eframe::App for App {
             }
         });
 
+        match action {
+            Some(MenuAction::Refresh) => refresh = true,
+            Some(MenuAction::Open(p)) => ctx.open_url(egui::OpenUrl::new_tab(p.url())),
+            Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
+            Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
+            None => {}
+        }
         if refresh {
             self.refresh_now();
-        }
-        if quit {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
 }
@@ -658,10 +891,7 @@ fn claim_single_instance() -> bool {
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
-    let name: Vec<u16> = r"Local\usage-widget-single-instance"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let name = wide(r"Local\usage-widget-single-instance");
     // The handle is deliberately never closed; Windows releases it on exit.
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
@@ -738,11 +968,6 @@ fn finish(result: Result<String, String>) -> eframe::Result {
         unsafe extern "system" {
             fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
         }
-        let wide = |s: &str| {
-            s.encode_utf16()
-                .chain(std::iter::once(0))
-                .collect::<Vec<u16>>()
-        };
         let text_w = wide(&text);
         let caption_w = wide("usage-widget");
         let icon = if is_err { 0x10 } else { 0x40 }; // MB_ICONERROR / MB_ICONINFORMATION
