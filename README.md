@@ -59,6 +59,7 @@ From a clone, `install.ps1` does the same three steps using the local checkout.
 
 - Drag anywhere on the widget to move it. Position is remembered between runs, and
   if the saved spot is off screen (say, a monitor is gone) it is moved back on.
+  While dragging it snaps to the screen edges and the taskbar with a small gap.
 - Right-click for refresh, size, links to each service's usage page, and Quit.
 - Size scales the widget from 50% to 150% on top of your display scaling (Ctrl +/-
   also works). Handy when a high-DPI monitor makes it too big. It is remembered.
