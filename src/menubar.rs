@@ -2,9 +2,13 @@
 //! Cmd+Tab entry, so the menu bar holds its menu and a way to hide the widget.
 
 use crate::providers::Provider;
+use crate::{MenuAction, SIZES};
 use eframe::egui;
+use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{
+    CheckMenuItem, ContextMenu, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 #[derive(Clone, Copy)]
@@ -14,6 +18,8 @@ pub enum Action {
     Open(Provider),
     EditConfig,
     Quit,
+    /// A choice from the widget's right-click popup.
+    Widget(MenuAction),
 }
 
 pub struct MenuBar {
@@ -21,6 +27,9 @@ pub struct MenuBar {
     toggle: MenuItem,
     actions: Vec<(MenuId, Action)>,
     rx: Receiver<MenuId>,
+    /// The items of the last right-click popup. AppKit delivers a choice after
+    /// the popup has closed, so it arrives with the menu bar's clicks.
+    popup_actions: RefCell<Vec<(MenuId, MenuAction)>>,
 }
 
 impl MenuBar {
@@ -85,15 +94,84 @@ impl MenuBar {
             toggle,
             actions,
             rx,
+            popup_actions: RefCell::default(),
         })
     }
 
     /// Menu actions chosen since the last call.
     pub fn take_actions(&self) -> Vec<Action> {
+        let popup = self.popup_actions.borrow();
         self.rx
             .try_iter()
-            .filter_map(|id| self.actions.iter().find(|(i, _)| *i == id).map(|(_, a)| *a))
+            .filter_map(|id| {
+                let bar = self.actions.iter().find(|(i, _)| *i == id).map(|(_, a)| *a);
+                bar.or_else(|| {
+                    let (_, a) = popup.iter().find(|(i, _)| *i == id)?;
+                    Some(Action::Widget(*a))
+                })
+            })
             .collect()
+    }
+
+    /// Shows the widget's right-click menu as a native popup at the cursor and
+    /// blocks until it is dismissed. Unlike an egui menu it is not clipped to the
+    /// window, which matters most for the one-line minimized widget. The choice
+    /// comes back from `take_actions` as `Action::Widget`.
+    ///
+    /// # Safety
+    ///
+    /// `ns_view` must point to the widget's live `NSView`.
+    pub unsafe fn popup(
+        &self,
+        ns_view: *const std::ffi::c_void,
+        providers: &[Provider],
+        zoom: f32,
+        refresh_mins: u64,
+        minimized: bool,
+    ) {
+        let mut actions = Vec::new();
+        let mut item = |text: &str, action: Option<MenuAction>| {
+            let item = MenuItem::new(text, action.is_some(), None);
+            if let Some(action) = action {
+                actions.push((item.id().clone(), action));
+            }
+            item
+        };
+        let refresh = item("Refresh now", Some(MenuAction::Refresh));
+        let minimize = item(
+            crate::minimize_label(minimized),
+            Some(MenuAction::ToggleMinimized),
+        );
+        let opens: Vec<MenuItem> = providers
+            .iter()
+            .map(|&p| item(&format!("Open {} usage", p.name()), Some(MenuAction::Open(p))))
+            .collect();
+        let note = item(&format!("Refreshes every {refresh_mins} min"), None);
+        let edit = item("Edit config", Some(MenuAction::EditConfig));
+        let quit = item("Quit", Some(MenuAction::Quit));
+        let sizes = Submenu::new("Size", true);
+        for z in SIZES {
+            let size = CheckMenuItem::new(
+                format!("{:.0}%", z * 100.0),
+                true,
+                (zoom - z).abs() < 0.01,
+                None,
+            );
+            actions.push((size.id().clone(), MenuAction::Size(z)));
+            let _ = sizes.append(&size);
+        }
+
+        let menu = Menu::new();
+        let separator = PredefinedMenuItem::separator;
+        let _ = menu.append_items(&[&refresh, &minimize, &separator()]);
+        for open in &opens {
+            let _ = menu.append(open);
+        }
+        let _ = menu.append_items(&[&separator(), &sizes, &separator(), &note, &edit, &quit]);
+
+        *self.popup_actions.borrow_mut() = actions;
+        // SAFETY: upheld by the caller.
+        unsafe { menu.show_context_menu_for_nsview(ns_view, None) };
     }
 
     pub fn set_widget_shown(&self, shown: bool) {

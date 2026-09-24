@@ -238,6 +238,23 @@ impl App {
                 }
             }
             menubar::Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+            menubar::Action::Widget(action) => self.apply_action(action, ctx),
+        }
+    }
+
+    /// A choice from the right-click menu.
+    fn apply_action(&mut self, action: MenuAction, ctx: &egui::Context) {
+        match action {
+            MenuAction::Refresh => self.refresh_now(),
+            MenuAction::ToggleMinimized => self.minimized = !self.minimized,
+            MenuAction::Open(p) => open_url(p.url()),
+            MenuAction::Size(z) => ctx.set_zoom_factor(z),
+            MenuAction::EditConfig => {
+                if let Err(e) = config::open(false) {
+                    self.config_error = Some(e);
+                }
+            }
+            MenuAction::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
         }
     }
 
@@ -1145,6 +1162,31 @@ fn native_menu(
     }
 }
 
+/// The right-click menu as a native popup from the menu bar's menu library. The
+/// choice arrives later through `MenuBar::take_actions`.
+#[cfg(target_os = "macos")]
+fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, minimized: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Some(bar) = &app.menubar else { return };
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: `ns_view` is the live NSView eframe draws into, and `ui` runs on the
+    // main thread.
+    unsafe {
+        bar.popup(
+            appkit.ns_view.as_ptr(),
+            &app.providers,
+            zoom,
+            refresh_mins,
+            minimized,
+        )
+    }
+}
+
 #[cfg(not(windows))]
 fn egui_menu(
     ui: &mut egui::Ui,
@@ -1443,8 +1485,13 @@ impl eframe::App for App {
         };
 
         // Checked on the raw pointer so a right-click over any widget counts.
-        #[cfg(windows)]
         let right_clicked = ctx.input(|i| i.pointer.button_clicked(PointerButton::Secondary));
+        // A native popup menu where there is one (Windows, and macOS with its menu
+        // bar icon), since an egui menu is clipped to this small window.
+        #[cfg(target_os = "macos")]
+        let native_menu_available = self.menubar.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let native_menu_available = cfg!(windows);
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -1453,12 +1500,14 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
             #[cfg(not(windows))]
-            bg.context_menu(|ui| {
-                action = egui_menu(ui, &self.providers, zoom, refresh_mins, minimized);
-                if action.is_some() {
-                    ui.close();
-                }
-            });
+            if !native_menu_available {
+                bg.context_menu(|ui| {
+                    action = egui_menu(ui, &self.providers, zoom, refresh_mins, minimized);
+                    if action.is_some() {
+                        ui.close();
+                    }
+                });
+            }
 
             // Vertical gaps are set explicitly so they can differ by role: tight within
             // a meter, looser between meters, widest between services.
@@ -1538,32 +1587,25 @@ impl eframe::App for App {
             }
         });
 
-        // An egui menu is clipped to this small window, so Windows gets a native
-        // popup menu that can extend past it. Shown after the content, so a widget
-        // with its own context menu (the Claude renewal lookup) can take the click.
-        #[cfg(windows)]
-        if right_clicked && !egui::Popup::is_any_open(&ctx) {
-            action = native_menu(frame, &self.providers, zoom, refresh_mins, minimized);
+        // Shown after the content, so a widget with its own context menu (the
+        // Claude renewal lookup) can take the click.
+        if native_menu_available && right_clicked && !egui::Popup::is_any_open(&ctx) {
+            #[cfg(windows)]
+            {
+                action = native_menu(frame, &self.providers, zoom, refresh_mins, minimized);
+            }
+            #[cfg(target_os = "macos")]
+            mac_menu(frame, self, zoom, refresh_mins, minimized);
         }
 
-        match action {
-            Some(MenuAction::Refresh) => refresh = true,
-            Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
-            Some(MenuAction::Open(p)) => open_url(p.url()),
-            Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
-            Some(MenuAction::EditConfig) => {
-                if let Err(e) = config::open(false) {
-                    self.config_error = Some(e);
-                }
-            }
-            Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
-            None => {}
+        let (lookup_renewal, cancel_renewal) = (renewal.clicked, renewal.cancelled);
+        if let Some(action) = action {
+            self.apply_action(action, &ctx);
         }
         if resized {
             self.settled = false;
         }
-        let lookup_renewal = renewal.clicked;
-        if renewal.cancelled {
+        if cancel_renewal {
             self.renewal_lookup = None;
         }
         if refresh {
