@@ -11,8 +11,8 @@ pub(super) struct Control {
     pub cancelled: Arc<AtomicBool>,
 }
 
-// Drain both pipes even after the diagnostic limit so verbose children cannot
-// block on a full pipe. Retain only the tail, not unbounded output.
+// Reads a pipe to the end, so a chatty helper never blocks on a full pipe, but
+// keeps only the last part of the output for error messages.
 fn capture(mut reader: impl Read) -> Vec<u8> {
     let mut tail = Vec::new();
     let mut buffer = [0; 4096];
@@ -132,7 +132,8 @@ impl ProcessTree {
     fn new(child: &std::process::Child) -> Result<Self, String> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::*;
-        // This private, non-inheritable handle closes even if the widget crashes.
+        // A job object that kills the helper and everything it starts when its
+        // handle closes. Windows closes it even if the widget crashes.
         unsafe {
             let job = Self(CreateJobObjectW(std::ptr::null(), std::ptr::null()));
             if job.0.is_null() {
@@ -210,7 +211,8 @@ mod tests {
                     cancelled.store(true, Ordering::Relaxed);
                 }
             });
-            // The grandchild inherits the pipes: this hangs if cleanup misses it.
+            // The grandchild keeps the pipes open, so this hangs unless cleanup
+            // kills it too.
             let result = control.output(Command::new(&node).args(["-e", "require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});setInterval(()=>{},1000)"]), Duration::from_secs(1));
             assert!(
                 result

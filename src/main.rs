@@ -711,8 +711,8 @@ fn percent_text(m: &Meter, size: f32, precision: usize, estimated: bool) -> Rich
 }
 
 fn percent_label(pct: f64, precision: usize, estimated: bool) -> String {
-    // Estimates must retain their fractional part even when the user chooses
-    // whole-percent display for authoritative readings.
+    // Estimates always show at least two decimals, even when readings are shown
+    // as whole percents: the decimals are the estimate.
     let precision = if estimated {
         precision.max(2)
     } else {

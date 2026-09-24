@@ -61,8 +61,9 @@ pub fn fraction(
     Ok(result)
 }
 
-/// One refresh in arrival order. The checkpoint supports replay after upgrading
-/// from an old cache, or when a previous batch/cache write was interrupted.
+/// One refresh: the tracker as it was before (`before`), the new log events and
+/// the reading. Enough to replay the estimate, e.g. after upgrading from an older
+/// cache or when saving was interrupted.
 #[derive(Serialize, Deserialize)]
 struct Batch {
     before: Tracker,
@@ -71,10 +72,11 @@ struct Batch {
     window: i64,
     plan: String,
     source: String,
-    /// The API supplies no timestamp; don't invent one from the receipt time.
+    /// When the reading was taken. The API doesn't say, so this stays empty
+    /// rather than guessing from when it arrived.
     source_at: Option<i64>,
     observed_at: i64,
-    /// Predicted percentage; null means the authoritative reading was displayed.
+    /// The estimate shown, or `None` if the widget showed the service's own figure.
     estimate: Option<f64>,
 }
 
@@ -111,7 +113,8 @@ struct Event {
     ts: String,
     session: String,
     model: String,
-    /// Deltas and original cumulative counters (input includes cached input).
+    /// Tokens this response used, then the log's running totals after it: input
+    /// (which includes cached input), cached input, output.
     tokens: [u64; 3],
     totals: [u64; 3],
     credits: f64,
@@ -429,7 +432,7 @@ mod tests {
         let restored: Batch = serde_json::from_str(&saved).unwrap();
         let (_, replayed) = restored.replay();
         assert_eq!(replayed.map(|f| restored.pct + f), restored.estimate);
-        // Source precision is retained, and already-fractional readings get no guess.
+        // A reading that already has decimals is kept as sent and gets no estimate.
         batch.pct = 13.25;
         assert_eq!(batch.replay().1, None);
         assert!(serde_json::to_string(&batch).unwrap().contains("13.25"));

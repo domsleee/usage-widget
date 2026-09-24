@@ -75,14 +75,15 @@ struct Batch {
     source_at: i64,
     source: String,
     plan: String,
-    /// Predicted percentages, in reading order; null means no local estimate.
+    /// The estimate shown for each reading, in order; `None` where there was none.
     estimates: Vec<Option<f64>>,
 }
 
 impl Batch {
     fn replay(&self) -> (HashMap<String, Tracker>, Vec<Option<f64>>) {
         let mut windows = self.before.clone();
-        // Preserve the original estimator's second-resolution timestamp split.
+        // Split the events at the reading's time, to the second, as the live
+        // estimator did, so a replay gives the same answer.
         let split = self.events.partition_point(|e| e.ts <= self.source_at);
         let result = self
             .readings

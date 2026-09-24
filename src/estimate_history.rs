@@ -1,4 +1,5 @@
-//! Durable, content-free inputs and predictions for offline estimator replay.
+//! A log of each estimate's inputs and result: token counts and readings, never
+//! prompt or response text. It lets the estimators be replayed and tuned offline.
 
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -18,7 +19,8 @@ struct Record<'a, T> {
     batch: &'a T,
 }
 
-/// Append before saving scan cursors: a failed append must leave inputs retryable.
+/// Call this before saving how far the logs have been read, so that if it fails
+/// the same inputs are read again next time.
 pub fn append(provider: &str, received_at: &str, batch: &impl Serialize) -> Result<(), String> {
     let record = Record {
         schema_version: 1,
@@ -49,8 +51,8 @@ fn append_to(path: &Path, record: &impl Serialize) -> io::Result<()> {
         .append(true)
         .open(path)?;
     file.lock()?;
-    // Preserve a partial write from an interrupted process, but isolate it from
-    // the next valid record. Replay readers should report/skip malformed lines.
+    // A crash can leave a half-written last line. Keep it, but start this record
+    // on a new line so the two don't run together; readers skip lines that don't parse.
     if file.metadata()?.len() > 0 {
         file.seek(SeekFrom::End(-1))?;
         let mut last = [0];

@@ -1,4 +1,5 @@
-//! Owns the on-demand helper until completion or cancellation.
+//! Runs the browser helper that looks up Claude's renewal date when asked, and
+//! stops it once it finishes or is cancelled.
 
 mod process;
 use crate::providers::Cycle;
