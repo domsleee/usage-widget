@@ -50,8 +50,7 @@ impl Tracker {
             return;
         }
         if !plan.is_empty() && plan != self.plan {
-            // A different allowance: what a point costs has to be learned again.
-            self.recalibrate(pct, plan);
+            self.change_plan(pct, plan);
             return;
         }
         self.credits += credits;
@@ -76,10 +75,27 @@ impl Tracker {
     /// one-point lag behind the logs is just the service catching up.
     pub fn observe(&mut self, pct: f64, window: i64, plan: &str) {
         if same_window(window, self.window) && pct + 1.0 < self.last_pct {
-            self.recalibrate(pct, plan);
+            if plan.is_empty() || plan == self.plan {
+                self.recalibrate(pct, plan);
+            } else {
+                self.change_plan(pct, plan);
+            }
         } else {
             self.apply(pct, window, plan, 0.0);
         }
+    }
+
+    /// A different allowance mid-window. The window's use so far now reads `pct` of
+    /// the new plan, which prices the new plan's point; the window's own count
+    /// then starts afresh.
+    fn change_plan(&mut self, pct: f64, plan: &str) {
+        let gained = self.last_pct - self.start_pct;
+        if gained >= MIN_POINTS && self.tick_credits > 0.0 && pct >= MIN_POINTS {
+            let per_point = self.tick_credits / gained;
+            let used = per_point * self.last_pct + self.credits - self.tick_credits;
+            self.rates.insert(plan.to_string(), used / pct);
+        }
+        self.recalibrate(pct, plan);
     }
 
     /// Starts learning what a point costs afresh from `pct`.
@@ -172,6 +188,32 @@ mod tests {
 
         t.observe(100.0, WEEK, "pro");
         assert_eq!(t.fraction(100.0, WEEK), None); // nothing past the limit
+    }
+
+    #[test]
+    fn plan_change_carries_the_cost_of_a_point_over() {
+        let mut t = Tracker::default();
+        t.observe(10.0, WEEK, "Pro");
+        for pct in [11.0, 12.0, 13.0, 14.0] {
+            t.spend(10.0);
+            t.observe(pct, WEEK, "Pro");
+        }
+        t.spend(5.0);
+        // 145 credits' worth of use reads 4% of the bigger plan: 36.25 a point,
+        // replacing whatever a past week left.
+        t.rates.insert("Max 5x".into(), 1.0);
+        t.observe(4.0, WEEK, "Max 5x");
+        assert_eq!(t.rates["Max 5x"], 36.25);
+        t.spend(9.0625);
+        assert_eq!(t.fraction(4.0, WEEK), Some(0.25));
+
+        // Too few points on the new plan to say.
+        let mut t = Tracker::default();
+        t.observe(10.0, WEEK, "Pro");
+        t.spend(30.0);
+        t.observe(40.0, WEEK, "Pro");
+        t.observe(2.0, WEEK, "Max 5x");
+        assert_eq!(t.rates.get("Max 5x"), None);
     }
 
     #[test]
