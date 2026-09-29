@@ -343,6 +343,8 @@ fn settle_window(frame: &eframe::Frame) -> bool {
 /// closing, for one), so rather than chasing each cause this checks every
 /// `CHECK_MS` whether any taskbar is above the widget and, if so, raises the
 /// widget again. A foreground hook does the same immediately for taskbar clicks.
+/// The same timer restores the widget if Windows minimizes it (Win+M, for one):
+/// with no taskbar button it would otherwise stay hidden until relaunched.
 /// Only the first call installs the timer and hook.
 #[cfg(windows)]
 fn watch_taskbar(hwnd: isize) {
@@ -364,11 +366,14 @@ fn watch_taskbar(hwnd: isize) {
         fn GetClassNameW(hwnd: isize, name: *mut u16, len: i32) -> i32;
         fn SetTimer(hwnd: isize, id: usize, ms: u32, proc: TimerProc) -> usize;
         fn GetWindow(hwnd: isize, cmd: u32) -> isize;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
     }
     const EVENT_SYSTEM_FOREGROUND: u32 = 0x3;
     const WINEVENT_OUTOFCONTEXT: u32 = 0x0;
     const GW_HWNDPREV: u32 = 3;
-    /// How often to check that no taskbar has been raised above the widget.
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    /// How often to check that the widget is not minimized or below a taskbar.
     const CHECK_MS: u32 = 500;
 
     static WIDGET: AtomicIsize = AtomicIsize::new(0);
@@ -411,7 +416,11 @@ fn watch_taskbar(hwnd: isize) {
     }
 
     unsafe extern "system" fn on_timer(_hwnd: isize, _msg: u32, _id: usize, _time: u32) {
-        if taskbar_above() {
+        let widget = WIDGET.load(Ordering::Relaxed);
+        if unsafe { IsIconic(widget) } != 0 {
+            unsafe { ShowWindow(widget, SW_SHOWNOACTIVATE) };
+            raise();
+        } else if taskbar_above() {
             raise();
         }
     }
