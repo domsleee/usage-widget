@@ -29,10 +29,11 @@ What is shown depends on the plan:
 - Codex: 5-hour and weekly rate-limit windows when present, plus the workspace spend limit when present.
 
 Tokens are read from disk on every refresh and never written back by the widget. If
-Claude Code has not run for a while its access token expires; the widget then runs a
-one-line headless prompt (`claude -p` on Haiku, at most once every 15 minutes) so
-Claude Code refreshes the token itself, and retries. An expired Codex token is only
-reported; running `codex` once refreshes it.
+Claude Code or the Codex CLI has not run for a while its access token expires; the
+widget then runs a one-line headless prompt (`claude -p` on Haiku, or `codex exec` at
+low reasoning effort, each at most once every 15 minutes) so the CLI refreshes the
+token itself, and retries. The Copilot token comes from `gh auth token`, which does
+not expire.
 
 Logos are from [Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
 
