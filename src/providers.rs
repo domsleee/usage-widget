@@ -336,12 +336,17 @@ fn copilot() -> Result<Vec<Meter>, String> {
         s => return Err(format!("GitHub returned HTTP {s}")),
     }
 
+    copilot_meters(&json)
+}
+
+fn copilot_meters(json: &Value) -> Result<Vec<Meter>, String> {
     let snap = &json["quota_snapshots"]["premium_interactions"];
     if snap.is_null() {
         return Err("no premium_interactions quota in response".into());
     }
 
-    if snap["unlimited"].as_bool() == Some(true) {
+    let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
+    if total <= 0.0 && snap["unlimited"].as_bool() == Some(true) {
         return Ok(vec![Meter {
             label: Some("unlimited".into()),
             used: 0.0,
@@ -350,7 +355,6 @@ fn copilot() -> Result<Vec<Meter>, String> {
         }]);
     }
 
-    let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
     let used = f64_of(&snap["credits_used"])
         .or_else(|| f64_of(&snap["remaining"]).map(|r| total - r))
         .unwrap_or(0.0);
@@ -607,6 +611,39 @@ fn window_label(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_entitlement_takes_precedence_over_unlimited() {
+        for unlimited in [false, true] {
+            let json = serde_json::json!({
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "unlimited": unlimited,
+                        "entitlement": 150_000,
+                        "credits_used": 0,
+                        "remaining": 150_000
+                    }
+                }
+            });
+            let meters = copilot_meters(&json).unwrap();
+            assert_eq!(meters.len(), 1);
+            assert_eq!(meters[0].label, None);
+            assert_eq!(meters[0].unit, Unit::Dollars);
+            assert_eq!(meters[0].summary(), "$0 / $1,500");
+        }
+    }
+
+    #[test]
+    fn copilot_unlimited_without_entitlement() {
+        let json = serde_json::json!({
+            "quota_snapshots": {
+                "premium_interactions": { "unlimited": true, "entitlement": 0 }
+            }
+        });
+        let meters = copilot_meters(&json).unwrap();
+        assert_eq!(meters[0].label.as_deref(), Some("unlimited"));
+        assert_eq!(meters[0].total, 0.0);
+    }
 
     #[test]
     fn formatting() {
