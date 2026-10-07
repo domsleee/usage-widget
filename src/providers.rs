@@ -49,8 +49,8 @@ impl Provider {
     pub fn url(self) -> &'static str {
         match self {
             Provider::Copilot => "https://github.com/settings/copilot/features",
-            Provider::Claude => "https://claude.ai/new#settings/usage",
-            Provider::Codex => "https://chatgpt.com/#settings/Usage",
+            Provider::Claude => "https://claude.ai/settings/usage",
+            Provider::Codex => "https://chatgpt.com/settings/usage?tab=overview",
         }
     }
 

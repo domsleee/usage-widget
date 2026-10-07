@@ -885,8 +885,7 @@ fn spend_row(
         }
         // Usage-based plans reset monthly and need no subscription renewal lookup.
         provider_logo(ui, p, logos);
-        let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-        let response = ui.label(name);
+        let response = name_link(ui, p);
         if !hover.is_empty() {
             response.on_hover_text(hover.join("\n"));
         }
@@ -976,6 +975,18 @@ fn window_cell(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) 
     }
 }
 
+/// The service name, which opens its usage page when clicked.
+fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
+    let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
+    let response = ui
+        .add(egui::Label::new(name).sense(Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        open_url(p.url());
+    }
+    response
+}
+
 /// Service name, then plan and billing cycle in small text.
 fn header(
     ui: &mut egui::Ui,
@@ -988,8 +999,7 @@ fn header(
     let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
         provider_logo(ui, p, logos);
-        let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-        ui.label(name);
+        name_link(ui, p);
         renewal.show(ui, p, slot);
         let mut info: Vec<String> = slot.plan.iter().cloned().collect();
         let mut hover = None;
