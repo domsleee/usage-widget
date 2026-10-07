@@ -10,7 +10,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Meter, Provider, Unit, money};
+use providers::{FetchError, Meter, Provider, Unit, money};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -37,7 +37,7 @@ const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
     provider: Provider,
-    result: Result<Vec<Meter>, String>,
+    result: Result<Vec<Meter>, FetchError>,
     at: i64,
 }
 
@@ -45,6 +45,8 @@ struct Update {
 struct Slot {
     meters: Option<Vec<Meter>>,
     error: Option<String>,
+    /// Why the service is not set up on this machine; shown on hover.
+    not_available: Option<String>,
     updated: Option<i64>,
     loading: bool,
 }
@@ -113,8 +115,17 @@ impl App {
                 Ok(m) => {
                     slot.meters = Some(m);
                     slot.error = None;
+                    slot.not_available = None;
                 }
-                Err(e) => slot.error = Some(e),
+                Err(FetchError::NotAvailable(why)) => {
+                    slot.meters = None;
+                    slot.error = None;
+                    slot.not_available = Some(why);
+                }
+                Err(e) => {
+                    slot.error = Some(e.into());
+                    slot.not_available = None;
+                }
             }
         }
     }
@@ -539,7 +550,18 @@ fn provider_block(
         if let Some(m) = single {
             amounts(ui, m, 12.0);
         }
+        if let Some(why) = &slot.not_available {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("Not Available").size(12.0).color(MUTED))
+                    .on_hover_text(why);
+            });
+        }
     });
+
+    if slot.not_available.is_some() {
+        bar(ui, 0.0, MUTED);
+        return;
+    }
 
     match (single, &slot.meters, &slot.error) {
         (Some(m), _, _) => {
@@ -853,11 +875,12 @@ fn compact_row(
         let text = match (pct, &slot.error) {
             (Some(pct), _) => RichText::new(format!("{pct:.0}%")).color(level_color(pct)),
             (None, Some(_)) => RichText::new("!").color(ERR),
+            (None, None) if slot.not_available.is_some() => RichText::new("N/A").color(MUTED),
             (None, None) => RichText::new("…").color(MUTED),
         };
         let resp = ui.label(text.size(11.5).strong());
-        if let Some(err) = &slot.error {
-            resp.on_hover_text(format!("{}: {err}", p.name()));
+        if let Some(why) = slot.error.as_ref().or(slot.not_available.as_ref()) {
+            resp.on_hover_text(format!("{}: {why}", p.name()));
         }
     }
 }

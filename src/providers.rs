@@ -51,7 +51,7 @@ impl Provider {
         }
     }
 
-    pub fn fetch(self) -> Result<Vec<Meter>, String> {
+    pub fn fetch(self) -> Result<Vec<Meter>, FetchError> {
         match self {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(),
@@ -172,10 +172,17 @@ fn home() -> Result<PathBuf, String> {
     std::env::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())
 }
 
-fn read_json_file(path: &PathBuf) -> Result<Value, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("bad JSON in {}: {e}", path.display()))
+/// A missing file means the CLI was never logged in here, so the service is
+/// reported as not available, with `hint` saying how to set it up.
+fn read_json_file(path: &PathBuf, hint: &str) -> Result<Value, FetchError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FetchError::NotAvailable(format!("{} not found; {hint}", path.display()))
+        } else {
+            FetchError::Other(format!("cannot read {}: {e}", path.display()))
+        }
+    })?;
+    serde_json::from_str(&text).map_err(|e| format!("bad JSON in {}: {e}", path.display()).into())
 }
 
 fn f64_of(v: &Value) -> Option<f64> {
@@ -212,7 +219,10 @@ fn jwt_exp(token: &str) -> Option<i64> {
 /// failure does not spend a prompt on every refresh.
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
-enum FetchError {
+#[derive(Debug)]
+pub enum FetchError {
+    /// The service is not set up on this machine (no login or no subscription).
+    NotAvailable(String),
     /// The stored token is expired or was rejected; a token refresh may fix it.
     Auth(String),
     Other(String),
@@ -233,7 +243,7 @@ impl From<&str> for FetchError {
 impl From<FetchError> for String {
     fn from(e: FetchError) -> Self {
         match e {
-            FetchError::Auth(e) | FetchError::Other(e) => e,
+            FetchError::NotAvailable(e) | FetchError::Auth(e) | FetchError::Other(e) => e,
         }
     }
 }
@@ -242,13 +252,13 @@ impl From<FetchError> for String {
 fn with_refresh(
     fetch: fn() -> Result<Vec<Meter>, FetchError>,
     refresh: fn() -> Result<(), String>,
-) -> Result<Vec<Meter>, String> {
+) -> Result<Vec<Meter>, FetchError> {
     match fetch() {
         Err(FetchError::Auth(msg)) => match refresh() {
-            Ok(()) => fetch().map_err(String::from),
-            Err(why) => Err(format!("{msg} ({why})")),
+            Ok(()) => fetch(),
+            Err(why) => Err(FetchError::Other(format!("{msg} ({why})"))),
         },
-        r => r.map_err(String::from),
+        r => r,
     }
 }
 
@@ -296,7 +306,7 @@ fn run_headless(last: &Mutex<Option<Instant>>, program: &str, args: &[&str]) -> 
 // GitHub Copilot
 // ---------------------------------------------------------------------------
 
-fn github_token() -> Result<String, String> {
+fn github_token() -> Result<String, FetchError> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(t) = std::env::var(var) {
             if !t.trim().is_empty() {
@@ -307,20 +317,26 @@ fn github_token() -> Result<String, String> {
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"]);
     no_window(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"))?;
+    let out = cmd.output().map_err(|e| {
+        FetchError::NotAvailable(format!(
+            "gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"
+        ))
+    })?;
     if !out.status.success() {
-        return Err("`gh auth token` failed; run `gh auth login`".into());
+        return Err(FetchError::NotAvailable(
+            "`gh auth token` failed; run `gh auth login`".into(),
+        ));
     }
     let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if tok.is_empty() {
-        return Err("gh returned an empty token".into());
+        return Err(FetchError::NotAvailable(
+            "gh returned an empty token; run `gh auth login`".into(),
+        ));
     }
     Ok(tok)
 }
 
-fn copilot() -> Result<Vec<Meter>, String> {
+fn copilot() -> Result<Vec<Meter>, FetchError> {
     let token = github_token()?;
     let auth = format!("token {token}");
     let (status, json) = get_json(
@@ -333,16 +349,23 @@ fn copilot() -> Result<Vec<Meter>, String> {
     match status {
         200 => {}
         401 | 403 => return Err("GitHub token rejected; run `gh auth login`".into()),
-        s => return Err(format!("GitHub returned HTTP {s}")),
+        404 => {
+            return Err(FetchError::NotAvailable(
+                "no Copilot access on this GitHub account".into(),
+            ));
+        }
+        s => return Err(format!("GitHub returned HTTP {s}").into()),
     }
 
     copilot_meters(&json)
 }
 
-fn copilot_meters(json: &Value) -> Result<Vec<Meter>, String> {
+fn copilot_meters(json: &Value) -> Result<Vec<Meter>, FetchError> {
     let snap = &json["quota_snapshots"]["premium_interactions"];
     if snap.is_null() {
-        return Err("no premium_interactions quota in response".into());
+        return Err(FetchError::NotAvailable(
+            "no Copilot premium request quota on this GitHub account".into(),
+        ));
     }
 
     let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
@@ -370,7 +393,7 @@ fn copilot_meters(json: &Value) -> Result<Vec<Meter>, String> {
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
-fn claude() -> Result<Vec<Meter>, String> {
+fn claude() -> Result<Vec<Meter>, FetchError> {
     with_refresh(claude_once, refresh_claude_token)
 }
 
@@ -397,11 +420,11 @@ fn refresh_claude_token() -> Result<(), String> {
 
 fn claude_once() -> Result<Vec<Meter>, FetchError> {
     let path = home()?.join(".claude").join(".credentials.json");
-    let creds = read_json_file(&path)?;
+    let creds = read_json_file(&path, "log in with `claude`")?;
     let oauth = &creds["claudeAiOauth"];
-    let token = oauth["accessToken"]
-        .as_str()
-        .ok_or("no claudeAiOauth.accessToken; log in with `claude`")?;
+    let token = oauth["accessToken"].as_str().ok_or_else(|| {
+        FetchError::NotAvailable("no claudeAiOauth.accessToken; log in with `claude`".into())
+    })?;
     if let Some(exp_ms) = i64_of(&oauth["expiresAt"]) {
         if exp_ms / 1000 < now_unix() {
             return Err(FetchError::Auth(
@@ -492,7 +515,7 @@ fn claude_once() -> Result<Vec<Meter>, FetchError> {
 // Codex (Codex CLI ChatGPT token)
 // ---------------------------------------------------------------------------
 
-fn codex() -> Result<Vec<Meter>, String> {
+fn codex() -> Result<Vec<Meter>, FetchError> {
     with_refresh(codex_once, refresh_codex_token)
 }
 
@@ -522,11 +545,11 @@ fn refresh_codex_token() -> Result<(), String> {
 
 fn codex_once() -> Result<Vec<Meter>, FetchError> {
     let path = home()?.join(".codex").join("auth.json");
-    let auth_file = read_json_file(&path)?;
+    let auth_file = read_json_file(&path, "log in with `codex`")?;
     let tokens = &auth_file["tokens"];
-    let token = tokens["access_token"]
-        .as_str()
-        .ok_or("no tokens.access_token; log in with `codex`")?;
+    let token = tokens["access_token"].as_str().ok_or_else(|| {
+        FetchError::NotAvailable("no tokens.access_token; log in with `codex`".into())
+    })?;
     if let Some(exp) = jwt_exp(token) {
         if exp < now_unix() {
             return Err(FetchError::Auth(
@@ -643,6 +666,24 @@ mod tests {
         let meters = copilot_meters(&json).unwrap();
         assert_eq!(meters[0].label.as_deref(), Some("unlimited"));
         assert_eq!(meters[0].total, 0.0);
+    }
+
+    #[test]
+    fn copilot_without_quota_is_not_available() {
+        let json = serde_json::json!({ "quota_snapshots": {} });
+        assert!(matches!(
+            copilot_meters(&json),
+            Err(FetchError::NotAvailable(_))
+        ));
+    }
+
+    #[test]
+    fn missing_credentials_file_is_not_available() {
+        let path = std::env::temp_dir().join("usage-widget-test-missing.json");
+        assert!(matches!(
+            read_json_file(&path, "log in"),
+            Err(FetchError::NotAvailable(_))
+        ));
     }
 
     #[test]
