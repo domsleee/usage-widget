@@ -1349,9 +1349,10 @@ fn refresh_button(ui: &mut egui::Ui, tooltip: &str, error: bool) -> bool {
     let r = size * 0.38;
     let stroke = Stroke::new(1.4, color);
 
-    // Arc from ~50° to ~320° (leaving a gap at the top-right where the arrow head sits).
-    let start = 50f32.to_radians();
-    let end = 320f32.to_radians();
+    // Arc anticlockwise from the top round to the right, leaving a gap at the
+    // top-right that the arrow head points into.
+    let start = 90f32.to_radians();
+    let end = 365f32.to_radians();
     let n = 20;
     let points: Vec<Pos2> = (0..=n)
         .map(|i| {
@@ -1361,13 +1362,15 @@ fn refresh_button(ui: &mut egui::Ui, tooltip: &str, error: bool) -> bool {
         .collect();
     ui.painter().add(Shape::line(points, stroke));
 
-    // Arrow head at the arc end.
-    let tip = Pos2::new(c.x + r * end.cos(), c.y - r * end.sin());
-    let head = r * 0.75;
+    // Arrow head at the arc end, pointing along it: base across the arc, tip ahead.
+    let base = Pos2::new(c.x + r * end.cos(), c.y - r * end.sin());
+    let ahead = Vec2::new(-end.sin(), -end.cos());
+    let out = Vec2::new(end.cos(), -end.sin());
+    let head = r * 0.9;
     let tri = vec![
-        tip + Vec2::new(-head * 0.55, -head * 0.55),
-        tip + Vec2::new(head * 0.4, -head * 0.6),
-        tip + Vec2::new(0.1 * head, head * 0.45),
+        base + out * head * 0.6,
+        base + ahead * head,
+        base - out * head * 0.6,
     ];
     ui.painter()
         .add(Shape::convex_polygon(tri, color, Stroke::NONE));
