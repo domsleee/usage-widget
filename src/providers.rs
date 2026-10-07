@@ -454,8 +454,9 @@ struct ClaudeState {
     /// The claude.ai renewal (`browser_cookies`) and when it was fetched.
     renewal: Option<(i64, Cycle)>,
     renewal_attempt: i64,
-    /// Claude Code's organization when `renewal` was fetched.
+    /// Claude Code's organization and plan when `renewal` was fetched.
     renewal_org: Option<String>,
+    renewal_plan: Option<String>,
     /// The Claude Code account last seen, and since when (0 if it was the first).
     account: Option<String>,
     account_since: i64,
@@ -719,7 +720,14 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
     }
 
     let note = claude_note(now, live_at, snap_at, &meters, state.blocked_until, problem);
-    let (cycle, renewal_problem) = claude_renewal(config, &mut state, now, &meters, org.as_deref());
+    let (cycle, renewal_problem) = claude_renewal(
+        config,
+        &mut state,
+        now,
+        &meters,
+        org.as_deref(),
+        plan.as_deref(),
+    );
     // Say why the renewal date is missing, but only when there is none to show.
     let note = match renewal_problem.filter(|_| cycle.is_none()) {
         Some(e) => Some(note.map_or(format!("renewal: {e}"), |n| format!("{n} · renewal: {e}"))),
@@ -766,6 +774,7 @@ fn claude_renewal(
     now: i64,
     meters: &[Meter],
     org: Option<&str>,
+    plan: Option<&str>,
 ) -> (Option<Cycle>, Option<String>) {
     // Monthly spend needs neither a manual subscription date nor browser lookup.
     if spend_meter(meters).is_some() {
@@ -779,8 +788,12 @@ fn claude_renewal(
         .as_ref()
         .and_then(|c| c.as_ref().err())
         .cloned();
-    // A date looked up for another organization belongs to another account.
-    if org.is_some() && state.renewal.is_some() && state.renewal_org.as_deref() != org {
+    // A date looked up for another organization belongs to another account, and a
+    // plan change starts a new billing cycle.
+    let changed = |was: &Option<String>, now: Option<&str>| now.is_some() && was.as_deref() != now;
+    if state.renewal.is_some()
+        && (changed(&state.renewal_org, org) || changed(&state.renewal_plan, plan))
+    {
         state.renewal = None;
         state.renewal_attempt = 0;
     }
@@ -797,6 +810,7 @@ fn claude_renewal(
                 Ok(c) => {
                     state.renewal = Some((now, c));
                     state.renewal_org = org.map(String::from);
+                    state.renewal_plan = plan.map(String::from);
                 }
                 Err(e) => {
                     renewal_problem = Some(renewal_problem.map_or_else(
@@ -1543,10 +1557,31 @@ mod tests {
             renewal_attempt: 5,
             ..Default::default()
         };
-        let (cycle, _) = claude_renewal(&config, &mut state, 10, &[], Some("a"));
+        let (cycle, _) = claude_renewal(&config, &mut state, 10, &[], Some("a"), None);
         assert!(cycle.is_none()); // browser_cookies is off
         assert!(state.renewal.is_some());
-        claude_renewal(&config, &mut state, 10, &[], Some("b"));
+        claude_renewal(&config, &mut state, 10, &[], Some("b"), None);
+        assert!(state.renewal.is_none());
+        assert_eq!(state.renewal_attempt, 0);
+    }
+
+    #[test]
+    fn renewal_looked_up_for_another_plan_is_dropped() {
+        let config = crate::config::Claude::default();
+        let cycle = Cycle {
+            verb: "renews".into(),
+            at: 1,
+            date_only: false,
+        };
+        let mut state = ClaudeState {
+            renewal: Some((0, cycle)),
+            renewal_plan: Some("Max 5x".into()),
+            renewal_attempt: 5,
+            ..Default::default()
+        };
+        claude_renewal(&config, &mut state, 10, &[], None, Some("Max 5x"));
+        assert!(state.renewal.is_some());
+        claude_renewal(&config, &mut state, 10, &[], None, Some("Max 20x"));
         assert!(state.renewal.is_none());
         assert_eq!(state.renewal_attempt, 0);
     }
@@ -1572,7 +1607,8 @@ mod tests {
                 let meters = claude_meters(&serde_json::json!({
                     "extra_usage": { "used_credits": 10, "monthly_limit": total }
                 }));
-                let (cycle, error) = claude_renewal(&config, &mut state, now_unix(), &meters, None);
+                let (cycle, error) =
+                    claude_renewal(&config, &mut state, now_unix(), &meters, None, None);
                 assert!(cycle.is_none());
                 assert!(error.is_none());
                 assert_eq!(state.renewal_attempt, 0);
