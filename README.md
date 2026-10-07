@@ -72,5 +72,10 @@ From a clone, `install.ps1` does the same three steps using the local checkout.
   The widget reopens in whichever mode it was left in.
 - Size scales the widget from 25% to 200% on top of your display scaling (Ctrl +/-
   also works). Handy when a high-DPI monitor makes it too big. It is remembered.
+- A service you have not set up on this machine (no `gh` login or Copilot plan, or
+  never logged in to Claude Code or Codex) shows "Not Available" with an empty bar,
+  or `N/A` when minimized. Other problems, like an expired token or no connection,
+  show the same way with a short reason in red, or `!` when minimized. Hover it to
+  see the full message.
 - Set `USAGE_WIDGET_REFRESH_MINS` to change the refresh interval (default 5).
 - Set `USAGE_WIDGET_OPACITY` (20-100) to change the window opacity (default 85).

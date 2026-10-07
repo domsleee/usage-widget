@@ -10,7 +10,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Meter, Provider, Unit, money};
+use providers::{FetchError, Meter, Problem, Provider, Unit, money};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -37,14 +37,14 @@ const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
     provider: Provider,
-    result: Result<Vec<Meter>, String>,
+    result: Result<Vec<Meter>, FetchError>,
     at: i64,
 }
 
 #[derive(Clone, Default)]
 struct Slot {
     meters: Option<Vec<Meter>>,
-    error: Option<String>,
+    error: Option<FetchError>,
     updated: Option<i64>,
     loading: bool,
 }
@@ -114,7 +114,10 @@ impl App {
                     slot.meters = Some(m);
                     slot.error = None;
                 }
-                Err(e) => slot.error = Some(e),
+                Err(e) => {
+                    slot.meters = None;
+                    slot.error = Some(e);
+                }
             }
         }
     }
@@ -539,15 +542,31 @@ fn provider_block(
         if let Some(m) = single {
             amounts(ui, m, 12.0);
         }
+        if let Some(e) = &slot.error {
+            let color = if e.problem == Problem::NotAvailable {
+                MUTED
+            } else {
+                ERR
+            };
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(e.problem.label()).size(12.0).color(color))
+                    .on_hover_text(&e.detail);
+            });
+        }
     });
 
-    match (single, &slot.meters, &slot.error) {
-        (Some(m), _, _) => {
+    if slot.error.is_some() {
+        bar(ui, 0.0, MUTED);
+        return;
+    }
+
+    match (single, &slot.meters) {
+        (Some(m), _) => {
             if m.total > 0.0 {
                 bar(ui, m.fraction(), level_color(m.percent()));
             }
         }
-        (None, Some(meters), _) => {
+        (None, Some(meters)) => {
             for m in meters {
                 ui.horizontal(|ui| {
                     if let Some(label) = &m.label {
@@ -560,16 +579,8 @@ fn provider_block(
                 }
             }
         }
-        (None, None, Some(err)) => {
-            ui.label(RichText::new(err).size(10.5).color(ERR));
-        }
-        (None, None, None) => {
+        (None, None) => {
             ui.label(RichText::new("loading…").size(10.5).color(MUTED));
-        }
-    }
-    if slot.meters.is_some() {
-        if let Some(err) = &slot.error {
-            ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
         }
     }
 }
@@ -852,12 +863,15 @@ fn compact_row(
             .reduce(f64::max);
         let text = match (pct, &slot.error) {
             (Some(pct), _) => RichText::new(format!("{pct:.0}%")).color(level_color(pct)),
+            (None, Some(e)) if e.problem == Problem::NotAvailable => {
+                RichText::new("N/A").color(MUTED)
+            }
             (None, Some(_)) => RichText::new("!").color(ERR),
             (None, None) => RichText::new("…").color(MUTED),
         };
         let resp = ui.label(text.size(11.5).strong());
-        if let Some(err) = &slot.error {
-            resp.on_hover_text(format!("{}: {err}", p.name()));
+        if let Some(e) = &slot.error {
+            resp.on_hover_text(format!("{}: {}", p.name(), e.detail));
         }
     }
 }

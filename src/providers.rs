@@ -51,7 +51,7 @@ impl Provider {
         }
     }
 
-    pub fn fetch(self) -> Result<Vec<Meter>, String> {
+    pub fn fetch(self) -> Result<Vec<Meter>, FetchError> {
         match self {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(),
@@ -141,17 +141,19 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), String> {
+fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), FetchError> {
     let mut req = agent().get(url).header("Accept", "application/json");
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    let mut resp = req.call().map_err(|e| format!("request failed: {e}"))?;
+    let mut resp = req
+        .call()
+        .map_err(|e| FetchError::new(Problem::Connection, format!("request failed: {e}")))?;
     let status = resp.status().as_u16();
     let text = resp
         .body_mut()
         .read_to_string()
-        .map_err(|e| format!("read failed: {e}"))?;
+        .map_err(|e| FetchError::new(Problem::Connection, format!("read failed: {e}")))?;
     let json = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
     Ok((status, json))
 }
@@ -172,10 +174,28 @@ fn home() -> Result<PathBuf, String> {
     std::env::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())
 }
 
-fn read_json_file(path: &PathBuf) -> Result<Value, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("bad JSON in {}: {e}", path.display()))
+/// A missing file means the CLI was never logged in here, so the service is
+/// reported as not available, with `hint` saying how to set it up.
+fn read_json_file(path: &PathBuf, hint: &str) -> Result<Value, FetchError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FetchError::new(
+                Problem::NotAvailable,
+                format!("{} not found; {hint}", path.display()),
+            )
+        } else {
+            FetchError::new(
+                Problem::Other,
+                format!("cannot read {}: {e}", path.display()),
+            )
+        }
+    })?;
+    serde_json::from_str(&text).map_err(|e| {
+        FetchError::new(
+            Problem::Other,
+            format!("bad JSON in {}: {e}", path.display()),
+        )
+    })
 }
 
 fn f64_of(v: &Value) -> Option<f64> {
@@ -212,43 +232,70 @@ fn jwt_exp(token: &str) -> Option<i64> {
 /// failure does not spend a prompt on every refresh.
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
-enum FetchError {
-    /// The stored token is expired or was rejected; a token refresh may fix it.
-    Auth(String),
-    Other(String),
+/// What went wrong reading a service, shown in short on the widget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Problem {
+    /// The service is not set up on this machine (no login or no subscription).
+    NotAvailable,
+    TokenExpired,
+    TokenRejected,
+    Connection,
+    /// The service answered with an unexpected HTTP status.
+    Service,
+    /// The service answered, but without the usage data expected.
+    BadResponse,
+    Other,
 }
 
-impl From<String> for FetchError {
-    fn from(e: String) -> Self {
-        FetchError::Other(e)
-    }
-}
-
-impl From<&str> for FetchError {
-    fn from(e: &str) -> Self {
-        FetchError::Other(e.into())
-    }
-}
-
-impl From<FetchError> for String {
-    fn from(e: FetchError) -> Self {
-        match e {
-            FetchError::Auth(e) | FetchError::Other(e) => e,
+impl Problem {
+    pub fn label(self) -> &'static str {
+        match self {
+            Problem::NotAvailable => "Not Available",
+            Problem::TokenExpired => "Token expired",
+            Problem::TokenRejected => "Token rejected",
+            Problem::Connection => "Connection failed",
+            Problem::Service => "Service error",
+            Problem::BadResponse => "Unexpected response",
+            Problem::Other => "Error",
         }
     }
 }
 
-/// Runs `fetch`; on an auth failure runs `refresh` and tries once more.
+/// A short `problem` for the widget, plus the full `detail` shown on hover.
+#[derive(Clone, Debug)]
+pub struct FetchError {
+    pub problem: Problem,
+    pub detail: String,
+}
+
+impl FetchError {
+    fn new(problem: Problem, detail: impl Into<String>) -> Self {
+        Self {
+            problem,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(e: String) -> Self {
+        FetchError::new(Problem::Other, e)
+    }
+}
+
+/// Runs `fetch`; on an expired or rejected token runs `refresh` and tries once more.
 fn with_refresh(
     fetch: fn() -> Result<Vec<Meter>, FetchError>,
     refresh: fn() -> Result<(), String>,
-) -> Result<Vec<Meter>, String> {
+) -> Result<Vec<Meter>, FetchError> {
     match fetch() {
-        Err(FetchError::Auth(msg)) => match refresh() {
-            Ok(()) => fetch().map_err(String::from),
-            Err(why) => Err(format!("{msg} ({why})")),
-        },
-        r => r.map_err(String::from),
+        Err(e) if matches!(e.problem, Problem::TokenExpired | Problem::TokenRejected) => {
+            match refresh() {
+                Ok(()) => fetch(),
+                Err(why) => Err(FetchError::new(e.problem, format!("{} ({why})", e.detail))),
+            }
+        }
+        r => r,
     }
 }
 
@@ -296,7 +343,7 @@ fn run_headless(last: &Mutex<Option<Instant>>, program: &str, args: &[&str]) -> 
 // GitHub Copilot
 // ---------------------------------------------------------------------------
 
-fn github_token() -> Result<String, String> {
+fn github_token() -> Result<String, FetchError> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(t) = std::env::var(var) {
             if !t.trim().is_empty() {
@@ -307,20 +354,29 @@ fn github_token() -> Result<String, String> {
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"]);
     no_window(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"))?;
+    let out = cmd.output().map_err(|e| {
+        FetchError::new(
+            Problem::NotAvailable,
+            format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"),
+        )
+    })?;
     if !out.status.success() {
-        return Err("`gh auth token` failed; run `gh auth login`".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "`gh auth token` failed; run `gh auth login`",
+        ));
     }
     let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if tok.is_empty() {
-        return Err("gh returned an empty token".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "gh returned an empty token; run `gh auth login`",
+        ));
     }
     Ok(tok)
 }
 
-fn copilot() -> Result<Vec<Meter>, String> {
+fn copilot() -> Result<Vec<Meter>, FetchError> {
     let token = github_token()?;
     let auth = format!("token {token}");
     let (status, json) = get_json(
@@ -332,17 +388,36 @@ fn copilot() -> Result<Vec<Meter>, String> {
     )?;
     match status {
         200 => {}
-        401 | 403 => return Err("GitHub token rejected; run `gh auth login`".into()),
-        s => return Err(format!("GitHub returned HTTP {s}")),
+        401 | 403 => {
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "GitHub token rejected; run `gh auth login`",
+            ));
+        }
+        404 => {
+            return Err(FetchError::new(
+                Problem::NotAvailable,
+                "no Copilot access on this GitHub account",
+            ));
+        }
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("GitHub returned HTTP {s}"),
+            ));
+        }
     }
 
     copilot_meters(&json)
 }
 
-fn copilot_meters(json: &Value) -> Result<Vec<Meter>, String> {
+fn copilot_meters(json: &Value) -> Result<Vec<Meter>, FetchError> {
     let snap = &json["quota_snapshots"]["premium_interactions"];
     if snap.is_null() {
-        return Err("no premium_interactions quota in response".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "no Copilot premium request quota on this GitHub account",
+        ));
     }
 
     let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
@@ -370,7 +445,7 @@ fn copilot_meters(json: &Value) -> Result<Vec<Meter>, String> {
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
-fn claude() -> Result<Vec<Meter>, String> {
+fn claude() -> Result<Vec<Meter>, FetchError> {
     with_refresh(claude_once, refresh_claude_token)
 }
 
@@ -397,15 +472,19 @@ fn refresh_claude_token() -> Result<(), String> {
 
 fn claude_once() -> Result<Vec<Meter>, FetchError> {
     let path = home()?.join(".claude").join(".credentials.json");
-    let creds = read_json_file(&path)?;
+    let creds = read_json_file(&path, "log in with `claude`")?;
     let oauth = &creds["claudeAiOauth"];
-    let token = oauth["accessToken"]
-        .as_str()
-        .ok_or("no claudeAiOauth.accessToken; log in with `claude`")?;
+    let token = oauth["accessToken"].as_str().ok_or_else(|| {
+        FetchError::new(
+            Problem::NotAvailable,
+            "no claudeAiOauth.accessToken; log in with `claude`",
+        )
+    })?;
     if let Some(exp_ms) = i64_of(&oauth["expiresAt"]) {
         if exp_ms / 1000 < now_unix() {
-            return Err(FetchError::Auth(
-                "Claude token expired; run `claude` once to refresh".into(),
+            return Err(FetchError::new(
+                Problem::TokenExpired,
+                "Claude token expired; run `claude` once to refresh",
             ));
         }
     }
@@ -421,11 +500,17 @@ fn claude_once() -> Result<Vec<Meter>, FetchError> {
     match status {
         200 => {}
         401 | 403 => {
-            return Err(FetchError::Auth(
-                "Claude token rejected; run `claude` once to refresh".into(),
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "Claude token rejected; run `claude` once to refresh",
             ));
         }
-        s => return Err(format!("Anthropic returned HTTP {s}").into()),
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("Anthropic returned HTTP {s}"),
+            ));
+        }
     }
 
     let mut meters = Vec::new();
@@ -483,7 +568,10 @@ fn claude_once() -> Result<Vec<Meter>, FetchError> {
     }
 
     if meters.is_empty() {
-        return Err("no usage windows in response".into());
+        return Err(FetchError::new(
+            Problem::BadResponse,
+            "no usage windows in response",
+        ));
     }
     Ok(meters)
 }
@@ -492,7 +580,7 @@ fn claude_once() -> Result<Vec<Meter>, FetchError> {
 // Codex (Codex CLI ChatGPT token)
 // ---------------------------------------------------------------------------
 
-fn codex() -> Result<Vec<Meter>, String> {
+fn codex() -> Result<Vec<Meter>, FetchError> {
     with_refresh(codex_once, refresh_codex_token)
 }
 
@@ -522,15 +610,19 @@ fn refresh_codex_token() -> Result<(), String> {
 
 fn codex_once() -> Result<Vec<Meter>, FetchError> {
     let path = home()?.join(".codex").join("auth.json");
-    let auth_file = read_json_file(&path)?;
+    let auth_file = read_json_file(&path, "log in with `codex`")?;
     let tokens = &auth_file["tokens"];
-    let token = tokens["access_token"]
-        .as_str()
-        .ok_or("no tokens.access_token; log in with `codex`")?;
+    let token = tokens["access_token"].as_str().ok_or_else(|| {
+        FetchError::new(
+            Problem::NotAvailable,
+            "no tokens.access_token; log in with `codex`",
+        )
+    })?;
     if let Some(exp) = jwt_exp(token) {
         if exp < now_unix() {
-            return Err(FetchError::Auth(
-                "Codex token expired; run `codex` once to refresh".into(),
+            return Err(FetchError::new(
+                Problem::TokenExpired,
+                "Codex token expired; run `codex` once to refresh",
             ));
         }
     }
@@ -545,11 +637,17 @@ fn codex_once() -> Result<Vec<Meter>, FetchError> {
     match status {
         200 => {}
         401 | 403 => {
-            return Err(FetchError::Auth(
-                "Codex token rejected; run `codex` once to refresh".into(),
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "Codex token rejected; run `codex` once to refresh",
             ));
         }
-        s => return Err(format!("OpenAI returned HTTP {s}").into()),
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("OpenAI returned HTTP {s}"),
+            ));
+        }
     }
 
     let mut meters = Vec::new();
@@ -593,7 +691,10 @@ fn codex_once() -> Result<Vec<Meter>, FetchError> {
                 unit: Unit::Percent,
             }]);
         }
-        return Err("no rate limit or spend data in response".into());
+        return Err(FetchError::new(
+            Problem::BadResponse,
+            "no rate limit or spend data in response",
+        ));
     }
     Ok(meters)
 }
@@ -643,6 +744,37 @@ mod tests {
         let meters = copilot_meters(&json).unwrap();
         assert_eq!(meters[0].label.as_deref(), Some("unlimited"));
         assert_eq!(meters[0].total, 0.0);
+    }
+
+    #[test]
+    fn copilot_without_quota_is_not_available() {
+        let json = serde_json::json!({ "quota_snapshots": {} });
+        assert!(matches!(
+            copilot_meters(&json),
+            Err(e) if e.problem == Problem::NotAvailable
+        ));
+    }
+
+    #[test]
+    fn missing_credentials_file_is_not_available() {
+        let path = std::env::temp_dir().join("usage-widget-test-missing.json");
+        assert!(matches!(
+            read_json_file(&path, "log in"),
+            Err(e) if e.problem == Problem::NotAvailable
+        ));
+    }
+
+    #[test]
+    fn failed_token_refresh_keeps_the_problem() {
+        fn expired() -> Result<Vec<Meter>, FetchError> {
+            Err(FetchError::new(Problem::TokenExpired, "token expired"))
+        }
+        fn refresh_fails() -> Result<(), String> {
+            Err("auto-refresh tried recently".into())
+        }
+        let e = with_refresh(expired, refresh_fails).unwrap_err();
+        assert_eq!(e.problem, Problem::TokenExpired);
+        assert_eq!(e.detail, "token expired (auto-refresh tried recently)");
     }
 
     #[test]
