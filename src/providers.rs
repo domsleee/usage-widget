@@ -54,7 +54,7 @@ impl Provider {
         }
     }
 
-    pub fn fetch(self, config: &Config) -> Result<Usage, String> {
+    pub fn fetch(self, config: &Config) -> Result<Usage, FetchError> {
         match self {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(&config.claude),
@@ -211,7 +211,7 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), String> {
+fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), FetchError> {
     get_json_retry(url, headers).map(|(status, json, _)| (status, json))
 }
 
@@ -219,12 +219,14 @@ fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), String>
 fn get_json_retry(
     url: &str,
     headers: &[(&str, &str)],
-) -> Result<(u16, Value, Option<i64>), String> {
+) -> Result<(u16, Value, Option<i64>), FetchError> {
     let mut req = agent().get(url).header("Accept", "application/json");
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    let mut resp = req.call().map_err(|e| format!("request failed: {e}"))?;
+    let mut resp = req
+        .call()
+        .map_err(|e| FetchError::new(Problem::Connection, format!("request failed: {e}")))?;
     let status = resp.status().as_u16();
     let retry_after = resp
         .headers()
@@ -234,7 +236,7 @@ fn get_json_retry(
     let text = resp
         .body_mut()
         .read_to_string()
-        .map_err(|e| format!("read failed: {e}"))?;
+        .map_err(|e| FetchError::new(Problem::Connection, format!("read failed: {e}")))?;
     let json = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
     Ok((status, json, retry_after))
 }
@@ -255,10 +257,28 @@ fn home() -> Result<PathBuf, String> {
     std::env::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())
 }
 
-fn read_json_file(path: &PathBuf) -> Result<Value, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("bad JSON in {}: {e}", path.display()))
+/// A missing file means the CLI was never logged in here, so the service is
+/// reported as not available, with `hint` saying how to set it up.
+fn read_json_file(path: &PathBuf, hint: &str) -> Result<Value, FetchError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FetchError::new(
+                Problem::NotAvailable,
+                format!("{} not found; {hint}", path.display()),
+            )
+        } else {
+            FetchError::new(
+                Problem::Other,
+                format!("cannot read {}: {e}", path.display()),
+            )
+        }
+    })?;
+    serde_json::from_str(&text).map_err(|e| {
+        FetchError::new(
+            Problem::Other,
+            format!("bad JSON in {}: {e}", path.display()),
+        )
+    })
 }
 
 fn f64_of(v: &Value) -> Option<f64> {
@@ -288,10 +308,134 @@ fn jwt_exp(token: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Token refresh via the owning CLI
+// ---------------------------------------------------------------------------
+
+/// Minimum gap between headless CLI runs per provider, so a persistent auth
+/// failure does not spend a prompt on every refresh.
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+/// What went wrong reading a service, shown in short on the widget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Problem {
+    /// The service is not set up on this machine (no login or no subscription).
+    NotAvailable,
+    TokenExpired,
+    TokenRejected,
+    RateLimited,
+    Connection,
+    /// The service answered with an unexpected HTTP status.
+    Service,
+    /// The service answered, but without the usage data expected.
+    BadResponse,
+    Other,
+}
+
+impl Problem {
+    pub fn label(self) -> &'static str {
+        match self {
+            Problem::NotAvailable => "Not Available",
+            Problem::TokenExpired => "Token expired",
+            Problem::TokenRejected => "Token rejected",
+            Problem::RateLimited => "Rate limited",
+            Problem::Connection => "Connection failed",
+            Problem::Service => "Service error",
+            Problem::BadResponse => "Unexpected response",
+            Problem::Other => "Error",
+        }
+    }
+}
+
+/// A short `problem` for the widget, plus the full `detail` shown on hover.
+#[derive(Clone, Debug)]
+pub struct FetchError {
+    pub problem: Problem,
+    pub detail: String,
+}
+
+impl FetchError {
+    fn new(problem: Problem, detail: impl Into<String>) -> Self {
+        Self {
+            problem,
+            detail: detail.into(),
+        }
+    }
+
+    /// An expired or rejected token, which running the owning CLI may refresh.
+    fn needs_refresh(&self) -> bool {
+        matches!(self.problem, Problem::TokenExpired | Problem::TokenRejected)
+    }
+
+    fn with_cause(self, why: &str) -> Self {
+        FetchError::new(self.problem, format!("{} ({why})", self.detail))
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(e: String) -> Self {
+        FetchError::new(Problem::Other, e)
+    }
+}
+
+/// Runs `fetch`; on an expired or rejected token runs `refresh` and tries once more.
+fn with_refresh<T>(
+    mut fetch: impl FnMut() -> Result<T, FetchError>,
+    refresh: fn() -> Result<(), String>,
+) -> Result<T, FetchError> {
+    match fetch() {
+        Err(e) if e.needs_refresh() => match refresh() {
+            Ok(()) => fetch(),
+            Err(why) => Err(e.with_cause(&why)),
+        },
+        r => r,
+    }
+}
+
+/// Runs a CLI headlessly and waits for it, rate-limited by `last`. `program` is
+/// tried as-is and then with `.cmd`, since npm installs ship a shim that
+/// Command only finds by full name.
+fn run_headless(last: &Mutex<Option<Instant>>, program: &str, args: &[&str]) -> Result<(), String> {
+    {
+        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < REFRESH_COOLDOWN) {
+            return Err("auto-refresh tried recently".into());
+        }
+        *last = Some(Instant::now());
+    }
+
+    let spawn = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        no_window(&mut cmd);
+        cmd.spawn()
+    };
+    let mut child = spawn(program)
+        .or_else(|_| spawn(&format!("{program}.cmd")))
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err(format!("headless {program} failed")),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
+            _ => {
+                let _ = child.kill();
+                return Err(format!("headless {program} timed out"));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GitHub Copilot
 // ---------------------------------------------------------------------------
 
-fn github_token() -> Result<String, String> {
+fn github_token() -> Result<String, FetchError> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(t) = std::env::var(var) {
             if !t.trim().is_empty() {
@@ -302,20 +446,29 @@ fn github_token() -> Result<String, String> {
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"]);
     no_window(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"))?;
+    let out = cmd.output().map_err(|e| {
+        FetchError::new(
+            Problem::NotAvailable,
+            format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"),
+        )
+    })?;
     if !out.status.success() {
-        return Err("`gh auth token` failed; run `gh auth login`".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "`gh auth token` failed; run `gh auth login`",
+        ));
     }
     let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if tok.is_empty() {
-        return Err("gh returned an empty token".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "gh returned an empty token; run `gh auth login`",
+        ));
     }
     Ok(tok)
 }
 
-fn copilot() -> Result<Usage, String> {
+fn copilot() -> Result<Usage, FetchError> {
     let token = github_token()?;
     let auth = format!("token {token}");
     let (status, json) = get_json(
@@ -327,16 +480,26 @@ fn copilot() -> Result<Usage, String> {
     )?;
     match status {
         200 => {}
-        401 | 403 => return Err("GitHub token rejected; run `gh auth login`".into()),
-        s => return Err(format!("GitHub returned HTTP {s}")),
+        401 | 403 => {
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "GitHub token rejected; run `gh auth login`",
+            ));
+        }
+        404 => {
+            return Err(FetchError::new(
+                Problem::NotAvailable,
+                "no Copilot access on this GitHub account",
+            ));
+        }
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("GitHub returned HTTP {s}"),
+            ));
+        }
     }
 
-    let snap = &json["quota_snapshots"]["premium_interactions"];
-    if snap.is_null() {
-        return Err("no premium_interactions quota in response".into());
-    }
-
-    let plan = copilot_plan(&json);
     // Seats are billed to the org or enterprise; the monthly quota reset is the only date.
     let cycle = json["quota_reset_date_utc"]
         .as_str()
@@ -346,40 +509,45 @@ fn copilot() -> Result<Usage, String> {
             verb: "resets".into(),
             at,
         });
-
-    if snap["unlimited"].as_bool() == Some(true) {
-        return Ok(Usage {
-            plan,
-            cycle,
-            note: None,
-            estimated: Vec::new(),
-            meters: vec![Meter {
-                label: Some("unlimited".into()),
-                used: 0.0,
-                total: 0.0,
-                unit: Unit::Percent,
-                resets_at: None,
-            }],
-        });
-    }
-
-    let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
-    let used = f64_of(&snap["credits_used"])
-        .or_else(|| f64_of(&snap["remaining"]).map(|r| total - r))
-        .unwrap_or(0.0);
     Ok(Usage {
-        plan,
+        plan: copilot_plan(&json),
         cycle,
         note: None,
         estimated: Vec::new(),
-        meters: vec![Meter {
-            label: None,
-            used: used * COPILOT_USD_PER_CREDIT,
-            total: total * COPILOT_USD_PER_CREDIT,
-            unit: Unit::Dollars,
-            resets_at: None,
-        }],
+        meters: copilot_meters(&json)?,
     })
+}
+
+fn copilot_meters(json: &Value) -> Result<Vec<Meter>, FetchError> {
+    let snap = &json["quota_snapshots"]["premium_interactions"];
+    if snap.is_null() {
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "no Copilot premium request quota on this GitHub account",
+        ));
+    }
+
+    let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
+    if total <= 0.0 && snap["unlimited"].as_bool() == Some(true) {
+        return Ok(vec![Meter {
+            label: Some("unlimited".into()),
+            used: 0.0,
+            total: 0.0,
+            unit: Unit::Percent,
+            resets_at: None,
+        }]);
+    }
+
+    let used = f64_of(&snap["credits_used"])
+        .or_else(|| f64_of(&snap["remaining"]).map(|r| total - r))
+        .unwrap_or(0.0);
+    Ok(vec![Meter {
+        label: None,
+        used: used * COPILOT_USD_PER_CREDIT,
+        total: total * COPILOT_USD_PER_CREDIT,
+        unit: Unit::Dollars,
+        resets_at: None,
+    }])
 }
 
 fn copilot_plan(json: &Value) -> Option<String> {
@@ -398,18 +566,18 @@ fn copilot_plan(json: &Value) -> Option<String> {
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
-fn claude_credentials() -> Result<Value, String> {
+fn claude_credentials() -> Result<Value, FetchError> {
     let path = home()?.join(".claude").join(".credentials.json");
     #[cfg(target_os = "macos")]
     if !path.exists() {
         return claude_keychain_credentials();
     }
-    read_json_file(&path)
+    read_json_file(&path, "log in with `claude`")
 }
 
 /// Claude Code on macOS keeps its credentials in the login keychain, not on disk.
 #[cfg(target_os = "macos")]
-fn claude_keychain_credentials() -> Result<Value, String> {
+fn claude_keychain_credentials() -> Result<Value, FetchError> {
     let out = Command::new("security")
         .args([
             "find-generic-password",
@@ -420,9 +588,13 @@ fn claude_keychain_credentials() -> Result<Value, String> {
         .output()
         .map_err(|e| format!("cannot run `security` ({e})"))?;
     if !out.status.success() {
-        return Err("no Claude Code credentials in keychain; log in with `claude`".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "no Claude Code credentials in keychain; log in with `claude`",
+        ));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("bad JSON in keychain entry: {e}"))
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| FetchError::from(format!("bad JSON in keychain entry: {e}")))
 }
 
 /// Anthropic limits usage calls per OAuth token, and Claude Code spends the same
@@ -497,7 +669,7 @@ fn claude_statusline() -> Option<(i64, Value)> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
-    let mut v = read_json_file(&path).ok()?;
+    let mut v = read_json_file(&path, "").ok()?;
     let rate_limits = v["rate_limits"].take();
     rate_limits.is_object().then_some((at, rate_limits))
 }
@@ -589,7 +761,7 @@ fn claude_should_call(api: bool, now: i64, newest: Option<i64>, state: &ClaudeSt
     api && !fresh && now >= state.blocked_until && now - state.last_attempt >= CLAUDE_POLL_SECS
 }
 
-fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
+fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
     let api = config.api;
     let mut creds = claude_credentials();
     let ClaudeCodeState {
@@ -623,12 +795,12 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         state.last_attempt = now;
         let first = claude_api(claude_oauth(&creds), version.as_deref());
         let result = match first {
-            Err(ClaudeError::Auth(msg)) => match refresh_claude_token() {
+            Err(ClaudeError::Fetch(e)) if e.needs_refresh() => match refresh_claude_token() {
                 Ok(()) => {
                     creds = claude_credentials();
                     claude_api(claude_oauth(&creds), version.as_deref())
                 }
-                Err(why) => Err(ClaudeError::Other(format!("{msg} ({why})"))),
+                Err(why) => Err(e.with_cause(&why).into()),
             },
             r => r,
         };
@@ -645,7 +817,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
                 // From when the 429 arrived; a token refresh can take a while.
                 state.blocked_until = now_unix() + retry_after.max(CLAUDE_FRESH_SECS);
             }
-            Err(ClaudeError::Auth(e) | ClaudeError::Other(e)) => problem = Some(e),
+            Err(ClaudeError::Fetch(e)) => problem = Some(e),
         }
         state.save();
     }
@@ -673,12 +845,23 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
     // When the 5h and week readings were taken.
     let Some(data_at) = live_at.or(snap_at).filter(|_| !meters.is_empty()) else {
         return Err(if rate_limited {
-            format!(
-                "Claude rate limited; retrying in {}",
-                until(state.blocked_until)
+            FetchError::new(
+                Problem::RateLimited,
+                format!(
+                    "Claude rate limited; retrying in {}",
+                    until(state.blocked_until)
+                ),
             )
         } else {
-            problem.unwrap_or_else(|| "no Claude usage cached yet; open Claude Code".into())
+            // Not logged in shows as such even when the API was not called.
+            problem
+                .or_else(|| creds.as_ref().err().cloned())
+                .unwrap_or_else(|| {
+                    FetchError::new(
+                        Problem::Other,
+                        "no Claude usage cached yet; open Claude Code",
+                    )
+                })
         });
     };
 
@@ -719,7 +902,14 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, String> {
         }
     }
 
-    let note = claude_note(now, live_at, snap_at, &meters, state.blocked_until, problem);
+    let note = claude_note(
+        now,
+        live_at,
+        snap_at,
+        &meters,
+        state.blocked_until,
+        problem.map(|e| e.detail),
+    );
     let (cycle, renewal_problem) = claude_renewal(
         config,
         &mut state,
@@ -874,7 +1064,7 @@ struct ClaudeCodeState {
 fn claude_code_state() -> ClaudeCodeState {
     let Some(v) = home()
         .ok()
-        .and_then(|h| read_json_file(&h.join(".claude.json")).ok())
+        .and_then(|h| read_json_file(&h.join(".claude.json"), "").ok())
     else {
         return ClaudeCodeState::default();
     };
@@ -904,72 +1094,41 @@ fn claude_code_state() -> ClaudeCodeState {
     }
 }
 
-fn claude_oauth(creds: &Result<Value, String>) -> Result<&Value, &String> {
+fn claude_oauth(creds: &Result<Value, FetchError>) -> Result<&Value, &FetchError> {
     creds.as_ref().map(|c| &c["claudeAiOauth"])
 }
 
 enum ClaudeError {
-    /// The stored token is expired or was rejected; a token refresh may fix it.
-    Auth(String),
     /// Seconds from `Retry-After`, 0 when absent.
     RateLimited(i64),
-    Other(String),
+    Fetch(FetchError),
 }
 
-/// Minimum gap between headless `claude` runs, so a persistent auth failure does
-/// not spend a prompt on every refresh.
-const CLAUDE_REFRESH_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+impl From<FetchError> for ClaudeError {
+    fn from(e: FetchError) -> Self {
+        ClaudeError::Fetch(e)
+    }
+}
 
 /// Claude Code only refreshes its OAuth token while it runs, so an idle machine
 /// ends up with an expired one. A one-line headless prompt on the smallest model
 /// makes it refresh and write the new token back to its credentials store.
 fn refresh_claude_token() -> Result<(), String> {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|t| t.elapsed() < CLAUDE_REFRESH_COOLDOWN) {
-            return Err("auto-refresh tried recently".into());
-        }
-        *last = Some(Instant::now());
-    }
-
-    let args = [
-        "-p",
-        "--model",
-        "haiku",
-        "--max-turns",
-        "1",
-        "--no-session-persistence",
-        "--strict-mcp-config",
-        "reply with ok",
-    ];
-    let spawn = |program: &str| {
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(std::env::temp_dir())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        no_window(&mut cmd);
-        cmd.spawn()
-    };
-    // npm installs ship a claude.cmd shim, which Command only finds by full name.
-    let mut child = spawn("claude")
-        .or_else(|_| spawn("claude.cmd"))
-        .map_err(|e| format!("could not run claude: {e}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => return Err("headless claude failed".into()),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
-            _ => {
-                let _ = child.kill();
-                return Err("headless claude timed out".into());
-            }
-        }
-    }
+    run_headless(
+        &LAST,
+        "claude",
+        &[
+            "-p",
+            "--model",
+            "haiku",
+            "--max-turns",
+            "1",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "reply with ok",
+        ],
+    )
 }
 
 /// The usage endpoint answers unknown clients with 429s after a few calls but
@@ -984,16 +1143,23 @@ fn claude_user_agent(version: Option<&str>) -> String {
     format!("claude-code/{version}")
 }
 
-fn claude_api(oauth: Result<&Value, &String>, version: Option<&str>) -> Result<Value, ClaudeError> {
-    use ClaudeError::Other;
-    let oauth = oauth.map_err(|e| Other(e.clone()))?;
-    let token = oauth["accessToken"]
-        .as_str()
-        .ok_or_else(|| Other("no claudeAiOauth.accessToken; log in with `claude`".into()))?;
+fn claude_api(
+    oauth: Result<&Value, &FetchError>,
+    version: Option<&str>,
+) -> Result<Value, ClaudeError> {
+    let oauth = oauth.map_err(|e| e.clone())?;
+    let token = oauth["accessToken"].as_str().ok_or_else(|| {
+        FetchError::new(
+            Problem::NotAvailable,
+            "no claudeAiOauth.accessToken; log in with `claude`",
+        )
+    })?;
     if i64_of(&oauth["expiresAt"]).is_some_and(|ms| ms / 1000 < now_unix()) {
-        return Err(ClaudeError::Auth(
-            "Claude token expired; run `claude` once to refresh".into(),
-        ));
+        return Err(FetchError::new(
+            Problem::TokenExpired,
+            "Claude token expired; run `claude` once to refresh",
+        )
+        .into());
     }
 
     let auth = format!("Bearer {token}");
@@ -1005,15 +1171,16 @@ fn claude_api(oauth: Result<&Value, &String>, version: Option<&str>) -> Result<V
             ("anthropic-beta", "oauth-2025-04-20"),
             ("User-Agent", &user_agent),
         ],
-    )
-    .map_err(Other)?;
+    )?;
     match status {
         200 => Ok(json),
-        401 | 403 => Err(ClaudeError::Auth(
-            "Claude token rejected; run `claude` once to refresh".into(),
-        )),
+        401 | 403 => Err(FetchError::new(
+            Problem::TokenRejected,
+            "Claude token rejected; run `claude` once to refresh",
+        )
+        .into()),
         429 => Err(ClaudeError::RateLimited(retry_after.unwrap_or(0))),
-        s => Err(Other(format!("Anthropic returned HTTP {s}"))),
+        s => Err(FetchError::new(Problem::Service, format!("Anthropic returned HTTP {s}")).into()),
     }
 }
 
@@ -1135,16 +1302,50 @@ fn claude_meters(json: &Value) -> Vec<Meter> {
 // Codex (Codex CLI ChatGPT token)
 // ---------------------------------------------------------------------------
 
-fn codex(estimate: bool) -> Result<Usage, String> {
+fn codex(estimate: bool) -> Result<Usage, FetchError> {
+    with_refresh(|| codex_once(estimate), refresh_codex_token)
+}
+
+/// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it
+/// runs. A one-line `codex exec` at low reasoning effort makes it refresh and
+/// write the new token back to `auth.json`. The user config is skipped so a
+/// costly default model/effort or MCP servers are not used for it.
+fn refresh_codex_token() -> Result<(), String> {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    run_headless(
+        &LAST,
+        "codex",
+        &[
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "read-only",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "reply with ok",
+        ],
+    )
+}
+
+fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
     let path = home()?.join(".codex").join("auth.json");
-    let auth_file = read_json_file(&path)?;
+    let auth_file = read_json_file(&path, "log in with `codex`")?;
     let tokens = &auth_file["tokens"];
-    let token = tokens["access_token"]
-        .as_str()
-        .ok_or("no tokens.access_token; log in with `codex`")?;
+    let token = tokens["access_token"].as_str().ok_or_else(|| {
+        FetchError::new(
+            Problem::NotAvailable,
+            "no tokens.access_token; log in with `codex`",
+        )
+    })?;
     if let Some(exp) = jwt_exp(token) {
         if exp < now_unix() {
-            return Err("Codex token expired; run `codex` once to refresh".into());
+            return Err(FetchError::new(
+                Problem::TokenExpired,
+                "Codex token expired; run `codex` once to refresh",
+            ));
         }
     }
     let account_id = tokens["account_id"].as_str().unwrap_or("");
@@ -1158,8 +1359,18 @@ fn codex(estimate: bool) -> Result<Usage, String> {
     let observed_at = now_unix();
     match status {
         200 => {}
-        401 | 403 => return Err("Codex token rejected; run `codex` once to refresh".into()),
-        s => return Err(format!("OpenAI returned HTTP {s}")),
+        401 | 403 => {
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "Codex token rejected; run `codex` once to refresh",
+            ));
+        }
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("OpenAI returned HTTP {s}"),
+            ));
+        }
     }
 
     let plan = codex_plan(&json);
@@ -1181,7 +1392,10 @@ fn codex(estimate: bool) -> Result<Usage, String> {
                 }],
             });
         }
-        return Err("no rate limit or spend data in response".into());
+        return Err(FetchError::new(
+            Problem::BadResponse,
+            "no rate limit or spend data in response",
+        ));
     }
 
     // Codex reports whole percents; estimate the part of the next one from local use.
@@ -1360,6 +1574,70 @@ mod tests {
         for date in ["2026-09-11", "2026-02-30", "2026-9-15", "invalid", ""] {
             assert!(manual_claude_cycle(date, today).is_err(), "{date}");
         }
+    }
+
+    #[test]
+    fn copilot_entitlement_takes_precedence_over_unlimited() {
+        for unlimited in [false, true] {
+            let json = serde_json::json!({
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "unlimited": unlimited,
+                        "entitlement": 150_000,
+                        "credits_used": 0,
+                        "remaining": 150_000
+                    }
+                }
+            });
+            let meters = copilot_meters(&json).unwrap();
+            assert_eq!(meters.len(), 1);
+            assert_eq!(meters[0].label, None);
+            assert_eq!(meters[0].unit, Unit::Dollars);
+            assert_eq!(meters[0].summary(), "$0 / $1,500");
+        }
+    }
+
+    #[test]
+    fn copilot_unlimited_without_entitlement() {
+        let json = serde_json::json!({
+            "quota_snapshots": {
+                "premium_interactions": { "unlimited": true, "entitlement": 0 }
+            }
+        });
+        let meters = copilot_meters(&json).unwrap();
+        assert_eq!(meters[0].label.as_deref(), Some("unlimited"));
+        assert_eq!(meters[0].total, 0.0);
+    }
+
+    #[test]
+    fn copilot_without_quota_is_not_available() {
+        let json = serde_json::json!({ "quota_snapshots": {} });
+        assert!(matches!(
+            copilot_meters(&json),
+            Err(e) if e.problem == Problem::NotAvailable
+        ));
+    }
+
+    #[test]
+    fn missing_credentials_file_is_not_available() {
+        let path = std::env::temp_dir().join("usage-widget-test-missing.json");
+        assert!(matches!(
+            read_json_file(&path, "log in"),
+            Err(e) if e.problem == Problem::NotAvailable
+        ));
+    }
+
+    #[test]
+    fn failed_token_refresh_keeps_the_problem() {
+        fn expired() -> Result<Vec<Meter>, FetchError> {
+            Err(FetchError::new(Problem::TokenExpired, "token expired"))
+        }
+        fn refresh_fails() -> Result<(), String> {
+            Err("auto-refresh tried recently".into())
+        }
+        let e = with_refresh(expired, refresh_fails).unwrap_err();
+        assert_eq!(e.problem, Problem::TokenExpired);
+        assert_eq!(e.detail, "token expired (auto-refresh tried recently)");
     }
 
     #[test]

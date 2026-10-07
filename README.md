@@ -29,6 +29,10 @@ only one copy runs at a time.
 - Right-click: refresh, minimize, size, usage pages, edit config, quit (no taskbar entry).
 - Minimize shrinks it to one line (`COP 87%  CLD 83%  CDX 99%` with logos), showing the
   most-used window per service. The widget reopens in whichever mode it was left in.
+- A service not set up here (no `gh` login or Copilot plan, never logged in to Claude
+  Code or Codex) shows "Not Available" with an empty bar, or `N/A` when minimized.
+  Other problems, like an expired token or no connection, show a short reason in red,
+  or `!` when minimized. Hover it for the full message.
 - Size scales it from 25% to 200% on top of display scaling (Ctrl +/- also works).
 - macOS: lives in the menu bar, with no Dock icon or Cmd+Tab entry. Its menu also hides and shows the widget. Started from a terminal, it runs in the background and returns the prompt.
 
@@ -117,7 +121,7 @@ Reuses the CLIs' stored credentials; never writes them.
 | Claude | `~/.claude/.credentials.json` (macOS: keychain) |
 | Codex | `~/.codex/auth.json` |
 
-Run `claude` or `codex` to refresh expired tokens. API endpoints are undocumented.
+API endpoints are undocumented.
 
 ### Claude Code status line
 
@@ -139,6 +143,6 @@ calibration and predictions until manually removed. It excludes conversations an
 credentials. See [estimate history](docs/estimate-history.md) for paths, token
 totals and replay rules.
 Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,
-with a keychain access prompt on first use. An expired Claude token is refreshed with a
-one-line `claude -p` on Haiku (at most every 15 min); for Codex, run `codex` once.
+with a keychain access prompt on first use. An expired token is refreshed with a
+one-line `claude -p` on Haiku or `codex exec` at low effort (each at most every 15 min).
 Dollar rates: `src/providers.rs`. Logos: [Simple Icons](https://simpleicons.org) (CC0).

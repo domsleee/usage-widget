@@ -21,7 +21,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Cycle, Meter, Provider, Unit, Usage, money, spend_meter};
+use providers::{Cycle, FetchError, Meter, Problem, Provider, Unit, Usage, money, spend_meter};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -56,7 +56,7 @@ const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
     provider: Provider,
-    result: Result<Usage, String>,
+    result: Result<Usage, FetchError>,
     at: i64,
     started: std::time::Instant,
 }
@@ -68,7 +68,7 @@ struct Slot {
     note: Option<String>,
     estimated: Vec<String>,
     meters: Option<Vec<Meter>>,
-    error: Option<String>,
+    error: Option<FetchError>,
     updated: Option<i64>,
     loading: bool,
 }
@@ -285,7 +285,10 @@ impl App {
                     slot.meters = Some(usage.meters);
                     slot.error = None;
                 }
-                Err(e) => slot.error = Some(e),
+                Err(e) => {
+                    slot.meters = None;
+                    slot.error = Some(e);
+                }
             }
         }
         if let Some(rx) = &self.renewal_lookup {
@@ -430,6 +433,7 @@ fn apply_window_style(frame: &eframe::Frame, opacity: u32) {
 
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWA_CAPTION_COLOR: u32 = 35;
     const DWMWCP_ROUND: u32 = 2;
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
 
@@ -462,6 +466,16 @@ fn apply_window_style(frame: &eframe::Frame, opacity: u32) {
             hwnd,
             DWMWA_BORDER_COLOR,
             (&DWMWA_COLOR_NONE as *const u32).cast(),
+            4,
+        );
+        // winit keeps a 1px strip of caption at the top of undecorated windows (for
+        // the drop shadow); paint it the background colour so it does not show as a
+        // light line. COLORREF is 0x00BBGGRR.
+        let caption = u32::from_le_bytes([BG.r(), BG.g(), BG.b(), 0]);
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            (&caption as *const u32).cast(),
             4,
         );
     }
@@ -563,13 +577,19 @@ fn settle_window(frame: &eframe::Frame) -> bool {
 
 /// The taskbar is topmost too, and whenever it is activated Windows raises it
 /// above every other topmost window, hiding the widget if it sits on the taskbar.
-/// Listens for foreground changes and puts the widget back on top whenever the
-/// taskbar comes forward. Only the first call installs the hook.
+/// The taskbar also raises itself in other ways (the Start menu opening or
+/// closing, for one), so rather than chasing each cause this checks every
+/// `CHECK_MS` whether any taskbar is above the widget and, if so, raises the
+/// widget again. A foreground hook does the same immediately for taskbar clicks.
+/// The same timer restores the widget if Windows minimizes it (Win+M, for one):
+/// with no taskbar button it would otherwise stay hidden until relaunched.
+/// Only the first call installs the timer and hook.
 #[cfg(windows)]
 fn watch_taskbar(hwnd: isize) {
     use std::sync::atomic::{AtomicIsize, Ordering};
 
     type WinEventProc = unsafe extern "system" fn(isize, u32, isize, i32, i32, u32, u32);
+    type TimerProc = unsafe extern "system" fn(isize, u32, usize, u32);
     #[link(name = "user32")]
     unsafe extern "system" {
         fn SetWinEventHook(
@@ -582,11 +602,66 @@ fn watch_taskbar(hwnd: isize) {
             flags: u32,
         ) -> isize;
         fn GetClassNameW(hwnd: isize, name: *mut u16, len: i32) -> i32;
+        fn SetTimer(hwnd: isize, id: usize, ms: u32, proc: TimerProc) -> usize;
+        fn GetWindow(hwnd: isize, cmd: u32) -> isize;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
     }
     const EVENT_SYSTEM_FOREGROUND: u32 = 0x3;
     const WINEVENT_OUTOFCONTEXT: u32 = 0x0;
+    const GW_HWNDPREV: u32 = 3;
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    /// How often to check that the widget is not minimized or below a taskbar.
+    const CHECK_MS: u32 = 500;
 
     static WIDGET: AtomicIsize = AtomicIsize::new(0);
+
+    fn is_taskbar(hwnd: isize) -> bool {
+        let mut buf = [0u16; 32];
+        let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+        // The primary monitor's taskbar, and the ones on other monitors.
+        class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd"
+    }
+
+    /// True if a taskbar is above the widget in the z-order. Only the few
+    /// windows above it are walked, since it sits near the top.
+    fn taskbar_above() -> bool {
+        let mut h = WIDGET.load(Ordering::Relaxed);
+        loop {
+            h = unsafe { GetWindow(h, GW_HWNDPREV) };
+            if h == 0 {
+                return false;
+            }
+            if is_taskbar(h) {
+                return true;
+            }
+        }
+    }
+
+    fn raise() {
+        unsafe {
+            SetWindowPos(
+                WIDGET.load(Ordering::Relaxed),
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    unsafe extern "system" fn on_timer(_hwnd: isize, _msg: u32, _id: usize, _time: u32) {
+        let widget = WIDGET.load(Ordering::Relaxed);
+        if unsafe { IsIconic(widget) } != 0 {
+            unsafe { ShowWindow(widget, SW_SHOWNOACTIVATE) };
+            raise();
+        } else if taskbar_above() {
+            raise();
+        }
+    }
 
     unsafe extern "system" fn on_foreground(
         _hook: isize,
@@ -597,30 +672,20 @@ fn watch_taskbar(hwnd: isize) {
         _thread: u32,
         _time: u32,
     ) {
-        let mut buf = [0u16; 32];
-        let len = unsafe { GetClassNameW(foreground, buf.as_mut_ptr(), buf.len() as i32) };
-        let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
-        // The primary monitor's taskbar, and the ones on other monitors.
-        if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" {
-            unsafe {
-                SetWindowPos(
-                    WIDGET.load(Ordering::Relaxed),
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
+        if is_taskbar(foreground) {
+            raise();
         }
     }
 
     if WIDGET.swap(hwnd, Ordering::Relaxed) != 0 {
         return;
     }
-    // Out-of-context hooks are delivered through this (the UI) thread's message loop.
+    // Out-of-context hooks and thread timers are delivered through this (the UI)
+    // thread's message loop. The hook reacts to taskbar clicks straight away; the
+    // timer catches the taskbar raising itself without becoming the foreground
+    // window, as it does when the Start menu opens or closes.
     unsafe {
+        SetTimer(0, 0, CHECK_MS, on_timer);
         SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_FOREGROUND,
@@ -778,37 +843,40 @@ fn provider_block(
     slot: &Slot,
     precision: usize,
     renewal: &mut RenewalButton<'_>,
+    logos: &HashMap<Provider, egui::TextureHandle>,
 ) {
     if let Some(m) = spend_only(slot) {
-        spend_row(ui, p, slot, m, precision);
+        spend_row(ui, p, slot, m, precision, logos);
     } else {
-        header(ui, p, slot, renewal);
+        header(ui, p, slot, renewal, logos);
         ui.add_space(6.0);
         match (&slot.meters, &slot.error) {
             (Some(meters), _) => meters_block(ui, meters, slot, precision),
-            (None, Some(err)) => {
-                ui.label(RichText::new(err).size(10.5).color(ERR));
-            }
+            // The reason is in the header.
+            (None, Some(_)) => bar(ui, 0.0, MUTED),
             (None, None) => {
                 ui.label(RichText::new("loading…").size(10.5).color(MUTED));
             }
         }
     }
-    if slot.meters.is_some() {
-        if let Some(note) = &slot.note {
-            ui.add_space(5.0);
-            ui.label(RichText::new(note).size(10.0).color(META));
-        }
-        if let Some(err) = &slot.error {
-            ui.add_space(5.0);
-            ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
-        }
+    if slot.meters.is_some()
+        && let Some(note) = &slot.note
+    {
+        ui.add_space(5.0);
+        ui.label(RichText::new(note).size(10.0).color(META));
     }
 }
 
 /// Name, amount and percentage on one line over one bar, as in the original
 /// widget. The plan and billing cycle move to the name's hover text.
-fn spend_row(ui: &mut egui::Ui, p: Provider, slot: &Slot, m: &Meter, precision: usize) {
+fn spend_row(
+    ui: &mut egui::Ui,
+    p: Provider,
+    slot: &Slot,
+    m: &Meter,
+    precision: usize,
+    logos: &HashMap<Provider, egui::TextureHandle>,
+) {
     let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
         let mut hover: Vec<String> = slot.plan.iter().cloned().collect();
@@ -816,6 +884,7 @@ fn spend_row(ui: &mut egui::Ui, p: Provider, slot: &Slot, m: &Meter, precision: 
             hover.push(format!("{} {}", c.verb, c.when()));
         }
         // Usage-based plans reset monthly and need no subscription renewal lookup.
+        provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         let response = ui.label(name);
         if !hover.is_empty() {
@@ -908,10 +977,17 @@ fn window_cell(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) 
 }
 
 /// Service name, then plan and billing cycle in small text.
-fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot, renewal: &mut RenewalButton<'_>) {
+fn header(
+    ui: &mut egui::Ui,
+    p: Provider,
+    slot: &Slot,
+    renewal: &mut RenewalButton<'_>,
+    logos: &HashMap<Provider, egui::TextureHandle>,
+) {
     // A fixed-height, bottom-aligned row (`with_layout` would take all the height left).
     let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
+        provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.label(name);
         renewal.show(ui, p, slot);
@@ -973,6 +1049,17 @@ fn header(ui: &mut egui::Ui, p: Provider, slot: &Slot, renewal: &mut RenewalButt
         }
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
+        }
+        if let Some(e) = &slot.error {
+            let color = if e.problem == Problem::NotAvailable {
+                MUTED
+            } else {
+                ERR
+            };
+            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
+                ui.label(RichText::new(e.problem.label()).size(12.0).color(color))
+                    .on_hover_text(&e.detail);
+            });
         }
     });
 }
@@ -1259,6 +1346,12 @@ fn logo_color(p: Provider) -> Color32 {
     }
 }
 
+fn provider_logo(ui: &mut egui::Ui, p: Provider, logos: &HashMap<Provider, egui::TextureHandle>) {
+    if let Some(logo) = logos.get(&p) {
+        ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(p)));
+    }
+}
+
 /// The minimized view: "<logo> COP 42%  <logo> CLD 17%  <logo> CDX 99%" on one line.
 fn compact_row(
     ui: &mut egui::Ui,
@@ -1273,9 +1366,7 @@ fn compact_row(
             ui.add_space(8.0);
         }
         let slot = slots.get(p).cloned().unwrap_or_default();
-        if let Some(logo) = logos.get(p) {
-            ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(*p)));
-        }
+        provider_logo(ui, *p, logos);
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
         // The most-used meter is the one that matters when space is this tight.
         let top = slot
@@ -1290,19 +1381,16 @@ fn compact_row(
                 RichText::new(percent_label(m.percent(), precision, estimated))
                     .color(level_color(m.percent()))
             }
+            (None, Some(e)) if e.problem == Problem::NotAvailable => {
+                RichText::new("N/A").color(MUTED)
+            }
             (None, Some(_)) => RichText::new("!").color(ERR),
             (None, None) => RichText::new("…").color(MUTED),
         };
         let resp = ui.label(text.size(11.5).strong());
         // What the full card would say under the numbers: stale data, its age, errors.
         let mut hover: Vec<String> = slot.note.iter().cloned().collect();
-        if let Some(err) = &slot.error {
-            hover.push(if top.is_some() {
-                format!("stale: {err}")
-            } else {
-                err.clone()
-            });
-        }
+        hover.extend(slot.error.iter().map(|e| e.detail.clone()));
         if !hover.is_empty() {
             if top.is_some() {
                 ui.label(RichText::new("*").size(11.5).color(META));
@@ -1491,7 +1579,7 @@ impl eframe::App for App {
                                 12.0
                             });
                         }
-                        provider_block(ui, *p, &slot, self.precision, &mut renewal);
+                        provider_block(ui, *p, &slot, self.precision, &mut renewal, &self.logos);
                     }
                     if self.providers.is_empty() {
                         ui.label(

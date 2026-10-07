@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "usage-widget"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
