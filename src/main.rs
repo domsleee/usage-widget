@@ -232,6 +232,7 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
 
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWA_CAPTION_COLOR: u32 = 35;
     const DWMWCP_ROUND: u32 = 2;
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
 
@@ -264,6 +265,16 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
             hwnd,
             DWMWA_BORDER_COLOR,
             (&DWMWA_COLOR_NONE as *const u32).cast(),
+            4,
+        );
+        // winit keeps a 1px strip of caption at the top of undecorated windows (for
+        // the drop shadow); paint it the background colour so it does not show as a
+        // light line. COLORREF is 0x00BBGGRR.
+        let caption = u32::from_le_bytes([BG.r(), BG.g(), BG.b(), 0]);
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            (&caption as *const u32).cast(),
             4,
         );
     }
