@@ -1778,8 +1778,38 @@ mod lookup_tests {
     }
 }
 
+/// Reads the same subscription data as the widget without opening a window.
+fn print_usage() {
+    let (mut config, config_error) = config::load();
+    config.claude.estimate = false;
+    config.codex.estimate = false;
+    let mut providers = serde_json::Map::new();
+    for provider in Provider::ALL.into_iter().filter(|p| config.enabled(*p)) {
+        let result = match provider.fetch(&config) {
+            Ok(usage) => serde_json::json!({ "usage": usage }),
+            Err(error) => serde_json::json!({
+                "error": error.problem.label(),
+                "detail": error.detail,
+            }),
+        };
+        providers.insert(provider.name().to_lowercase(), result);
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "fetched_at": now_unix(),
+            "config_error": config_error,
+            "providers": providers,
+        })
+    );
+}
+
 fn main() -> eframe::Result {
     match std::env::args().nth(1).as_deref() {
+        Some("usage") => {
+            print_usage();
+            return Ok(());
+        }
         Some("config") => {
             return match config::open(true) {
                 Ok(path) => {
@@ -1795,7 +1825,7 @@ fn main() -> eframe::Result {
             return finish(Err(format!(
                 "unknown argument {flag}
 
-usage: usage-widget [config | --startup | --no-startup]"
+usage: usage-widget [usage | config | --startup | --no-startup]"
             )));
         }
         None => {}

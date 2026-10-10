@@ -63,7 +63,8 @@ impl Provider {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Unit {
     /// Amount in whole currency units.
     Dollars,
@@ -71,6 +72,7 @@ pub enum Unit {
     Percent,
 }
 
+#[derive(Serialize)]
 pub struct Usage {
     /// Subscription name, e.g. "Max 5x" or "Enterprise".
     pub plan: Option<String>,
@@ -125,7 +127,7 @@ impl Cycle {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Meter {
     /// Optional sub-label when a provider has more than one meter (e.g. "5h", "week").
     pub label: Option<String>,

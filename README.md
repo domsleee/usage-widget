@@ -36,6 +36,10 @@ only one copy runs at a time.
 - Size scales it from 25% to 200% on top of display scaling (Ctrl +/- also works).
 - macOS: lives in the menu bar, with no Dock icon or Cmd+Tab entry. Its menu also hides and shows the widget. Started from a terminal, it runs in the background and returns the prompt.
 
+`usage-widget usage` prints subscription usage as JSON without opening a window,
+using the same providers and config as the widget, with local estimates disabled.
+The [subscription-usage skill](skills/subscription-usage/SKILL.md) lets agents read it.
+
 ## Config
 
 `usage-widget config` creates and opens `config.toml` (in `$VISUAL`/`$EDITOR` if set):
