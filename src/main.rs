@@ -1810,6 +1810,17 @@ fn main() -> eframe::Result {
             print_usage();
             return Ok(());
         }
+        Some("prices") => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "per_tokens": 1_000_000,
+                    "claude": claude_estimate::pricing(),
+                    "codex": codex_estimate::pricing(),
+                })
+            );
+            return Ok(());
+        }
         Some("config") => {
             return match config::open(true) {
                 Ok(path) => {
@@ -1825,7 +1836,7 @@ fn main() -> eframe::Result {
             return finish(Err(format!(
                 "unknown argument {flag}
 
-usage: usage-widget [usage | config | --startup | --no-startup]"
+usage: usage-widget [usage | prices | config | --startup | --no-startup]"
             )));
         }
         None => {}

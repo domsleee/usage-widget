@@ -39,6 +39,10 @@ only one copy runs at a time.
 `usage-widget usage` prints subscription usage as JSON without opening a window,
 using the same providers and config as the widget, with local estimates disabled.
 The [subscription-usage skill](skills/subscription-usage/SKILL.md) lets agents read it.
+`usage-widget prices` prints the estimator's token rates per million tokens,
+separating normal input, cache reads, Claude cache writes and output. Codex uses
+credits; Claude uses relative cost weights for calibration. Unlisted Codex models
+use the displayed fallback, and Claude models match a family or the default.
 
 ## Config
 

@@ -30,6 +30,30 @@ fn rate_card(model: &str) -> (f64, f64, f64) {
     }
 }
 
+/// Token rates used by the estimator, including the fallback for other models.
+pub fn pricing() -> Value {
+    let models: serde_json::Map<String, Value> = [
+        "gpt-6-astra",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+    ]
+    .into_iter()
+    .map(|model| {
+        let (input, cache_read, output) = rate_card(model);
+        (
+            model.to_string(),
+            serde_json::json!({ "input": input, "cache_read": cache_read, "output": output }),
+        )
+    })
+    .collect();
+    serde_json::json!({
+        "unit": "credits",
+        "default_model": "gpt-5.6-sol",
+        "models": models,
+    })
+}
+
 /// The estimated share of the next point already used (0.0 to 0.99), given the
 /// server's whole `pct` for the weekly window that resets at `window`.
 pub fn fraction(

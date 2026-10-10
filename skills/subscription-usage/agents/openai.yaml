@@ -1,4 +1,4 @@
 interface:
   display_name: "Subscription Usage"
-  short_description: "Read subscription usage from usage-widget"
-  default_prompt: "Use $subscription-usage to check my subscription usage and reset times."
+  short_description: "Read subscription usage and estimator token rates"
+  default_prompt: "Use $subscription-usage to check my subscription usage and per-model token prices."

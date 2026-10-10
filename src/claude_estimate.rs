@@ -31,6 +31,28 @@ fn prices(model: &str) -> [f64; 4] {
     }
 }
 
+/// Relative token prices used for calibration, rather than a subscription bill.
+pub fn pricing() -> Value {
+    let families: serde_json::Map<String, Value> = ["haiku", "sonnet", "default"]
+        .into_iter()
+        .map(|family| {
+            let [input, cache_write, cache_read, output] = prices(family);
+            (
+                family.to_string(),
+                serde_json::json!({
+                    "input": input, "cache_write": cache_write,
+                    "cache_read": cache_read, "output": output,
+                }),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "unit": "relative_cost",
+        "default_family": "default",
+        "families": families,
+    })
+}
+
 /// For each `(label, whole percent, window reset time)` reading, taken at
 /// `observed_at`, the estimated share of the next point already used.
 pub fn fractions(
