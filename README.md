@@ -5,9 +5,9 @@ GitHub Copilot, Claude and Codex allowance you have used: in dollars on business
 plans, and as 5-hour and weekly windows on personal subscriptions. It refreshes
 every five minutes and can be dragged anywhere on screen.
 
-<img width="323" height="237" alt="image" src="https://github.com/user-attachments/assets/29bc8928-0440-46c9-98d3-0cd0231311bb" /> <img width="483" height="171" alt="image" src="https://github.com/user-attachments/assets/d055487b-2c99-4984-b1cd-de8b0e231424" />
-
-
+| Business plans | Personal subscriptions |
+| --- | --- |
+| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="250" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset countdown" src="docs/personal-plans.png" /> |
 
 Credit-to-dollar rates live at the top of `src/providers.rs`:
 Copilot 50,000 credits = $500, Codex 12,500 credits = $500. Claude reports
@@ -35,9 +35,20 @@ What is shown depends on the plan:
   - Claude: 5-hour and 7-day windows when the plan has them, plus monthly spend against the cap when present.
   - Codex: 5-hour and weekly rate-limit windows when present, plus the workspace spend limit when present.
 - Personal subscriptions (Claude Pro/Max, ChatGPT Plus/Pro/Go, Copilot Pro/Pro+): no
-  dollar amounts. One line reads `42% 5h / 17% wk`, the 5-hour and weekly windows
-  coloured by level, and the bar tracks the 5-hour window. Copilot has no rolling
-  windows, so a personal Copilot plan shows its monthly allowance as `% mo`.
+  dollar amounts. One line reads `63% 5h / 18% wk`, the 5-hour and weekly windows
+  coloured by level. The window that will run out first in the current session is
+  shown bright and the other faded; the bar tracks that window, and the countdown
+  next to the service name, `(hh:mm)` or `(dd:hh:mm)`, is the time until it resets.
+  When the other window becomes the one that runs out first, the bar and labels
+  slide across to it. Copilot has no rolling windows, so a personal Copilot plan
+  shows its monthly allowance as `% mo`.
+
+  The two percentages are shares of differently sized allowances, so which runs
+  out first depends on how much of the week one 5-hour point costs. Neither
+  service publishes that, so the widget learns it from how both windows rise
+  between refreshes (ignoring refreshes across a reset) and remembers it between
+  runs. Until it has seen enough use, the fuller window is picked. A weekly window
+  that resets before the 5-hour one cannot be the one that runs out first.
 
 The plan comes from Claude Code's `subscriptionType`, and from the plan named in the
 Copilot and Codex usage responses.
@@ -80,7 +91,8 @@ From a clone, `install.ps1` does the same three steps using the local checkout.
   if the saved spot is off screen (say, a monitor is gone) it is moved back on.
 - Right-click for refresh, minimize, size, links to each service's usage page, and Quit.
 - Minimize shrinks it to one line (`COP 87%  CLD 83%  CDX 99%` with each service's logo),
-  showing the most-used window per service. Maximize from the same menu restores it.
+  showing the most-used window per service (on a personal plan, the one that will
+  run out first). Maximize from the same menu restores it.
   Both views show each service's logo to the left of its name.
   The widget reopens in whichever mode it was left in.
 - Size scales the widget from 25% to 200% on top of your display scaling (Ctrl +/-

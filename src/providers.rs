@@ -1,7 +1,7 @@
 //! Fetches usage for each service using credentials already stored by the
 //! corresponding CLI (gh, Claude Code, Codex). Nothing is persisted here.
 
-use crate::timeutil::now_unix;
+use crate::timeutil::{now_unix, parse_rfc3339};
 use base64::Engine;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -85,6 +85,8 @@ pub struct Meter {
     pub used: f64,
     pub total: f64,
     pub unit: Unit,
+    /// When a usage window next resets, as unix seconds.
+    pub resets_at: Option<i64>,
 }
 
 impl Meter {
@@ -196,6 +198,14 @@ fn f64_of(v: &Value) -> Option<f64> {
     }
 }
 
+/// A timestamp given as unix seconds or as RFC 3339 text.
+fn time_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::String(s) => parse_rfc3339(s),
+        v => i64_of(v),
+    }
+}
+
 fn i64_of(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -284,6 +294,7 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
                 used: 0.0,
                 total: 0.0,
                 unit: Unit::Percent,
+                resets_at: None,
             }],
             personal: false,
         }));
@@ -306,6 +317,7 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
                 },
                 total: 100.0,
                 unit: Unit::Percent,
+                resets_at: None,
             }],
             personal: true,
         }));
@@ -317,6 +329,7 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
             used: used * COPILOT_USD_PER_CREDIT,
             total: total * COPILOT_USD_PER_CREDIT,
             unit: Unit::Dollars,
+            resets_at: None,
         }],
         personal: false,
     }))
@@ -390,6 +403,7 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
                 used: util,
                 total: 100.0,
                 unit: Unit::Percent,
+                resets_at: time_of(&w["resets_at"]),
             });
         }
     }
@@ -420,6 +434,7 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
             used: used_minor as f64 / div,
             total: limit_minor as f64 / div,
             unit: Unit::Dollars,
+            resets_at: None,
         });
     } else {
         let extra = &json["extra_usage"];
@@ -432,6 +447,7 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
                 used: used / 100.0,
                 total: limit / 100.0,
                 unit: Unit::Dollars,
+                resets_at: None,
             });
         }
     }
@@ -500,11 +516,14 @@ fn codex_usage(json: &Value) -> Result<Option<Usage>, String> {
             let label = i64_of(&w["limit_window_seconds"])
                 .map(|secs| window_label(secs, week))
                 .unwrap_or_else(|| fallback.into());
+            let resets_at = time_of(&w["reset_at"])
+                .or_else(|| i64_of(&w["reset_after_seconds"]).map(|s| now_unix() + s));
             meters.push(Meter {
                 label: Some(label),
                 used: pct,
                 total: 100.0,
                 unit: Unit::Percent,
+                resets_at,
             });
         }
     }
@@ -523,6 +542,7 @@ fn codex_usage(json: &Value) -> Result<Option<Usage>, String> {
             used: used * CODEX_USD_PER_CREDIT,
             total: limit * CODEX_USD_PER_CREDIT,
             unit: Unit::Dollars,
+            resets_at: None,
         });
     }
 
@@ -534,6 +554,7 @@ fn codex_usage(json: &Value) -> Result<Option<Usage>, String> {
                     used: 0.0,
                     total: 0.0,
                     unit: Unit::Percent,
+                    resets_at: None,
                 }],
                 personal: false,
             }));
