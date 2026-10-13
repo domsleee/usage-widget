@@ -45,6 +45,9 @@ static INSTALLED: Mutex<bool> = Mutex::new(false);
 /// Checks GitHub for a newer release and, if there is one, installs it over the
 /// running exe.
 pub fn check_and_install() -> Result<Outcome, String> {
+    if !cfg!(windows) {
+        return Err("Automatic updates are only supported on Windows".into());
+    }
     let mut installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
     if *installed {
         return Ok(Outcome::Installed);
@@ -76,6 +79,9 @@ pub fn restart() -> Result<(), String> {
 /// Removes the previous exe left behind by an update. Windows will not delete a
 /// running exe, so this happens on the next start.
 pub fn cleanup() {
+    if !cfg!(windows) {
+        return;
+    }
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(sibling(&exe, "old"));
         let _ = std::fs::remove_file(sibling(&exe, "new"));
@@ -84,7 +90,8 @@ pub fn cleanup() {
 
 /// Automatic updates are on for release builds unless `USAGE_WIDGET_AUTO_UPDATE=0`.
 pub fn auto_enabled() -> bool {
-    !cfg!(debug_assertions)
+    cfg!(windows)
+        && !cfg!(debug_assertions)
         && std::env::var("USAGE_WIDGET_AUTO_UPDATE").map_or(true, |v| v.trim() != "0")
 }
 

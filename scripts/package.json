@@ -1,0 +1,13 @@
+{
+  "name": "usage-widget-helpers",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "claude-renewal": "node claude-renewal.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.63.0",
+    "smol-toml": "1.8.0"
+  }
+}
