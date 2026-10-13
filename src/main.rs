@@ -14,7 +14,7 @@ use eframe::egui::{
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
 use providers::{FetchError, Meter, Problem, Provider, Unit, Usage, money};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -29,6 +29,7 @@ const MINI_MARGIN_X: i8 = 10;
 const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
 const RATIOS_KEY: &str = "ratios";
+const HIDDEN_KEY: &str = "hidden";
 /// Seconds the bar and window labels take to move over when the binding window changes.
 const SWITCH_SECS: f32 = 0.35;
 /// How far the window that is not the binding one fades towards the background.
@@ -87,6 +88,9 @@ struct App {
     /// Learnt weekly cost of the 5-hour window per service name, for personal
     /// plans. Persisted, since it takes a while to learn.
     ratios: HashMap<String, limits::Ratio>,
+    /// Names of services the user has unticked in the menu. They are still
+    /// fetched, so ticking one again shows it straight away. Persisted.
+    hidden: HashSet<String>,
     /// Set once an update has been installed; the UI thread then restarts.
     restart: Arc<AtomicBool>,
 }
@@ -113,6 +117,10 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, RATIOS_KEY))
             .unwrap_or_default();
+        let hidden = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, HIDDEN_KEY))
+            .unwrap_or_default();
 
         let mut slots = HashMap::new();
         for p in Provider::ALL {
@@ -133,6 +141,7 @@ impl App {
             minimized,
             logos: load_logos(&cc.egui_ctx),
             ratios,
+            hidden,
             restart,
         }
     }
@@ -211,12 +220,44 @@ impl App {
         Some(limits::binding(five_hour, week, k))
     }
 
-    /// The services the account has, in display order.
-    fn visible(&self) -> Vec<Provider> {
+    /// The services the account has, in display order. These are listed in the
+    /// menu, ticked or not.
+    fn found(&self) -> Vec<Provider> {
         Provider::ALL
             .into_iter()
             .filter(|p| self.slots.get(p).is_some_and(Slot::visible))
             .collect()
+    }
+
+    /// The found services the user has not unticked.
+    fn shown(&self) -> Vec<Provider> {
+        let mut found = self.found();
+        found.retain(|p| !self.hidden.contains(p.name()));
+        found
+    }
+
+    /// What the widget says when it has no service to show, in the full and the
+    /// minimized view.
+    fn empty_text(&self, found: &[Provider]) -> (&'static str, &'static str) {
+        if !found.is_empty() {
+            (
+                "All services are hidden. Right-click to show them.",
+                "All hidden",
+            )
+        } else if self.all_fetched() {
+            (
+                "No paid Copilot, Claude or Codex plan found. Sign in with gh, claude or codex and it shows up at the next refresh.",
+                "No plans found",
+            )
+        } else {
+            ("…", "…")
+        }
+    }
+
+    fn toggle(&mut self, p: Provider) {
+        if !self.hidden.remove(p.name()) {
+            self.hidden.insert(p.name().to_string());
+        }
     }
 
     /// True once every service has answered at least once.
@@ -228,13 +269,13 @@ impl App {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
-    /// Sum of every dollar-denominated meter across providers. Only when at least
-    /// two providers have one, since otherwise it repeats that provider's line.
-    fn total(&self) -> Option<Meter> {
+    /// Sum of every dollar-denominated meter across the shown providers. Only when
+    /// at least two have one, since otherwise it repeats that provider's line.
+    fn total(&self, shown: &[Provider]) -> Option<Meter> {
         let mut used = 0.0;
         let mut total = 0.0;
         let mut providers = 0;
-        for slot in self.slots.values() {
+        for slot in shown.iter().filter_map(|p| self.slots.get(p)) {
             let mut any = false;
             for m in slot.usage.iter().flat_map(|u| &u.meters) {
                 if m.unit == Unit::Dollars {
@@ -654,7 +695,7 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
-/// "42% 5h / 17% wk" right-aligned: each window's percentage coloured by level,
+/// "42% 5h | 17% wk" right-aligned: each window's percentage coloured by level,
 /// followed by its label, each faded by its weight (see `weighted`).
 fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -662,7 +703,7 @@ fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
         // Laid out right to left, so the last window goes first.
         for (i, (m, &w)) in meters.iter().zip(weights).rev().enumerate() {
             if i > 0 {
-                ui.label(RichText::new("/").size(size).color(MUTED));
+                ui.label(RichText::new("|").size(size).color(MUTED));
             }
             if let Some(label) = &m.label {
                 ui.label(RichText::new(label).size(size).color(weighted(LIGHT, w)));
@@ -807,6 +848,7 @@ enum MenuAction {
     Refresh,
     ToggleMinimized,
     Open(Provider),
+    Toggle(Provider),
     Size(f32),
     CheckForUpdates,
     Quit,
@@ -821,7 +863,8 @@ fn minimize_label(minimized: bool) -> &'static str {
 #[cfg(windows)]
 fn native_menu(
     frame: &eframe::Frame,
-    providers: &[Provider],
+    found: &[Provider],
+    shown: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -863,6 +906,7 @@ fn native_menu(
     const ID_MINIMIZE: usize = 3;
     const ID_UPDATE: usize = 4;
     const ID_OPEN: usize = 10;
+    const ID_TOGGLE: usize = 20;
     const ID_SIZE: usize = 100;
 
     let hwnd = hwnd(frame)?;
@@ -874,8 +918,18 @@ fn native_menu(
         add(menu, MF_STRING, ID_REFRESH, "Refresh now");
         add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
         add(menu, MF_SEPARATOR, 0, "");
+        if !found.is_empty() {
+            add(menu, MF_STRING | MF_GRAYED, 0, "Show");
+            for (i, p) in Provider::ALL.iter().enumerate() {
+                if found.contains(p) {
+                    let checked = if shown.contains(p) { MF_CHECKED } else { 0 };
+                    add(menu, MF_STRING | checked, ID_TOGGLE + i, p.name());
+                }
+            }
+            add(menu, MF_SEPARATOR, 0, "");
+        }
         for (i, p) in Provider::ALL.iter().enumerate() {
-            if providers.contains(p) {
+            if found.contains(p) {
                 add(
                     menu,
                     MF_STRING,
@@ -884,7 +938,7 @@ fn native_menu(
                 );
             }
         }
-        if !providers.is_empty() {
+        if !found.is_empty() {
             add(menu, MF_SEPARATOR, 0, "");
         }
         // Owned by `menu` once appended, so destroyed along with it.
@@ -936,6 +990,9 @@ fn native_menu(
             _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
             }
+            _ if (ID_TOGGLE..ID_TOGGLE + Provider::ALL.len()).contains(&id) => {
+                Some(MenuAction::Toggle(Provider::ALL[id - ID_TOGGLE]))
+            }
             _ if (ID_SIZE..ID_SIZE + SIZES.len()).contains(&id) => {
                 Some(MenuAction::Size(SIZES[id - ID_SIZE]))
             }
@@ -947,7 +1004,8 @@ fn native_menu(
 #[cfg(not(windows))]
 fn egui_menu(
     ui: &mut egui::Ui,
-    providers: &[Provider],
+    found: &[Provider],
+    shown: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -960,12 +1018,22 @@ fn egui_menu(
         action = Some(MenuAction::ToggleMinimized);
     }
     ui.separator();
-    for &p in providers {
+    if !found.is_empty() {
+        ui.label(RichText::new("show").size(10.0).color(MUTED));
+        for &p in found {
+            let mut checked = shown.contains(&p);
+            if ui.checkbox(&mut checked, p.name()).clicked() {
+                action = Some(MenuAction::Toggle(p));
+            }
+        }
+        ui.separator();
+    }
+    for &p in found {
         if ui.button(format!("Open {} usage", p.name())).clicked() {
             action = Some(MenuAction::Open(p));
         }
     }
-    if !providers.is_empty() {
+    if !found.is_empty() {
         ui.separator();
     }
     ui.menu_button("Size", |ui| {
@@ -1161,6 +1229,7 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
         eframe::set_value(storage, RATIOS_KEY, &self.ratios);
+        eframe::set_value(storage, HIDDEN_KEY, &self.hidden);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1195,17 +1264,13 @@ impl eframe::App for App {
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
         let minimized = self.minimized;
-        let providers = self.visible();
+        let found = self.found();
+        let providers = self.shown();
         let bindings: HashMap<Provider, usize> = providers
             .iter()
             .filter_map(|&p| Some((p, self.binding(p)?)))
             .collect();
-        // Shown when no service is: still waiting on one, or none has a paid plan.
-        let empty = if self.all_fetched() {
-            "No Copilot, Claude or Codex plan found"
-        } else {
-            "…"
-        };
+        let (empty, empty_compact) = self.empty_text(&found);
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -1218,11 +1283,11 @@ impl eframe::App for App {
             #[cfg(windows)]
             // Checked on the raw pointer so a right-click over any widget counts.
             if ui.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
-                action = native_menu(frame, &providers, zoom, refresh_mins, minimized);
+                action = native_menu(frame, &found, &providers, zoom, refresh_mins, minimized);
             }
             #[cfg(not(windows))]
             bg.context_menu(|ui| {
-                action = egui_menu(ui, &providers, zoom, refresh_mins, minimized);
+                action = egui_menu(ui, &found, &providers, zoom, refresh_mins, minimized);
                 if action.is_some() {
                     ui.close();
                 }
@@ -1234,7 +1299,14 @@ impl eframe::App for App {
             // min_rect is always expanded to fill the window.
             let content = if minimized {
                 ui.horizontal(|ui| {
-                    compact_row(ui, &providers, &self.slots, &self.logos, &bindings, empty)
+                    compact_row(
+                        ui,
+                        &providers,
+                        &self.slots,
+                        &self.logos,
+                        &bindings,
+                        empty_compact,
+                    )
                 })
             } else {
                 ui.vertical(|ui| {
@@ -1261,7 +1333,7 @@ impl eframe::App for App {
                             .unwrap_or_else(|| "fetching…".into());
                         ui.label(RichText::new(updated).size(9.5).color(MUTED));
 
-                        if let Some(t) = self.total() {
+                        if let Some(t) = self.total(&providers) {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let text = format!("${} / ${}", money(t.used), money(t.total));
                                 ui.label(RichText::new(text).size(10.5).color(TEXT))
@@ -1297,6 +1369,7 @@ impl eframe::App for App {
             Some(MenuAction::Refresh) => refresh = true,
             Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
             Some(MenuAction::Open(p)) => open_url(p.url()),
+            Some(MenuAction::Toggle(p)) => self.toggle(p),
             Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
             Some(MenuAction::CheckForUpdates) => self.check_for_updates(&ctx),
             Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),

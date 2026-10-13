@@ -52,6 +52,8 @@ Bars go green, yellow and red as you use more.
 - Drag it anywhere. It remembers where it was.
 - Right-click to refresh, minimize, resize, check for updates, open each service's
   usage page, or quit.
+- Untick a service under Show in the right-click menu to hide it. Tick it again to
+  bring it back.
 - Hover a red error to see the full message.
 
 Optional settings, as environment variables:
