@@ -50,9 +50,10 @@ impl Provider {
         }
     }
 
-    /// `Ok(None)` when the account has no paid plan with this service (not signed
-    /// in on this machine, or on a free plan), so the widget leaves it out.
-    pub fn fetch(self) -> Result<Option<Usage>, String> {
+    /// `Problem::NotAvailable` when the account has no paid plan with this
+    /// service (not signed in on this machine, or on a free plan), so the widget
+    /// leaves it out.
+    pub fn fetch(self) -> Result<Usage, FetchError> {
         match self {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(),
@@ -136,7 +137,7 @@ pub fn money(v: f64) -> String {
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     // The OS TLS stack (SChannel on Windows) trusting the OS certificate store, so
     // corporate TLS-inspecting proxies whose root is installed there just work.
@@ -153,17 +154,19 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), String> {
+fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value), FetchError> {
     let mut req = agent().get(url).header("Accept", "application/json");
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    let mut resp = req.call().map_err(|e| format!("request failed: {e}"))?;
+    let mut resp = req
+        .call()
+        .map_err(|e| FetchError::new(Problem::Connection, format!("request failed: {e}")))?;
     let status = resp.status().as_u16();
     let text = resp
         .body_mut()
         .read_to_string()
-        .map_err(|e| format!("read failed: {e}"))?;
+        .map_err(|e| FetchError::new(Problem::Connection, format!("read failed: {e}")))?;
     let json = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
     Ok((status, json))
 }
@@ -184,10 +187,28 @@ fn home() -> Result<PathBuf, String> {
     std::env::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())
 }
 
-fn read_json_file(path: &PathBuf) -> Result<Value, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("bad JSON in {}: {e}", path.display()))
+/// A missing file means the CLI was never logged in here, so the service is
+/// reported as not available, with `hint` saying how to set it up.
+fn read_json_file(path: &PathBuf, hint: &str) -> Result<Value, FetchError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FetchError::new(
+                Problem::NotAvailable,
+                format!("{} not found; {hint}", path.display()),
+            )
+        } else {
+            FetchError::new(
+                Problem::Other,
+                format!("cannot read {}: {e}", path.display()),
+            )
+        }
+    })?;
+    serde_json::from_str(&text).map_err(|e| {
+        FetchError::new(
+            Problem::Other,
+            format!("bad JSON in {}: {e}", path.display()),
+        )
+    })
 }
 
 fn f64_of(v: &Value) -> Option<f64> {
@@ -225,10 +246,65 @@ fn jwt_exp(token: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// What went wrong reading a service, shown in short on the widget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Problem {
+    /// The service is not set up on this machine (no login or no subscription).
+    NotAvailable,
+    TokenExpired,
+    TokenRejected,
+    Connection,
+    /// The service answered with an unexpected HTTP status.
+    Service,
+    /// The service answered, but without the usage data expected.
+    BadResponse,
+    Other,
+}
+
+impl Problem {
+    pub fn label(self) -> &'static str {
+        match self {
+            Problem::NotAvailable => "Not Available",
+            Problem::TokenExpired => "Token expired",
+            Problem::TokenRejected => "Token rejected",
+            Problem::Connection => "Connection failed",
+            Problem::Service => "Service error",
+            Problem::BadResponse => "Unexpected response",
+            Problem::Other => "Error",
+        }
+    }
+}
+
+/// A short `problem` for the widget, plus the full `detail` shown on hover.
+#[derive(Clone, Debug)]
+pub struct FetchError {
+    pub problem: Problem,
+    pub detail: String,
+}
+
+impl FetchError {
+    fn new(problem: Problem, detail: impl Into<String>) -> Self {
+        Self {
+            problem,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(e: String) -> Self {
+        FetchError::new(Problem::Other, e)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GitHub Copilot
 // ---------------------------------------------------------------------------
 
-fn github_token() -> Result<String, String> {
+fn github_token() -> Result<String, FetchError> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(t) = std::env::var(var) {
             if !t.trim().is_empty() {
@@ -239,24 +315,30 @@ fn github_token() -> Result<String, String> {
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"]);
     no_window(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"))?;
+    let out = cmd.output().map_err(|e| {
+        FetchError::new(
+            Problem::NotAvailable,
+            format!("gh not found ({e}); set GITHUB_TOKEN or install GitHub CLI"),
+        )
+    })?;
     if !out.status.success() {
-        return Err("`gh auth token` failed; run `gh auth login`".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "`gh auth token` failed; run `gh auth login`",
+        ));
     }
     let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if tok.is_empty() {
-        return Err("gh returned an empty token".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "gh returned an empty token; run `gh auth login`",
+        ));
     }
     Ok(tok)
 }
 
-fn copilot() -> Result<Option<Usage>, String> {
-    // No GitHub CLI login (or token variable) on this machine.
-    let Ok(token) = github_token() else {
-        return Ok(None);
-    };
+fn copilot() -> Result<Usage, FetchError> {
+    let token = github_token()?;
     let auth = format!("token {token}");
     let (status, json) = get_json(
         "https://api.github.com/copilot_internal/user",
@@ -267,28 +349,48 @@ fn copilot() -> Result<Option<Usage>, String> {
     )?;
     match status {
         200 => {}
-        401 | 403 => return Err("GitHub token rejected; run `gh auth login`".into()),
-        // Signed in to GitHub, but without Copilot.
-        404 => return Ok(None),
-        s => return Err(format!("GitHub returned HTTP {s}")),
+        401 | 403 => {
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "GitHub token rejected; run `gh auth login`",
+            ));
+        }
+        404 => {
+            return Err(FetchError::new(
+                Problem::NotAvailable,
+                "no Copilot access on this GitHub account",
+            ));
+        }
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("GitHub returned HTTP {s}"),
+            ));
+        }
     }
 
     copilot_usage(&json)
 }
 
-fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
+fn copilot_usage(json: &Value) -> Result<Usage, FetchError> {
     let plan = json["copilot_plan"].as_str().unwrap_or("");
     if plan == "free" {
-        return Ok(None);
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "Copilot Free has no paid plan to track",
+        ));
     }
     let snap = &json["quota_snapshots"]["premium_interactions"];
     if snap.is_null() {
-        return Err("no premium_interactions quota in response".into());
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "no Copilot premium request quota on this GitHub account",
+        ));
     }
 
     let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
     if total <= 0.0 && snap["unlimited"].as_bool() == Some(true) {
-        return Ok(Some(Usage {
+        return Ok(Usage {
             meters: vec![Meter {
                 label: Some("unlimited".into()),
                 used: 0.0,
@@ -297,7 +399,7 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
                 resets_at: None,
             }],
             personal: false,
-        }));
+        });
     }
 
     let used = f64_of(&snap["credits_used"])
@@ -307,7 +409,7 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
     // Copilot Pro and Pro+ ("individual", "individual_pro") have no rolling
     // windows, only the monthly allowance.
     if plan.starts_with("individual") {
-        return Ok(Some(Usage {
+        return Ok(Usage {
             meters: vec![Meter {
                 label: Some("mo".into()),
                 used: if total > 0.0 {
@@ -320,10 +422,10 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
                 resets_at: None,
             }],
             personal: true,
-        }));
+        });
     }
 
-    Ok(Some(Usage {
+    Ok(Usage {
         meters: vec![Meter {
             label: None,
             used: used * COPILOT_USD_PER_CREDIT,
@@ -332,7 +434,7 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
             resets_at: None,
         }],
         personal: false,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -343,25 +445,30 @@ fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
 /// the token expires. The widget never refreshes it itself (that would rotate the
 /// refresh token under Claude Code, or spend usage on a headless prompt), so it
 /// asks for Claude Code to be run and picks the new token up on the next refresh.
-fn claude() -> Result<Option<Usage>, String> {
+fn claude() -> Result<Usage, FetchError> {
     let path = home()?.join(".claude").join(".credentials.json");
-    // Claude Code has never been signed in on this machine.
-    if !path.exists() {
-        return Ok(None);
-    }
-    let creds = read_json_file(&path)?;
+    let creds = read_json_file(&path, "log in with `claude`")?;
     let oauth = &creds["claudeAiOauth"];
     // Signed in with an API key rather than a Claude plan.
-    let Some(token) = oauth["accessToken"].as_str() else {
-        return Ok(None);
-    };
+    let token = oauth["accessToken"].as_str().ok_or_else(|| {
+        FetchError::new(
+            Problem::NotAvailable,
+            "no claudeAiOauth.accessToken; log in with `claude`",
+        )
+    })?;
     let plan = oauth["subscriptionType"].as_str().unwrap_or("");
     if plan == "free" {
-        return Ok(None);
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "Claude Free has no plan usage to track",
+        ));
     }
     if let Some(exp_ms) = i64_of(&oauth["expiresAt"]) {
         if exp_ms / 1000 < now_unix() {
-            return Err("Claude token expired; run `claude` once to refresh".into());
+            return Err(FetchError::new(
+                Problem::TokenExpired,
+                "Claude token expired; run `claude` once to refresh",
+            ));
         }
     }
 
@@ -375,14 +482,24 @@ fn claude() -> Result<Option<Usage>, String> {
     )?;
     match status {
         200 => {}
-        401 | 403 => return Err("Claude token rejected; run `claude` once to refresh".into()),
-        s => return Err(format!("Anthropic returned HTTP {s}")),
+        401 | 403 => {
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "Claude token rejected; run `claude` once to refresh",
+            ));
+        }
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("Anthropic returned HTTP {s}"),
+            ));
+        }
     }
 
-    claude_usage(&json, matches!(plan, "pro" | "max")).map(Some)
+    claude_usage(&json, matches!(plan, "pro" | "max"))
 }
 
-fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
+fn claude_usage(json: &Value, personal: bool) -> Result<Usage, FetchError> {
     // A personal plan shows just its 5-hour and weekly windows.
     let windows: &[(&str, &str)] = if personal {
         &[("five_hour", "5h"), ("seven_day", "wk")]
@@ -409,7 +526,10 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
     }
     if personal {
         if meters.is_empty() {
-            return Err("no usage windows in response".into());
+            return Err(FetchError::new(
+                Problem::BadResponse,
+                "no usage windows in response",
+            ));
         }
         return Ok(Usage { meters, personal });
     }
@@ -453,7 +573,10 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
     }
 
     if meters.is_empty() {
-        return Err("no usage windows in response".into());
+        return Err(FetchError::new(
+            Problem::BadResponse,
+            "no usage windows in response",
+        ));
     }
     Ok(Usage { meters, personal })
 }
@@ -464,21 +587,23 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
 
 /// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it runs,
 /// so an expired token is reported until `codex` is run again.
-fn codex() -> Result<Option<Usage>, String> {
+fn codex() -> Result<Usage, FetchError> {
     let path = home()?.join(".codex").join("auth.json");
-    // The Codex CLI has never been signed in on this machine.
-    if !path.exists() {
-        return Ok(None);
-    }
-    let auth_file = read_json_file(&path)?;
+    let auth_file = read_json_file(&path, "log in with `codex`")?;
     let tokens = &auth_file["tokens"];
     // Signed in with an API key rather than a ChatGPT plan.
-    let Some(token) = tokens["access_token"].as_str() else {
-        return Ok(None);
-    };
+    let token = tokens["access_token"].as_str().ok_or_else(|| {
+        FetchError::new(
+            Problem::NotAvailable,
+            "no tokens.access_token; log in with `codex`",
+        )
+    })?;
     if let Some(exp) = jwt_exp(token) {
         if exp < now_unix() {
-            return Err("Codex token expired; run `codex` once to refresh".into());
+            return Err(FetchError::new(
+                Problem::TokenExpired,
+                "Codex token expired; run `codex` once to refresh",
+            ));
         }
     }
     let account_id = tokens["account_id"].as_str().unwrap_or("");
@@ -491,17 +616,30 @@ fn codex() -> Result<Option<Usage>, String> {
     let (status, json) = get_json("https://chatgpt.com/backend-api/wham/usage", &headers)?;
     match status {
         200 => {}
-        401 | 403 => return Err("Codex token rejected; run `codex` once to refresh".into()),
-        s => return Err(format!("OpenAI returned HTTP {s}")),
+        401 | 403 => {
+            return Err(FetchError::new(
+                Problem::TokenRejected,
+                "Codex token rejected; run `codex` once to refresh",
+            ));
+        }
+        s => {
+            return Err(FetchError::new(
+                Problem::Service,
+                format!("OpenAI returned HTTP {s}"),
+            ));
+        }
     }
 
     codex_usage(&json)
 }
 
-fn codex_usage(json: &Value) -> Result<Option<Usage>, String> {
+fn codex_usage(json: &Value) -> Result<Usage, FetchError> {
     let plan = json["plan_type"].as_str().unwrap_or("");
     if plan == "free" {
-        return Ok(None);
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "ChatGPT Free has no paid plan to track",
+        ));
     }
     // ChatGPT plans billed to the user rather than a workspace.
     let personal = matches!(plan, "plus" | "pro" | "go");
@@ -548,7 +686,7 @@ fn codex_usage(json: &Value) -> Result<Option<Usage>, String> {
 
     if meters.is_empty() {
         if json["credits"]["unlimited"].as_bool() == Some(true) {
-            return Ok(Some(Usage {
+            return Ok(Usage {
                 meters: vec![Meter {
                     label: Some("unlimited".into()),
                     used: 0.0,
@@ -557,11 +695,14 @@ fn codex_usage(json: &Value) -> Result<Option<Usage>, String> {
                     resets_at: None,
                 }],
                 personal: false,
-            }));
+            });
         }
-        return Err("no rate limit or spend data in response".into());
+        return Err(FetchError::new(
+            Problem::BadResponse,
+            "no rate limit or spend data in response",
+        ));
     }
-    Ok(Some(Usage { meters, personal }))
+    Ok(Usage { meters, personal })
 }
 
 /// "5h", "2d", or `week` for windows of six days or more.
@@ -578,6 +719,10 @@ fn window_label(secs: i64, week: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn not_available<T>(r: Result<T, FetchError>) -> bool {
+        matches!(r, Err(e) if e.problem == Problem::NotAvailable)
+    }
 
     fn pcts(u: &Usage) -> Vec<(String, f64)> {
         u.meters
@@ -600,7 +745,7 @@ mod tests {
                     }
                 }
             });
-            let usage = copilot_usage(&json).unwrap().unwrap();
+            let usage = copilot_usage(&json).unwrap();
             assert!(!usage.personal);
             assert_eq!(usage.meters.len(), 1);
             assert_eq!(usage.meters[0].label, None);
@@ -616,7 +761,7 @@ mod tests {
                 "premium_interactions": { "unlimited": true, "entitlement": 0 }
             }
         });
-        let usage = copilot_usage(&json).unwrap().unwrap();
+        let usage = copilot_usage(&json).unwrap();
         assert_eq!(usage.meters[0].label.as_deref(), Some("unlimited"));
         assert_eq!(usage.meters[0].total, 0.0);
     }
@@ -629,12 +774,24 @@ mod tests {
                 "premium_interactions": { "entitlement": 1500, "remaining": 1125 }
             }
         });
-        let usage = copilot_usage(&json).unwrap().unwrap();
+        let usage = copilot_usage(&json).unwrap();
         assert!(usage.personal);
         assert_eq!(pcts(&usage), [("mo".to_string(), 25.0)]);
 
         let free = serde_json::json!({ "copilot_plan": "free", "quota_snapshots": {} });
-        assert!(copilot_usage(&free).unwrap().is_none());
+        assert!(not_available(copilot_usage(&free)));
+    }
+
+    #[test]
+    fn copilot_without_quota_is_not_available() {
+        let json = serde_json::json!({ "quota_snapshots": {} });
+        assert!(not_available(copilot_usage(&json)));
+    }
+
+    #[test]
+    fn missing_credentials_file_is_not_available() {
+        let path = std::env::temp_dir().join("usage-widget-test-missing.json");
+        assert!(not_available(read_json_file(&path, "log in")));
     }
 
     #[test]
@@ -667,7 +824,7 @@ mod tests {
         let spend = serde_json::json!({ "individual_limit": { "used": "1250", "limit": "12500" } });
 
         let plus = serde_json::json!({ "plan_type": "plus", "rate_limit": windows, "spend_control": spend });
-        let usage = codex_usage(&plus).unwrap().unwrap();
+        let usage = codex_usage(&plus).unwrap();
         assert!(usage.personal);
         assert_eq!(
             pcts(&usage),
@@ -675,12 +832,12 @@ mod tests {
         );
 
         let business = serde_json::json!({ "plan_type": "business", "rate_limit": null, "spend_control": spend });
-        let usage = codex_usage(&business).unwrap().unwrap();
+        let usage = codex_usage(&business).unwrap();
         assert!(!usage.personal);
         assert_eq!(usage.meters[0].summary(), "$50 / $500");
 
         let free = serde_json::json!({ "plan_type": "free", "rate_limit": windows });
-        assert!(codex_usage(&free).unwrap().is_none());
+        assert!(not_available(codex_usage(&free)));
     }
 
     #[test]

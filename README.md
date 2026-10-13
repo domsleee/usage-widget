@@ -66,7 +66,9 @@ formally documented and may change.
 
 ## Install
 
-Needs a Rust toolchain (https://rustup.rs). Windows only.
+Windows only. Either download `usage-widget.exe` from the
+[latest release](https://github.com/pepsi-enjoyer/usage-widget/releases/latest), put it
+somewhere permanent and run it, or build it with a Rust toolchain (https://rustup.rs):
 
 ```
 cargo install --git https://github.com/pepsi-enjoyer/usage-widget
@@ -78,18 +80,29 @@ usage-widget
 `--no-startup` removes it. The widget stays out of the taskbar and Alt-Tab, so quit
 it from its right-click menu.
 
-To upgrade, quit the widget first (Windows will not let a running exe be replaced),
-then run the `cargo install` line again and start `usage-widget`. There is no need to
-re-run `--startup`. Only one copy runs at a time, so launching it while it is already
-running does nothing.
+Only one copy runs at a time, so launching it while it is already running does nothing.
 
 From a clone, `install.ps1` does the same three steps using the local checkout.
+
+## Updates
+
+The widget checks GitHub for a newer release a minute after it starts and every six
+hours after that. When there is one, it downloads the release's `usage-widget.exe`,
+checks it against the release's SHA-256, swaps it in place of the running exe and
+restarts. Right-click > Check for updates does the same on demand and tells you the
+result. Set `USAGE_WIDGET_AUTO_UPDATE=0` to turn off the automatic check; the menu
+item still works. Debug builds (`cargo run`) skip the automatic check.
+
+To upgrade by hand instead, quit the widget first (Windows will not let a running exe
+be replaced), then run the `cargo install` line again and start `usage-widget`. There
+is no need to re-run `--startup`.
 
 ## Using it
 
 - Drag anywhere on the widget to move it. Position is remembered between runs, and
   if the saved spot is off screen (say, a monitor is gone) it is moved back on.
-- Right-click for refresh, minimize, size, links to each service's usage page, and Quit.
+- Right-click for refresh, minimize, size, check for updates, links to each service's
+  usage page, and Quit. The menu also shows the installed version.
 - Minimize shrinks it to one line (`COP 87%  CLD 83%  CDX 99%` with each service's logo),
   showing the most-used window per service (on a personal plan, the one that will
   run out first). Maximize from the same menu restores it.
@@ -97,5 +110,9 @@ From a clone, `install.ps1` does the same three steps using the local checkout.
   The widget reopens in whichever mode it was left in.
 - Size scales the widget from 25% to 200% on top of your display scaling (Ctrl +/-
   also works). Handy when a high-DPI monitor makes it too big. It is remembered.
+- A service you have not set up on this machine (no `gh` login or Copilot plan, never
+  logged in to Claude Code or Codex, or on a free plan) is left out. Other problems,
+  like an expired token or no connection, show the service with an empty bar and a
+  short reason in red, or `!` when minimized. Hover it to see the full message.
 - Set `USAGE_WIDGET_REFRESH_MINS` to change the refresh interval (default 5).
 - Set `USAGE_WIDGET_OPACITY` (20-100) to change the window opacity (default 85).

@@ -7,13 +7,16 @@
 mod limits;
 mod providers;
 mod timeutil;
+mod update;
 
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Meter, Provider, Unit, Usage, money};
+use providers::{FetchError, Meter, Problem, Provider, Unit, Usage, money};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 use timeutil::{ago, now_unix, until, until_next_minute};
@@ -46,25 +49,28 @@ const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
     provider: Provider,
-    result: Result<Option<Usage>, String>,
+    result: Result<Usage, FetchError>,
     at: i64,
 }
 
 #[derive(Clone, Default)]
 struct Slot {
     usage: Option<Usage>,
-    error: Option<String>,
+    error: Option<FetchError>,
     updated: Option<i64>,
     loading: bool,
-    /// The last fetch found no paid plan with this service, so it is not shown.
-    absent: bool,
 }
 
 impl Slot {
-    /// Hidden until the first fetch says what the account has, so a service
-    /// the user does not have never flashes up.
+    /// A service with no paid plan on this machine is left out. Others are
+    /// hidden only until their first fetch answers, so a service the user does
+    /// not have never flashes up.
     fn visible(&self) -> bool {
-        !self.absent && (self.usage.is_some() || self.error.is_some())
+        let absent = self
+            .error
+            .as_ref()
+            .is_some_and(|e| e.problem == Problem::NotAvailable);
+        !absent && (self.usage.is_some() || self.error.is_some())
     }
 }
 
@@ -81,6 +87,8 @@ struct App {
     /// Learnt weekly cost of the 5-hour window per service name, for personal
     /// plans. Persisted, since it takes a while to learn.
     ratios: HashMap<String, limits::Ratio>,
+    /// Set once an update has been installed; the UI thread then restarts.
+    restart: Arc<AtomicBool>,
 }
 
 impl App {
@@ -89,6 +97,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
         spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
+        let restart = Arc::new(AtomicBool::new(false));
+        if update::auto_enabled() {
+            spawn_auto_update(cc.egui_ctx.clone(), restart.clone());
+        }
         // Selectable labels grab clicks and drags, so right-click and drag-to-move
         // would not work over text.
         cc.egui_ctx
@@ -121,7 +133,31 @@ impl App {
             minimized,
             logos: load_logos(&cc.egui_ctx),
             ratios,
+            restart,
         }
+    }
+
+    /// Runs a check from the menu in the background and reports the result.
+    fn check_for_updates(&self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let restart = self.restart.clone();
+        std::thread::spawn(move || match update::check_and_install() {
+            Ok(update::Outcome::UpToDate) => message_box(
+                &format!("You have the latest version ({}).", update::CURRENT),
+                false,
+            ),
+            Ok(update::Outcome::NotReady(v)) => message_box(
+                &format!(
+                    "Version {v} is out, but its download is not ready yet. Try again in a few minutes."
+                ),
+                false,
+            ),
+            Ok(update::Outcome::Installed) => {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+            }
+            Err(e) => message_box(&format!("Could not check for updates: {e}"), true),
+        });
     }
 
     fn refresh_now(&mut self) {
@@ -136,14 +172,13 @@ impl App {
             let slot = self.slots.entry(u.provider).or_default();
             slot.loading = false;
             slot.updated = Some(u.at);
-            slot.absent = matches!(u.result, Ok(None));
             match u.result {
                 Ok(usage) => {
                     // Personal plans learn how their two windows relate.
-                    if let Some(Usage {
+                    if let Usage {
                         meters,
                         personal: true,
-                    }) = &usage
+                    } = &usage
                         && let [five_hour, week] = meters.as_slice()
                     {
                         self.ratios
@@ -151,10 +186,13 @@ impl App {
                             .or_default()
                             .observe(five_hour, week);
                     }
-                    slot.usage = usage;
+                    slot.usage = Some(usage);
                     slot.error = None;
                 }
-                Err(e) => slot.error = Some(e),
+                Err(e) => {
+                    slot.usage = None;
+                    slot.error = Some(e);
+                }
             }
         }
     }
@@ -253,6 +291,22 @@ fn spawn_worker(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             while refresh_rx.try_recv().is_ok() {}
+        }
+    });
+}
+
+/// Checks for updates shortly after start and then every few hours, installing
+/// any newer release. Failures are ignored and retried at the next check.
+fn spawn_auto_update(ctx: egui::Context, restart: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(update::FIRST_CHECK_AFTER);
+        loop {
+            if let Ok(update::Outcome::Installed) = update::check_and_install() {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+                return;
+            }
+            std::thread::sleep(update::CHECK_EVERY);
         }
     });
 }
@@ -700,7 +754,18 @@ fn provider_block(
         } else if let Some(m) = single {
             amounts(ui, m, 12.0);
         }
+        if let Some(e) = &slot.error {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(e.problem.label()).size(12.0).color(ERR))
+                    .on_hover_text(&e.detail);
+            });
+        }
     });
+
+    if slot.error.is_some() {
+        bar(ui, 0.0, MUTED);
+        return;
+    }
 
     // A personal plan's bar follows its binding window, sliding from what it
     // showed before to the new window's level when that changes.
@@ -709,16 +774,16 @@ fn provider_block(
         let target = [m.fraction(), c.r().into(), c.g().into(), c.b().into()];
         let [fraction, r, g, b] = ease(ui, egui::Id::new(("bar", p.name())), target);
         bar(ui, fraction, Color32::from_rgb(r as u8, g as u8, b as u8));
-        return stale_note(ui, slot);
+        return;
     }
     let header = personal.and_then(<[Meter]>::first).or(single);
-    match (header, usage, &slot.error) {
-        (Some(m), _, _) => {
+    match (header, usage) {
+        (Some(m), _) => {
             if m.total > 0.0 {
                 bar(ui, m.fraction(), level_color(m.percent()));
             }
         }
-        (None, Some(usage), _) => {
+        (None, Some(usage)) => {
             for m in &usage.meters {
                 ui.horizontal(|ui| {
                     if let Some(label) = &m.label {
@@ -731,21 +796,8 @@ fn provider_block(
                 }
             }
         }
-        (None, None, Some(err)) => {
-            ui.label(RichText::new(err).size(10.5).color(ERR));
-        }
-        (None, None, None) => {
+        (None, None) => {
             ui.label(RichText::new("loading…").size(10.5).color(MUTED));
-        }
-    }
-    stale_note(ui, slot);
-}
-
-/// The last fetch failed but older numbers are still shown.
-fn stale_note(ui: &mut egui::Ui, slot: &Slot) {
-    if slot.usage.is_some() {
-        if let Some(err) = &slot.error {
-            ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
         }
     }
 }
@@ -756,6 +808,7 @@ enum MenuAction {
     ToggleMinimized,
     Open(Provider),
     Size(f32),
+    CheckForUpdates,
     Quit,
 }
 
@@ -808,6 +861,7 @@ fn native_menu(
     const ID_REFRESH: usize = 1;
     const ID_QUIT: usize = 2;
     const ID_MINIMIZE: usize = 3;
+    const ID_UPDATE: usize = 4;
     const ID_OPEN: usize = 10;
     const ID_SIZE: usize = 100;
 
@@ -849,9 +903,12 @@ fn native_menu(
             );
         }
         add(menu, MF_POPUP, sizes as usize, "Size");
+        add(menu, MF_STRING, ID_UPDATE, "Check for updates");
         add(menu, MF_SEPARATOR, 0, "");
         let note = format!("Refreshes every {refresh_mins} min");
         add(menu, MF_STRING | MF_GRAYED, 0, &note);
+        let version = format!("Version {}", update::CURRENT);
+        add(menu, MF_STRING | MF_GRAYED, 0, &version);
         add(menu, MF_STRING, ID_QUIT, "Quit");
 
         let mut pt = Point::default();
@@ -874,6 +931,7 @@ fn native_menu(
         match id {
             ID_REFRESH => Some(MenuAction::Refresh),
             ID_MINIMIZE => Some(MenuAction::ToggleMinimized),
+            ID_UPDATE => Some(MenuAction::CheckForUpdates),
             ID_QUIT => Some(MenuAction::Quit),
             _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
@@ -918,9 +976,17 @@ fn egui_menu(
             }
         }
     });
+    if ui.button("Check for updates").clicked() {
+        action = Some(MenuAction::CheckForUpdates);
+    }
     ui.separator();
     ui.label(
         RichText::new(format!("refreshes every {refresh_mins} min"))
+            .size(10.0)
+            .color(MUTED),
+    );
+    ui.label(
+        RichText::new(format!("version {}", update::CURRENT))
             .size(10.0)
             .color(MUTED),
     );
@@ -1050,8 +1116,8 @@ fn compact_row(
             (None, None) => RichText::new("…").color(MUTED),
         };
         let resp = ui.label(text.size(11.5).strong());
-        if let Some(err) = &slot.error {
-            resp.on_hover_text(format!("{}: {err}", p.name()));
+        if let Some(e) = &slot.error {
+            resp.on_hover_text(format!("{}: {}", p.name(), e.detail));
         }
     }
 }
@@ -1232,19 +1298,31 @@ impl eframe::App for App {
             Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
             Some(MenuAction::Open(p)) => open_url(p.url()),
             Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
+            Some(MenuAction::CheckForUpdates) => self.check_for_updates(&ctx),
             Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
             None => {}
         }
         if refresh {
             self.refresh_now();
         }
+        // Closing normally lets eframe save position and size before the new
+        // version, which waits for this process to exit, starts up.
+        if self.restart.swap(false, Ordering::SeqCst) {
+            match update::restart() {
+                Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                Err(e) => message_box(&format!("Updated, but {e}"), true),
+            }
+        }
     }
 }
 
 fn main() -> eframe::Result {
+    let mut wait_for_exit = Duration::ZERO;
     match std::env::args().nth(1).as_deref() {
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
+        // Started by the previous version after an update; it is still closing.
+        Some("--updated") => wait_for_exit = Duration::from_secs(30),
         Some(flag) => {
             return finish(Err(format!(
                 "unknown flag {flag}
@@ -1255,9 +1333,10 @@ usage: usage-widget [--startup | --no-startup]"
         None => {}
     }
 
-    if !claim_single_instance() {
+    if !claim_single_instance(wait_for_exit) {
         return Ok(());
     }
+    update::cleanup();
 
     let options = eframe::NativeOptions {
         persist_window: true,
@@ -1313,25 +1392,38 @@ fn set_opacity(hwnd: isize) {
 
 /// Holds a named mutex for the life of the process; returns false if another
 /// instance already holds it (e.g. launched again, or at login while running).
+/// Keeps trying for up to `wait`, for when the other instance is about to exit.
 #[cfg(windows)]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(wait: Duration) -> bool {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateMutexW(attrs: *const core::ffi::c_void, owner: i32, name: *const u16) -> isize;
         fn GetLastError() -> u32;
+        fn CloseHandle(handle: isize) -> i32;
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
     let name = wide(r"Local\usage-widget-single-instance");
-    // The handle is deliberately never closed; Windows releases it on exit.
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS
+    let start = std::time::Instant::now();
+    loop {
+        // The handle is deliberately never closed once claimed; Windows releases it on exit.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS {
+                return true;
+            }
+            // Our own handle would keep the mutex alive, so drop it before retrying.
+            CloseHandle(handle);
+        }
+        if start.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
 #[cfg(not(windows))]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(_wait: Duration) -> bool {
     true
 }
 
@@ -1393,23 +1485,44 @@ fn finish(result: Result<String, String>) -> eframe::Result {
         Ok(msg) => (msg.clone(), false),
         Err(msg) => (msg.clone(), true),
     };
-    #[cfg(windows)]
-    {
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
-        }
-        let text_w = wide(&text);
-        let caption_w = wide("usage-widget");
-        let icon = if is_err { 0x10 } else { 0x40 }; // MB_ICONERROR / MB_ICONINFORMATION
-        unsafe {
-            MessageBoxW(0, text_w.as_ptr(), caption_w.as_ptr(), icon);
-        }
-    }
+    message_box(&text, is_err);
     if is_err {
         eprintln!("{text}");
         std::process::exit(1);
     }
     println!("{text}");
     Ok(())
+}
+
+/// Shows a message box on Windows; elsewhere the text goes to stderr.
+fn message_box(text: &str, is_err: bool) {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
+        }
+        const MB_ICONERROR: u32 = 0x10;
+        const MB_ICONINFORMATION: u32 = 0x40;
+        // Without an owner window the box could open behind the always-on-top widget.
+        const MB_SETFOREGROUND: u32 = 0x1_0000;
+        const MB_TOPMOST: u32 = 0x4_0000;
+        let text_w = wide(text);
+        let caption_w = wide("usage-widget");
+        let icon = if is_err {
+            MB_ICONERROR
+        } else {
+            MB_ICONINFORMATION
+        };
+        unsafe {
+            MessageBoxW(
+                0,
+                text_w.as_ptr(),
+                caption_w.as_ptr(),
+                icon | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!("{text}");
 }
