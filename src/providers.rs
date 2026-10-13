@@ -5,9 +5,8 @@ use crate::timeutil::now_unix;
 use base64::Engine;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
@@ -51,13 +50,24 @@ impl Provider {
         }
     }
 
-    pub fn fetch(self) -> Result<Vec<Meter>, String> {
+    /// `Ok(None)` when the account has no paid plan with this service (not signed
+    /// in on this machine, or on a free plan), so the widget leaves it out.
+    pub fn fetch(self) -> Result<Option<Usage>, String> {
         match self {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(),
             Provider::Codex => codex(),
         }
     }
+}
+
+/// What a service reported for the signed-in account.
+#[derive(Clone, Debug)]
+pub struct Usage {
+    pub meters: Vec<Meter>,
+    /// A personal subscription (Claude Pro/Max, ChatGPT Plus/Pro, Copilot Pro).
+    /// Its meters are percent windows, shown on one line with no dollar amounts.
+    pub personal: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -205,94 +215,6 @@ fn jwt_exp(token: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Token refresh via the owning CLI
-// ---------------------------------------------------------------------------
-
-/// Minimum gap between headless CLI runs per provider, so a persistent auth
-/// failure does not spend a prompt on every refresh.
-const REFRESH_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-
-enum FetchError {
-    /// The stored token is expired or was rejected; a token refresh may fix it.
-    Auth(String),
-    Other(String),
-}
-
-impl From<String> for FetchError {
-    fn from(e: String) -> Self {
-        FetchError::Other(e)
-    }
-}
-
-impl From<&str> for FetchError {
-    fn from(e: &str) -> Self {
-        FetchError::Other(e.into())
-    }
-}
-
-impl From<FetchError> for String {
-    fn from(e: FetchError) -> Self {
-        match e {
-            FetchError::Auth(e) | FetchError::Other(e) => e,
-        }
-    }
-}
-
-/// Runs `fetch`; on an auth failure runs `refresh` and tries once more.
-fn with_refresh(
-    fetch: fn() -> Result<Vec<Meter>, FetchError>,
-    refresh: fn() -> Result<(), String>,
-) -> Result<Vec<Meter>, String> {
-    match fetch() {
-        Err(FetchError::Auth(msg)) => match refresh() {
-            Ok(()) => fetch().map_err(String::from),
-            Err(why) => Err(format!("{msg} ({why})")),
-        },
-        r => r.map_err(String::from),
-    }
-}
-
-/// Runs a CLI headlessly and waits for it, rate-limited by `last`. `program` is
-/// tried as-is and then with `.cmd`, since npm installs ship a shim that
-/// Command only finds by full name.
-fn run_headless(last: &Mutex<Option<Instant>>, program: &str, args: &[&str]) -> Result<(), String> {
-    {
-        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|t| t.elapsed() < REFRESH_COOLDOWN) {
-            return Err("auto-refresh tried recently".into());
-        }
-        *last = Some(Instant::now());
-    }
-
-    let spawn = |program: &str| {
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(std::env::temp_dir())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        no_window(&mut cmd);
-        cmd.spawn()
-    };
-    let mut child = spawn(program)
-        .or_else(|_| spawn(&format!("{program}.cmd")))
-        .map_err(|e| format!("could not run {program}: {e}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => return Err(format!("headless {program} failed")),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
-            _ => {
-                let _ = child.kill();
-                return Err(format!("headless {program} timed out"));
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // GitHub Copilot
 // ---------------------------------------------------------------------------
 
@@ -320,8 +242,11 @@ fn github_token() -> Result<String, String> {
     Ok(tok)
 }
 
-fn copilot() -> Result<Vec<Meter>, String> {
-    let token = github_token()?;
+fn copilot() -> Result<Option<Usage>, String> {
+    // No GitHub CLI login (or token variable) on this machine.
+    let Ok(token) = github_token() else {
+        return Ok(None);
+    };
     let auth = format!("token {token}");
     let (status, json) = get_json(
         "https://api.github.com/copilot_internal/user",
@@ -333,13 +258,19 @@ fn copilot() -> Result<Vec<Meter>, String> {
     match status {
         200 => {}
         401 | 403 => return Err("GitHub token rejected; run `gh auth login`".into()),
+        // Signed in to GitHub, but without Copilot.
+        404 => return Ok(None),
         s => return Err(format!("GitHub returned HTTP {s}")),
     }
 
-    copilot_meters(&json)
+    copilot_usage(&json)
 }
 
-fn copilot_meters(json: &Value) -> Result<Vec<Meter>, String> {
+fn copilot_usage(json: &Value) -> Result<Option<Usage>, String> {
+    let plan = json["copilot_plan"].as_str().unwrap_or("");
+    if plan == "free" {
+        return Ok(None);
+    }
     let snap = &json["quota_snapshots"]["premium_interactions"];
     if snap.is_null() {
         return Err("no premium_interactions quota in response".into());
@@ -347,66 +278,77 @@ fn copilot_meters(json: &Value) -> Result<Vec<Meter>, String> {
 
     let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
     if total <= 0.0 && snap["unlimited"].as_bool() == Some(true) {
-        return Ok(vec![Meter {
-            label: Some("unlimited".into()),
-            used: 0.0,
-            total: 0.0,
-            unit: Unit::Percent,
-        }]);
+        return Ok(Some(Usage {
+            meters: vec![Meter {
+                label: Some("unlimited".into()),
+                used: 0.0,
+                total: 0.0,
+                unit: Unit::Percent,
+            }],
+            personal: false,
+        }));
     }
 
     let used = f64_of(&snap["credits_used"])
         .or_else(|| f64_of(&snap["remaining"]).map(|r| total - r))
         .unwrap_or(0.0);
-    Ok(vec![Meter {
-        label: None,
-        used: used * COPILOT_USD_PER_CREDIT,
-        total: total * COPILOT_USD_PER_CREDIT,
-        unit: Unit::Dollars,
-    }])
+
+    // Copilot Pro and Pro+ ("individual", "individual_pro") have no rolling
+    // windows, only the monthly allowance.
+    if plan.starts_with("individual") {
+        return Ok(Some(Usage {
+            meters: vec![Meter {
+                label: Some("mo".into()),
+                used: if total > 0.0 {
+                    used / total * 100.0
+                } else {
+                    0.0
+                },
+                total: 100.0,
+                unit: Unit::Percent,
+            }],
+            personal: true,
+        }));
+    }
+
+    Ok(Some(Usage {
+        meters: vec![Meter {
+            label: None,
+            used: used * COPILOT_USD_PER_CREDIT,
+            total: total * COPILOT_USD_PER_CREDIT,
+            unit: Unit::Dollars,
+        }],
+        personal: false,
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
-fn claude() -> Result<Vec<Meter>, String> {
-    with_refresh(claude_once, refresh_claude_token)
-}
-
-/// Claude Code only refreshes its OAuth token while it runs, so an idle machine
-/// ends up with an expired one. A one-line headless prompt on the smallest model
-/// makes it refresh and write the new token back to `.credentials.json`.
-fn refresh_claude_token() -> Result<(), String> {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    run_headless(
-        &LAST,
-        "claude",
-        &[
-            "-p",
-            "--model",
-            "haiku",
-            "--max-turns",
-            "1",
-            "--no-session-persistence",
-            "--strict-mcp-config",
-            "reply with ok",
-        ],
-    )
-}
-
-fn claude_once() -> Result<Vec<Meter>, FetchError> {
+/// Claude Code only refreshes its OAuth token while it runs, so on an idle machine
+/// the token expires. The widget never refreshes it itself (that would rotate the
+/// refresh token under Claude Code, or spend usage on a headless prompt), so it
+/// asks for Claude Code to be run and picks the new token up on the next refresh.
+fn claude() -> Result<Option<Usage>, String> {
     let path = home()?.join(".claude").join(".credentials.json");
+    // Claude Code has never been signed in on this machine.
+    if !path.exists() {
+        return Ok(None);
+    }
     let creds = read_json_file(&path)?;
     let oauth = &creds["claudeAiOauth"];
-    let token = oauth["accessToken"]
-        .as_str()
-        .ok_or("no claudeAiOauth.accessToken; log in with `claude`")?;
+    // Signed in with an API key rather than a Claude plan.
+    let Some(token) = oauth["accessToken"].as_str() else {
+        return Ok(None);
+    };
+    let plan = oauth["subscriptionType"].as_str().unwrap_or("");
+    if plan == "free" {
+        return Ok(None);
+    }
     if let Some(exp_ms) = i64_of(&oauth["expiresAt"]) {
         if exp_ms / 1000 < now_unix() {
-            return Err(FetchError::Auth(
-                "Claude token expired; run `claude` once to refresh".into(),
-            ));
+            return Err("Claude token expired; run `claude` once to refresh".into());
         }
     }
 
@@ -420,30 +362,42 @@ fn claude_once() -> Result<Vec<Meter>, FetchError> {
     )?;
     match status {
         200 => {}
-        401 | 403 => {
-            return Err(FetchError::Auth(
-                "Claude token rejected; run `claude` once to refresh".into(),
-            ));
-        }
-        s => return Err(format!("Anthropic returned HTTP {s}").into()),
+        401 | 403 => return Err("Claude token rejected; run `claude` once to refresh".into()),
+        s => return Err(format!("Anthropic returned HTTP {s}")),
     }
 
+    claude_usage(&json, matches!(plan, "pro" | "max")).map(Some)
+}
+
+fn claude_usage(json: &Value, personal: bool) -> Result<Usage, String> {
+    // A personal plan shows just its 5-hour and weekly windows.
+    let windows: &[(&str, &str)] = if personal {
+        &[("five_hour", "5h"), ("seven_day", "wk")]
+    } else {
+        &[
+            ("five_hour", "5h"),
+            ("seven_day", "week"),
+            ("seven_day_opus", "opus wk"),
+            ("seven_day_sonnet", "sonnet wk"),
+        ]
+    };
     let mut meters = Vec::new();
-    for (key, label) in [
-        ("five_hour", "5h"),
-        ("seven_day", "week"),
-        ("seven_day_opus", "opus wk"),
-        ("seven_day_sonnet", "sonnet wk"),
-    ] {
+    for (key, label) in windows {
         let w = &json[key];
         if let Some(util) = f64_of(&w["utilization"]) {
             meters.push(Meter {
-                label: Some(label.into()),
+                label: Some((*label).into()),
                 used: util,
                 total: 100.0,
                 unit: Unit::Percent,
             });
         }
+    }
+    if personal {
+        if meters.is_empty() {
+            return Err("no usage windows in response".into());
+        }
+        return Ok(Usage { meters, personal });
     }
 
     // Spend against a monthly credit cap (enterprise / extra usage).
@@ -485,53 +439,30 @@ fn claude_once() -> Result<Vec<Meter>, FetchError> {
     if meters.is_empty() {
         return Err("no usage windows in response".into());
     }
-    Ok(meters)
+    Ok(Usage { meters, personal })
 }
 
 // ---------------------------------------------------------------------------
 // Codex (Codex CLI ChatGPT token)
 // ---------------------------------------------------------------------------
 
-fn codex() -> Result<Vec<Meter>, String> {
-    with_refresh(codex_once, refresh_codex_token)
-}
-
-/// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it
-/// runs. A one-line `codex exec` at low reasoning effort makes it refresh and
-/// write the new token back to `auth.json`. The user config is skipped so a
-/// costly default model/effort or MCP servers are not used for it.
-fn refresh_codex_token() -> Result<(), String> {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    run_headless(
-        &LAST,
-        "codex",
-        &[
-            "exec",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--sandbox",
-            "read-only",
-            "-c",
-            "model_reasoning_effort=\"low\"",
-            "reply with ok",
-        ],
-    )
-}
-
-fn codex_once() -> Result<Vec<Meter>, FetchError> {
+/// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it runs,
+/// so an expired token is reported until `codex` is run again.
+fn codex() -> Result<Option<Usage>, String> {
     let path = home()?.join(".codex").join("auth.json");
+    // The Codex CLI has never been signed in on this machine.
+    if !path.exists() {
+        return Ok(None);
+    }
     let auth_file = read_json_file(&path)?;
     let tokens = &auth_file["tokens"];
-    let token = tokens["access_token"]
-        .as_str()
-        .ok_or("no tokens.access_token; log in with `codex`")?;
+    // Signed in with an API key rather than a ChatGPT plan.
+    let Some(token) = tokens["access_token"].as_str() else {
+        return Ok(None);
+    };
     if let Some(exp) = jwt_exp(token) {
         if exp < now_unix() {
-            return Err(FetchError::Auth(
-                "Codex token expired; run `codex` once to refresh".into(),
-            ));
+            return Err("Codex token expired; run `codex` once to refresh".into());
         }
     }
     let account_id = tokens["account_id"].as_str().unwrap_or("");
@@ -544,22 +475,30 @@ fn codex_once() -> Result<Vec<Meter>, FetchError> {
     let (status, json) = get_json("https://chatgpt.com/backend-api/wham/usage", &headers)?;
     match status {
         200 => {}
-        401 | 403 => {
-            return Err(FetchError::Auth(
-                "Codex token rejected; run `codex` once to refresh".into(),
-            ));
-        }
-        s => return Err(format!("OpenAI returned HTTP {s}").into()),
+        401 | 403 => return Err("Codex token rejected; run `codex` once to refresh".into()),
+        s => return Err(format!("OpenAI returned HTTP {s}")),
     }
+
+    codex_usage(&json)
+}
+
+fn codex_usage(json: &Value) -> Result<Option<Usage>, String> {
+    let plan = json["plan_type"].as_str().unwrap_or("");
+    if plan == "free" {
+        return Ok(None);
+    }
+    // ChatGPT plans billed to the user rather than a workspace.
+    let personal = matches!(plan, "plus" | "pro" | "go");
 
     let mut meters = Vec::new();
 
     let rl = &json["rate_limit"];
-    for (key, fallback) in [("primary_window", "5h"), ("secondary_window", "week")] {
+    let week = if personal { "wk" } else { "week" };
+    for (key, fallback) in [("primary_window", "5h"), ("secondary_window", week)] {
         let w = &rl[key];
         if let Some(pct) = f64_of(&w["used_percent"]) {
             let label = i64_of(&w["limit_window_seconds"])
-                .map(window_label)
+                .map(|secs| window_label(secs, week))
                 .unwrap_or_else(|| fallback.into());
             meters.push(Meter {
                 label: Some(label),
@@ -570,8 +509,11 @@ fn codex_once() -> Result<Vec<Meter>, FetchError> {
         }
     }
 
+    // A personal plan shows just its windows.
     let lim = &json["spend_control"]["individual_limit"];
-    if let (Some(used), Some(limit)) = (f64_of(&lim["used"]), f64_of(&lim["limit"])) {
+    if let (false, Some(used), Some(limit)) =
+        (personal, f64_of(&lim["used"]), f64_of(&lim["limit"]))
+    {
         meters.push(Meter {
             label: if meters.is_empty() {
                 None
@@ -586,21 +528,25 @@ fn codex_once() -> Result<Vec<Meter>, FetchError> {
 
     if meters.is_empty() {
         if json["credits"]["unlimited"].as_bool() == Some(true) {
-            return Ok(vec![Meter {
-                label: Some("unlimited".into()),
-                used: 0.0,
-                total: 0.0,
-                unit: Unit::Percent,
-            }]);
+            return Ok(Some(Usage {
+                meters: vec![Meter {
+                    label: Some("unlimited".into()),
+                    used: 0.0,
+                    total: 0.0,
+                    unit: Unit::Percent,
+                }],
+                personal: false,
+            }));
         }
         return Err("no rate limit or spend data in response".into());
     }
-    Ok(meters)
+    Ok(Some(Usage { meters, personal }))
 }
 
-fn window_label(secs: i64) -> String {
+/// "5h", "2d", or `week` for windows of six days or more.
+fn window_label(secs: i64, week: &str) -> String {
     if secs >= 6 * 86_400 {
-        "week".into()
+        week.into()
     } else if secs >= 86_400 {
         format!("{}d", secs / 86_400)
     } else {
@@ -612,10 +558,18 @@ fn window_label(secs: i64) -> String {
 mod tests {
     use super::*;
 
+    fn pcts(u: &Usage) -> Vec<(String, f64)> {
+        u.meters
+            .iter()
+            .map(|m| (m.label.clone().unwrap_or_default(), m.percent()))
+            .collect()
+    }
+
     #[test]
     fn copilot_entitlement_takes_precedence_over_unlimited() {
         for unlimited in [false, true] {
             let json = serde_json::json!({
+                "copilot_plan": "enterprise",
                 "quota_snapshots": {
                     "premium_interactions": {
                         "unlimited": unlimited,
@@ -625,11 +579,12 @@ mod tests {
                     }
                 }
             });
-            let meters = copilot_meters(&json).unwrap();
-            assert_eq!(meters.len(), 1);
-            assert_eq!(meters[0].label, None);
-            assert_eq!(meters[0].unit, Unit::Dollars);
-            assert_eq!(meters[0].summary(), "$0 / $1,500");
+            let usage = copilot_usage(&json).unwrap().unwrap();
+            assert!(!usage.personal);
+            assert_eq!(usage.meters.len(), 1);
+            assert_eq!(usage.meters[0].label, None);
+            assert_eq!(usage.meters[0].unit, Unit::Dollars);
+            assert_eq!(usage.meters[0].summary(), "$0 / $1,500");
         }
     }
 
@@ -640,9 +595,71 @@ mod tests {
                 "premium_interactions": { "unlimited": true, "entitlement": 0 }
             }
         });
-        let meters = copilot_meters(&json).unwrap();
-        assert_eq!(meters[0].label.as_deref(), Some("unlimited"));
-        assert_eq!(meters[0].total, 0.0);
+        let usage = copilot_usage(&json).unwrap().unwrap();
+        assert_eq!(usage.meters[0].label.as_deref(), Some("unlimited"));
+        assert_eq!(usage.meters[0].total, 0.0);
+    }
+
+    #[test]
+    fn copilot_personal_and_free_plans() {
+        let json = serde_json::json!({
+            "copilot_plan": "individual_pro",
+            "quota_snapshots": {
+                "premium_interactions": { "entitlement": 1500, "remaining": 1125 }
+            }
+        });
+        let usage = copilot_usage(&json).unwrap().unwrap();
+        assert!(usage.personal);
+        assert_eq!(pcts(&usage), [("mo".to_string(), 25.0)]);
+
+        let free = serde_json::json!({ "copilot_plan": "free", "quota_snapshots": {} });
+        assert!(copilot_usage(&free).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_personal_shows_only_windows() {
+        let json = serde_json::json!({
+            "five_hour": { "utilization": 42.0 },
+            "seven_day": { "utilization": 17.0 },
+            "seven_day_opus": { "utilization": 5.0 },
+            "extra_usage": { "used_credits": 500.0, "monthly_limit": 2000.0 }
+        });
+        let usage = claude_usage(&json, true).unwrap();
+        assert!(usage.personal);
+        assert_eq!(
+            pcts(&usage),
+            [("5h".to_string(), 42.0), ("wk".to_string(), 17.0)]
+        );
+
+        let business = claude_usage(&json, false).unwrap();
+        assert!(!business.personal);
+        assert_eq!(business.meters.len(), 4);
+        assert_eq!(business.meters[3].unit, Unit::Dollars);
+    }
+
+    #[test]
+    fn codex_plans() {
+        let windows = serde_json::json!({
+            "primary_window": { "used_percent": 30, "limit_window_seconds": 18_000 },
+            "secondary_window": { "used_percent": 60, "limit_window_seconds": 604_800 }
+        });
+        let spend = serde_json::json!({ "individual_limit": { "used": "1250", "limit": "12500" } });
+
+        let plus = serde_json::json!({ "plan_type": "plus", "rate_limit": windows, "spend_control": spend });
+        let usage = codex_usage(&plus).unwrap().unwrap();
+        assert!(usage.personal);
+        assert_eq!(
+            pcts(&usage),
+            [("5h".to_string(), 30.0), ("wk".to_string(), 60.0)]
+        );
+
+        let business = serde_json::json!({ "plan_type": "business", "rate_limit": null, "spend_control": spend });
+        let usage = codex_usage(&business).unwrap().unwrap();
+        assert!(!usage.personal);
+        assert_eq!(usage.meters[0].summary(), "$50 / $500");
+
+        let free = serde_json::json!({ "plan_type": "free", "rate_limit": windows });
+        assert!(codex_usage(&free).unwrap().is_none());
     }
 
     #[test]
@@ -652,7 +669,7 @@ mod tests {
         assert_eq!(money(518.94), "518.94");
         assert_eq!(money(1000.0), "1,000");
         assert_eq!(money(12_345.5), "12,345.50");
-        assert_eq!(window_label(18_000), "5h");
-        assert_eq!(window_label(604_800), "week");
+        assert_eq!(window_label(18_000, "week"), "5h");
+        assert_eq!(window_label(604_800, "week"), "week");
     }
 }

@@ -1,5 +1,6 @@
 //! A tiny always-on-top, frameless, draggable widget that shows Copilot,
-//! Claude and Codex usage in dollars, refreshed every few minutes.
+//! Claude and Codex usage (dollars on business plans, 5-hour and weekly windows
+//! on personal ones), refreshed every few minutes.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -10,7 +11,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Meter, Provider, Unit, money};
+use providers::{Meter, Provider, Unit, Usage, money};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -32,21 +33,33 @@ const SIZES: [f32; 8] = [0.25, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0];
 const BG: Color32 = Color32::from_rgb(24, 26, 32);
 const TEXT: Color32 = Color32::from_gray(232);
 const MUTED: Color32 = Color32::from_gray(135);
+/// Window labels ("5h", "wk") next to a personal plan's percentages.
+const LIGHT: Color32 = Color32::from_gray(175);
 const TRACK: Color32 = Color32::from_gray(58);
 const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
     provider: Provider,
-    result: Result<Vec<Meter>, String>,
+    result: Result<Option<Usage>, String>,
     at: i64,
 }
 
 #[derive(Clone, Default)]
 struct Slot {
-    meters: Option<Vec<Meter>>,
+    usage: Option<Usage>,
     error: Option<String>,
     updated: Option<i64>,
     loading: bool,
+    /// The last fetch found no paid plan with this service, so it is not shown.
+    absent: bool,
+}
+
+impl Slot {
+    /// Hidden until the first fetch says what the account has, so a service
+    /// the user does not have never flashes up.
+    fn visible(&self) -> bool {
+        !self.absent && (self.usage.is_some() || self.error.is_some())
+    }
 }
 
 struct App {
@@ -109,9 +122,10 @@ impl App {
             let slot = self.slots.entry(u.provider).or_default();
             slot.loading = false;
             slot.updated = Some(u.at);
+            slot.absent = matches!(u.result, Ok(None));
             match u.result {
-                Ok(m) => {
-                    slot.meters = Some(m);
+                Ok(usage) => {
+                    slot.usage = usage;
                     slot.error = None;
                 }
                 Err(e) => slot.error = Some(e),
@@ -119,25 +133,41 @@ impl App {
         }
     }
 
+    /// The services the account has, in display order.
+    fn visible(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|p| self.slots.get(p).is_some_and(Slot::visible))
+            .collect()
+    }
+
+    /// True once every service has answered at least once.
+    fn all_fetched(&self) -> bool {
+        self.slots.values().all(|s| s.updated.is_some())
+    }
+
     fn last_updated(&self) -> Option<i64> {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
-    /// Sum of every dollar-denominated meter across providers.
+    /// Sum of every dollar-denominated meter across providers. Only when at least
+    /// two providers have one, since otherwise it repeats that provider's line.
     fn total(&self) -> Option<Meter> {
         let mut used = 0.0;
         let mut total = 0.0;
-        let mut any = false;
+        let mut providers = 0;
         for slot in self.slots.values() {
-            for m in slot.meters.iter().flatten() {
+            let mut any = false;
+            for m in slot.usage.iter().flat_map(|u| &u.meters) {
                 if m.unit == Unit::Dollars {
                     used += m.used;
                     total += m.total;
                     any = true;
                 }
             }
+            providers += usize::from(any);
         }
-        any.then(|| Meter {
+        (providers >= 2).then(|| Meter {
             label: None,
             used,
             total,
@@ -517,17 +547,42 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
+/// "42% 5h / 17% wk" right-aligned: each window's percentage coloured by level,
+/// followed by its label.
+fn windows(ui: &mut egui::Ui, meters: &[Meter], size: f32) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        // Laid out right to left, so the last window goes first.
+        for (i, m) in meters.iter().rev().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("/").size(size).color(MUTED));
+            }
+            if let Some(label) = &m.label {
+                ui.label(RichText::new(label).size(size).color(LIGHT));
+            }
+            let pct = m.percent();
+            ui.label(
+                RichText::new(format!("{pct:.0}%"))
+                    .size(size)
+                    .strong()
+                    .color(level_color(pct)),
+            );
+        }
+    });
+}
+
 fn provider_block(
     ui: &mut egui::Ui,
     p: Provider,
     slot: &Slot,
     logos: &HashMap<Provider, egui::TextureHandle>,
 ) {
-    let single = slot
-        .meters
-        .as_ref()
-        .filter(|m| m.len() == 1 && m[0].label.is_none())
-        .map(|m| &m[0]);
+    let usage = slot.usage.as_ref();
+    // A personal plan's windows all go on the header line.
+    let personal = usage.filter(|u| u.personal).map(|u| u.meters.as_slice());
+    let single = usage
+        .filter(|u| !u.personal && u.meters.len() == 1 && u.meters[0].label.is_none())
+        .map(|u| &u.meters[0]);
 
     ui.horizontal(|ui| {
         provider_logo(ui, p, logos);
@@ -536,19 +591,23 @@ fn provider_block(
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
-        if let Some(m) = single {
+        if let Some(meters) = personal {
+            windows(ui, meters, 12.0);
+        } else if let Some(m) = single {
             amounts(ui, m, 12.0);
         }
     });
 
-    match (single, &slot.meters, &slot.error) {
+    // A personal plan's bar follows its first window (5h).
+    let header = personal.and_then(<[Meter]>::first).or(single);
+    match (header, usage, &slot.error) {
         (Some(m), _, _) => {
             if m.total > 0.0 {
                 bar(ui, m.fraction(), level_color(m.percent()));
             }
         }
-        (None, Some(meters), _) => {
-            for m in meters {
+        (None, Some(usage), _) => {
+            for m in &usage.meters {
                 ui.horizontal(|ui| {
                     if let Some(label) = &m.label {
                         ui.label(RichText::new(label).size(11.0).color(MUTED));
@@ -567,7 +626,7 @@ fn provider_block(
             ui.label(RichText::new("loading…").size(10.5).color(MUTED));
         }
     }
-    if slot.meters.is_some() {
+    if slot.usage.is_some() {
         if let Some(err) = &slot.error {
             ui.label(RichText::new(format!("stale: {err}")).size(10.0).color(ERR));
         }
@@ -592,6 +651,7 @@ fn minimize_label(minimized: bool) -> &'static str {
 #[cfg(windows)]
 fn native_menu(
     frame: &eframe::Frame,
+    providers: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -644,14 +704,18 @@ fn native_menu(
         add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
         add(menu, MF_SEPARATOR, 0, "");
         for (i, p) in Provider::ALL.iter().enumerate() {
-            add(
-                menu,
-                MF_STRING,
-                ID_OPEN + i,
-                &format!("Open {} usage", p.name()),
-            );
+            if providers.contains(p) {
+                add(
+                    menu,
+                    MF_STRING,
+                    ID_OPEN + i,
+                    &format!("Open {} usage", p.name()),
+                );
+            }
         }
-        add(menu, MF_SEPARATOR, 0, "");
+        if !providers.is_empty() {
+            add(menu, MF_SEPARATOR, 0, "");
+        }
         // Owned by `menu` once appended, so destroyed along with it.
         let sizes = CreatePopupMenu();
         for (i, z) in SIZES.iter().enumerate() {
@@ -708,6 +772,7 @@ fn native_menu(
 #[cfg(not(windows))]
 fn egui_menu(
     ui: &mut egui::Ui,
+    providers: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -720,12 +785,14 @@ fn egui_menu(
         action = Some(MenuAction::ToggleMinimized);
     }
     ui.separator();
-    for p in Provider::ALL {
+    for &p in providers {
         if ui.button(format!("Open {} usage", p.name())).clicked() {
             action = Some(MenuAction::Open(p));
         }
     }
-    ui.separator();
+    if !providers.is_empty() {
+        ui.separator();
+    }
     ui.menu_button("Size", |ui| {
         for z in SIZES {
             let label = format!("{:.0}%", z * 100.0);
@@ -831,11 +898,16 @@ fn provider_logo(ui: &mut egui::Ui, p: Provider, logos: &HashMap<Provider, egui:
 /// The minimized view: "<logo> COP 42%  <logo> CLD 17%  <logo> CDX 99%" on one line.
 fn compact_row(
     ui: &mut egui::Ui,
+    providers: &[Provider],
     slots: &HashMap<Provider, Slot>,
     logos: &HashMap<Provider, egui::TextureHandle>,
+    empty: &str,
 ) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-    for (i, p) in Provider::ALL.iter().enumerate() {
+    if providers.is_empty() {
+        ui.label(RichText::new(empty).size(11.5).color(MUTED));
+    }
+    for (i, p) in providers.iter().enumerate() {
         if i > 0 {
             ui.add_space(8.0);
         }
@@ -844,9 +916,9 @@ fn compact_row(
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
         // The most-used meter is the one that matters when space is this tight.
         let pct = slot
-            .meters
+            .usage
             .iter()
-            .flatten()
+            .flat_map(|u| &u.meters)
             .filter(|m| m.total > 0.0)
             .map(Meter::percent)
             .reduce(f64::max);
@@ -932,6 +1004,13 @@ impl eframe::App for App {
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
         let minimized = self.minimized;
+        let providers = self.visible();
+        // Shown when no service is: still waiting on one, or none has a paid plan.
+        let empty = if self.all_fetched() {
+            "No Copilot, Claude or Codex plan found"
+        } else {
+            "…"
+        };
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -944,11 +1023,11 @@ impl eframe::App for App {
             #[cfg(windows)]
             // Checked on the raw pointer so a right-click over any widget counts.
             if ui.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
-                action = native_menu(frame, zoom, refresh_mins, minimized);
+                action = native_menu(frame, &providers, zoom, refresh_mins, minimized);
             }
             #[cfg(not(windows))]
             bg.context_menu(|ui| {
-                action = egui_menu(ui, zoom, refresh_mins, minimized);
+                action = egui_menu(ui, &providers, zoom, refresh_mins, minimized);
                 if action.is_some() {
                     ui.close();
                 }
@@ -959,10 +1038,13 @@ impl eframe::App for App {
             // Wrap the content so its real size can be measured: the panel's own
             // min_rect is always expanded to fill the window.
             let content = if minimized {
-                ui.horizontal(|ui| compact_row(ui, &self.slots, &self.logos))
+                ui.horizontal(|ui| compact_row(ui, &providers, &self.slots, &self.logos, empty))
             } else {
                 ui.vertical(|ui| {
-                    for (i, p) in Provider::ALL.iter().enumerate() {
+                    if providers.is_empty() {
+                        ui.label(RichText::new(empty).size(10.5).color(MUTED));
+                    }
+                    for (i, p) in providers.iter().enumerate() {
                         if i > 0 {
                             ui.add_space(5.0);
                         }
@@ -985,7 +1067,7 @@ impl eframe::App for App {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let text = format!("${} / ${}", money(t.used), money(t.total));
                                 ui.label(RichText::new(text).size(10.5).color(TEXT))
-                                    .on_hover_text("Total across all three");
+                                    .on_hover_text("Total across all services");
                             });
                         }
                     });

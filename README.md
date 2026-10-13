@@ -1,8 +1,9 @@
 # usage-widget
 
 A small always-on-top desktop widget (Rust, egui) that shows how much of your
-GitHub Copilot, Claude and Codex allowance you have used, in dollars. It
-refreshes every five minutes and can be dragged anywhere on screen.
+GitHub Copilot, Claude and Codex allowance you have used: in dollars on business
+plans, and as 5-hour and weekly windows on personal subscriptions. It refreshes
+every five minutes and can be dragged anywhere on screen.
 
 <img width="323" height="237" alt="image" src="https://github.com/user-attachments/assets/29bc8928-0440-46c9-98d3-0cd0231311bb" /> <img width="483" height="171" alt="image" src="https://github.com/user-attachments/assets/d055487b-2c99-4984-b1cd-de8b0e231424" />
 
@@ -10,7 +11,7 @@ refreshes every five minutes and can be dragged anywhere on screen.
 
 Credit-to-dollar rates live at the top of `src/providers.rs`:
 Copilot 50,000 credits = $500, Codex 12,500 credits = $500. Claude reports
-dollars directly. The footer total sums all three.
+dollars directly. When two or more services show dollars, the footer totals them.
 
 ## How it gets the numbers
 
@@ -22,18 +23,30 @@ No logins of its own. It reuses credentials the CLIs already store locally:
 | Claude | `~/.claude/.credentials.json` written by Claude Code | `api.anthropic.com/api/oauth/usage` |
 | Codex | `~/.codex/auth.json` written by Codex CLI | `chatgpt.com/backend-api/wham/usage` |
 
+Only the services you have a paid plan with are shown. One you are not signed in
+to on this machine, or are on a free plan with, is left out, so with only a Claude
+subscription the widget shows just Claude.
+
 What is shown depends on the plan:
 
-- Copilot: premium request credits used / entitlement.
-- Claude: 5-hour and 7-day windows when the plan has them, plus monthly spend against the cap when present.
-- Codex: 5-hour and weekly rate-limit windows when present, plus the workspace spend limit when present.
+- Business plans (Copilot Business/Enterprise, Claude Team/Enterprise, ChatGPT
+  Business/Enterprise/Edu):
+  - Copilot: premium request credits used / entitlement, in dollars.
+  - Claude: 5-hour and 7-day windows when the plan has them, plus monthly spend against the cap when present.
+  - Codex: 5-hour and weekly rate-limit windows when present, plus the workspace spend limit when present.
+- Personal subscriptions (Claude Pro/Max, ChatGPT Plus/Pro/Go, Copilot Pro/Pro+): no
+  dollar amounts. One line reads `42% 5h / 17% wk`, the 5-hour and weekly windows
+  coloured by level, and the bar tracks the 5-hour window. Copilot has no rolling
+  windows, so a personal Copilot plan shows its monthly allowance as `% mo`.
 
-Tokens are read from disk on every refresh and never written back by the widget. If
-Claude Code or the Codex CLI has not run for a while its access token expires; the
-widget then runs a one-line headless prompt (`claude -p` on Haiku, or `codex exec` at
-low reasoning effort, each at most once every 15 minutes) so the CLI refreshes the
-token itself, and retries. The Copilot token comes from `gh auth token`, which does
-not expire.
+The plan comes from Claude Code's `subscriptionType`, and from the plan named in the
+Copilot and Codex usage responses.
+
+Tokens are read from disk on every refresh and never written back or refreshed by the
+widget. If Claude Code or the Codex CLI has not run for a while its access token
+expires and the widget says so; run `claude` or `codex` once and the next refresh
+picks up the new token. The Copilot token comes from `gh auth token`, which does not
+expire.
 
 Logos are from [Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
 
