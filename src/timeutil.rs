@@ -126,6 +126,39 @@ pub fn ago(ts: i64) -> String {
     }
 }
 
+/// Time left until a future timestamp as dd:hh:mm.
+pub fn window_until(ts: i64) -> String {
+    window_countdown((ts - now_unix()).max(0))
+}
+
+/// Local reset date and time for a weekly window, for example "17 Oct 2:30pm".
+pub fn reset_date_time(ts: i64) -> String {
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|t| t.format("%-d %b %-I:%M%P").to_string())
+        .unwrap_or_default()
+}
+
+/// dd:hh:mm, or hh:mm once under a day.
+fn window_countdown(secs: i64) -> String {
+    let (days, hours, mins) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
+    if days > 0 {
+        format!("{days:02}:{hours:02}:{mins:02}")
+    } else {
+        format!("{hours:02}:{mins:02}")
+    }
+}
+
+/// Time to the next whole minute, so a countdown ticks over on time.
+pub fn until_next_minute() -> std::time::Duration {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() % 60_000)
+        .unwrap_or(0);
+    std::time::Duration::from_millis(60_000 - millis as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
