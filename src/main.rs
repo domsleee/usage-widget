@@ -1,8 +1,10 @@
 //! A tiny always-on-top, frameless, draggable widget that shows Copilot,
-//! Claude and Codex usage in dollars, refreshed every few minutes.
+//! Claude and Codex usage (dollars on business plans, 5-hour and weekly windows
+//! on personal ones), refreshed every few minutes.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod limits;
 mod providers;
 mod timeutil;
 mod update;
@@ -11,13 +13,13 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{FetchError, Meter, Problem, Provider, Unit, money};
+use providers::{FetchError, Meter, Problem, Provider, Unit, Usage, money};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, now_unix};
+use timeutil::{ago, now_unix, until, until_next_minute};
 
 const WIDTH: f32 = 250.0;
 const MARGIN: i8 = 12;
@@ -26,6 +28,11 @@ const DEFAULT_OPACITY_PERCENT: u32 = 85;
 const MINI_MARGIN_X: i8 = 10;
 const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
+const RATIOS_KEY: &str = "ratios";
+/// Seconds the bar and window labels take to move over when the binding window changes.
+const SWITCH_SECS: f32 = 0.35;
+/// How far the window that is not the binding one fades towards the background.
+const FADE: f32 = 0.65;
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
 const SIZES: [f32; 8] = [0.25, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0];
@@ -35,21 +42,36 @@ const SIZES: [f32; 8] = [0.25, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0];
 const BG: Color32 = Color32::from_rgb(24, 26, 32);
 const TEXT: Color32 = Color32::from_gray(232);
 const MUTED: Color32 = Color32::from_gray(135);
+/// Window labels ("5h", "wk") next to a personal plan's percentages.
+const LIGHT: Color32 = Color32::from_gray(175);
 const TRACK: Color32 = Color32::from_gray(58);
 const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
     provider: Provider,
-    result: Result<Vec<Meter>, FetchError>,
+    result: Result<Usage, FetchError>,
     at: i64,
 }
 
 #[derive(Clone, Default)]
 struct Slot {
-    meters: Option<Vec<Meter>>,
+    usage: Option<Usage>,
     error: Option<FetchError>,
     updated: Option<i64>,
     loading: bool,
+}
+
+impl Slot {
+    /// A service with no paid plan on this machine is left out. Others are
+    /// hidden only until their first fetch answers, so a service the user does
+    /// not have never flashes up.
+    fn visible(&self) -> bool {
+        let absent = self
+            .error
+            .as_ref()
+            .is_some_and(|e| e.problem == Problem::NotAvailable);
+        !absent && (self.usage.is_some() || self.error.is_some())
+    }
 }
 
 struct App {
@@ -62,6 +84,9 @@ struct App {
     /// Compact single-line view. Persisted, so the widget reopens the way it was left.
     minimized: bool,
     logos: HashMap<Provider, egui::TextureHandle>,
+    /// Learnt weekly cost of the 5-hour window per service name, for personal
+    /// plans. Persisted, since it takes a while to learn.
+    ratios: HashMap<String, limits::Ratio>,
     /// Set once an update has been installed; the UI thread then restarts.
     restart: Arc<AtomicBool>,
 }
@@ -84,6 +109,10 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, MINIMIZED_KEY))
             .unwrap_or(false);
+        let ratios = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, RATIOS_KEY))
+            .unwrap_or_default();
 
         let mut slots = HashMap::new();
         for p in Provider::ALL {
@@ -103,6 +132,7 @@ impl App {
             settled: false,
             minimized,
             logos: load_logos(&cc.egui_ctx),
+            ratios,
             restart,
         }
     }
@@ -143,41 +173,84 @@ impl App {
             slot.loading = false;
             slot.updated = Some(u.at);
             match u.result {
-                Ok(m) => {
-                    slot.meters = Some(m);
+                Ok(usage) => {
+                    // Personal plans learn how their two windows relate.
+                    if let Usage {
+                        meters,
+                        personal: true,
+                    } = &usage
+                        && let [five_hour, week] = meters.as_slice()
+                    {
+                        self.ratios
+                            .entry(u.provider.name().to_string())
+                            .or_default()
+                            .observe(five_hour, week);
+                    }
+                    slot.usage = Some(usage);
                     slot.error = None;
                 }
                 Err(e) => {
-                    slot.meters = None;
+                    slot.usage = None;
                     slot.error = Some(e);
                 }
             }
         }
     }
 
+    /// For a personal plan with 5-hour and weekly windows, the one that runs out
+    /// first this session (0 or 1).
+    fn binding(&self, p: Provider) -> Option<usize> {
+        let usage = self.slots.get(&p)?.usage.as_ref().filter(|u| u.personal)?;
+        let [five_hour, week] = usage.meters.as_slice() else {
+            return None;
+        };
+        let k = self
+            .ratios
+            .get(p.name())
+            .and_then(limits::Ratio::weekly_per_five_hour);
+        Some(limits::binding(five_hour, week, k))
+    }
+
+    /// The services the account has, in display order.
+    fn visible(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|p| self.slots.get(p).is_some_and(Slot::visible))
+            .collect()
+    }
+
+    /// True once every service has answered at least once.
+    fn all_fetched(&self) -> bool {
+        self.slots.values().all(|s| s.updated.is_some())
+    }
+
     fn last_updated(&self) -> Option<i64> {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
-    /// Sum of every dollar-denominated meter across providers.
+    /// Sum of every dollar-denominated meter across providers. Only when at least
+    /// two providers have one, since otherwise it repeats that provider's line.
     fn total(&self) -> Option<Meter> {
         let mut used = 0.0;
         let mut total = 0.0;
-        let mut any = false;
+        let mut providers = 0;
         for slot in self.slots.values() {
-            for m in slot.meters.iter().flatten() {
+            let mut any = false;
+            for m in slot.usage.iter().flat_map(|u| &u.meters) {
                 if m.unit == Unit::Dollars {
                     used += m.used;
                     total += m.total;
                     any = true;
                 }
             }
+            providers += usize::from(any);
         }
-        any.then(|| Meter {
+        (providers >= 2).then(|| Meter {
             label: None,
             used,
             total,
             unit: Unit::Dollars,
+            resets_at: None,
         })
     }
 }
@@ -538,6 +611,18 @@ fn level_color(percent: f64) -> Color32 {
     }
 }
 
+/// `a` moved towards `b` by `t` (0 to 1).
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// `color` at `weight` (0 to 1) of full strength: a window that is not the
+/// binding one fades towards the background, as if disabled.
+fn weighted(color: Color32, weight: f32) -> Color32 {
+    mix(mix(color, BG, FADE), color, weight)
+}
+
 fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
     let painter = ui.painter();
@@ -569,36 +654,109 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
+/// "42% 5h / 17% wk" right-aligned: each window's percentage coloured by level,
+/// followed by its label, each faded by its weight (see `weighted`).
+fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        // Laid out right to left, so the last window goes first.
+        for (i, (m, &w)) in meters.iter().zip(weights).rev().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("/").size(size).color(MUTED));
+            }
+            if let Some(label) = &m.label {
+                ui.label(RichText::new(label).size(size).color(weighted(LIGHT, w)));
+            }
+            let pct = m.percent();
+            ui.label(
+                RichText::new(format!("{pct:.0}%"))
+                    .size(size)
+                    .strong()
+                    .color(weighted(level_color(pct), w)),
+            );
+        }
+    });
+}
+
+/// Eases from the values last shown to `target` over `SWITCH_SECS` whenever the
+/// target changes, picking up from mid-way if it changes again. The first
+/// target seen for an id is shown as-is.
+fn ease<const N: usize>(ui: &egui::Ui, id: egui::Id, target: [f32; N]) -> [f32; N] {
+    #[derive(Clone, Copy)]
+    struct Tween<const N: usize> {
+        from: [f32; N],
+        to: [f32; N],
+        start: f64,
+    }
+    let at = |tw: &Tween<N>, now: f64| {
+        let t = ((now - tw.start) as f32 / SWITCH_SECS).clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        std::array::from_fn(|i| tw.from[i] + (tw.to[i] - tw.from[i]) * t)
+    };
+
+    let ctx = ui.ctx();
+    let now = ui.input(|i| i.time);
+    let mut tw = ctx.data(|d| d.get_temp::<Tween<N>>(id)).unwrap_or(Tween {
+        from: target,
+        to: target,
+        start: now,
+    });
+    if tw.to != target {
+        tw = Tween {
+            from: at(&tw, now),
+            to: target,
+            start: now,
+        };
+    }
+    ctx.data_mut(|d| d.insert_temp(id, tw));
+    if now - tw.start < f64::from(SWITCH_SECS) {
+        ctx.request_repaint();
+    }
+    at(&tw, now)
+}
+
 fn provider_block(
     ui: &mut egui::Ui,
     p: Provider,
     slot: &Slot,
     logos: &HashMap<Provider, egui::TextureHandle>,
+    binding: Option<usize>,
 ) {
-    let single = slot
-        .meters
-        .as_ref()
-        .filter(|m| m.len() == 1 && m[0].label.is_none())
-        .map(|m| &m[0]);
+    let usage = slot.usage.as_ref();
+    // A personal plan's windows all go on the header line.
+    let personal = usage.filter(|u| u.personal).map(|u| u.meters.as_slice());
+    let single = usage
+        .filter(|u| !u.personal && u.meters.len() == 1 && u.meters[0].label.is_none())
+        .map(|u| &u.meters[0]);
+    // Where the bar and the bright label sit between the 5-hour and weekly window.
+    let position = binding.map(|b| ease(ui, egui::Id::new(("binding", p.name())), [b as f32])[0]);
+    let weights: Vec<f32> = match position {
+        Some(t) => vec![1.0 - t, t],
+        None => vec![1.0; personal.map_or(0, <[Meter]>::len)],
+    };
+    // The binding window, whose reset is counted down next to the name.
+    let selected = personal.and_then(|m| m.get(binding.unwrap_or(0)));
 
     ui.horizontal(|ui| {
         provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.label(name);
+        if let Some(at) = selected.and_then(|m| m.resets_at) {
+            let text = RichText::new(format!("({})", until(at))).size(11.0);
+            ui.label(text.color(LIGHT))
+                .on_hover_text("Until this window resets");
+        }
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
-        if let Some(m) = single {
+        if let Some(meters) = personal {
+            windows(ui, meters, &weights, 12.0);
+        } else if let Some(m) = single {
             amounts(ui, m, 12.0);
         }
         if let Some(e) = &slot.error {
-            let color = if e.problem == Problem::NotAvailable {
-                MUTED
-            } else {
-                ERR
-            };
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(e.problem.label()).size(12.0).color(color))
+                ui.label(RichText::new(e.problem.label()).size(12.0).color(ERR))
                     .on_hover_text(&e.detail);
             });
         }
@@ -609,14 +767,24 @@ fn provider_block(
         return;
     }
 
-    match (single, &slot.meters) {
+    // A personal plan's bar follows its binding window, sliding from what it
+    // showed before to the new window's level when that changes.
+    if let Some(m) = selected.filter(|_| binding.is_some()) {
+        let c = level_color(m.percent());
+        let target = [m.fraction(), c.r().into(), c.g().into(), c.b().into()];
+        let [fraction, r, g, b] = ease(ui, egui::Id::new(("bar", p.name())), target);
+        bar(ui, fraction, Color32::from_rgb(r as u8, g as u8, b as u8));
+        return;
+    }
+    let header = personal.and_then(<[Meter]>::first).or(single);
+    match (header, usage) {
         (Some(m), _) => {
             if m.total > 0.0 {
                 bar(ui, m.fraction(), level_color(m.percent()));
             }
         }
-        (None, Some(meters)) => {
-            for m in meters {
+        (None, Some(usage)) => {
+            for m in &usage.meters {
                 ui.horizontal(|ui| {
                     if let Some(label) = &m.label {
                         ui.label(RichText::new(label).size(11.0).color(MUTED));
@@ -653,6 +821,7 @@ fn minimize_label(minimized: bool) -> &'static str {
 #[cfg(windows)]
 fn native_menu(
     frame: &eframe::Frame,
+    providers: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -706,14 +875,18 @@ fn native_menu(
         add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
         add(menu, MF_SEPARATOR, 0, "");
         for (i, p) in Provider::ALL.iter().enumerate() {
-            add(
-                menu,
-                MF_STRING,
-                ID_OPEN + i,
-                &format!("Open {} usage", p.name()),
-            );
+            if providers.contains(p) {
+                add(
+                    menu,
+                    MF_STRING,
+                    ID_OPEN + i,
+                    &format!("Open {} usage", p.name()),
+                );
+            }
         }
-        add(menu, MF_SEPARATOR, 0, "");
+        if !providers.is_empty() {
+            add(menu, MF_SEPARATOR, 0, "");
+        }
         // Owned by `menu` once appended, so destroyed along with it.
         let sizes = CreatePopupMenu();
         for (i, z) in SIZES.iter().enumerate() {
@@ -774,6 +947,7 @@ fn native_menu(
 #[cfg(not(windows))]
 fn egui_menu(
     ui: &mut egui::Ui,
+    providers: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -786,12 +960,14 @@ fn egui_menu(
         action = Some(MenuAction::ToggleMinimized);
     }
     ui.separator();
-    for p in Provider::ALL {
+    for &p in providers {
         if ui.button(format!("Open {} usage", p.name())).clicked() {
             action = Some(MenuAction::Open(p));
         }
     }
-    ui.separator();
+    if !providers.is_empty() {
+        ui.separator();
+    }
     ui.menu_button("Size", |ui| {
         for z in SIZES {
             let label = format!("{:.0}%", z * 100.0);
@@ -905,30 +1081,37 @@ fn provider_logo(ui: &mut egui::Ui, p: Provider, logos: &HashMap<Provider, egui:
 /// The minimized view: "<logo> COP 42%  <logo> CLD 17%  <logo> CDX 99%" on one line.
 fn compact_row(
     ui: &mut egui::Ui,
+    providers: &[Provider],
     slots: &HashMap<Provider, Slot>,
     logos: &HashMap<Provider, egui::TextureHandle>,
+    bindings: &HashMap<Provider, usize>,
+    empty: &str,
 ) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-    for (i, p) in Provider::ALL.iter().enumerate() {
+    if providers.is_empty() {
+        ui.label(RichText::new(empty).size(11.5).color(MUTED));
+    }
+    for (i, p) in providers.iter().enumerate() {
         if i > 0 {
             ui.add_space(8.0);
         }
-        let slot = slots.get(p).cloned().unwrap_or_default();
+        let Some(slot) = slots.get(p) else {
+            continue;
+        };
         provider_logo(ui, *p, logos);
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
-        // The most-used meter is the one that matters when space is this tight.
-        let pct = slot
-            .meters
-            .iter()
-            .flatten()
-            .filter(|m| m.total > 0.0)
-            .map(Meter::percent)
-            .reduce(f64::max);
+        // The meter that matters when space is this tight: the binding window on
+        // a personal plan, otherwise the most-used one.
+        let meters = slot.usage.iter().flat_map(|u| &u.meters);
+        let pct = match bindings.get(p) {
+            Some(&b) => meters.clone().nth(b).map(Meter::percent),
+            None => meters
+                .filter(|m| m.total > 0.0)
+                .map(Meter::percent)
+                .reduce(f64::max),
+        };
         let text = match (pct, &slot.error) {
             (Some(pct), _) => RichText::new(format!("{pct:.0}%")).color(level_color(pct)),
-            (None, Some(e)) if e.problem == Problem::NotAvailable => {
-                RichText::new("N/A").color(MUTED)
-            }
             (None, Some(_)) => RichText::new("!").color(ERR),
             (None, None) => RichText::new("…").color(MUTED),
         };
@@ -977,6 +1160,7 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
+        eframe::set_value(storage, RATIOS_KEY, &self.ratios);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -989,7 +1173,9 @@ impl eframe::App for App {
         apply_windows_chrome(frame);
         self.drain();
         let ctx = root.ctx().clone();
-        ctx.request_repaint_after(Duration::from_secs(30));
+        // Repaints only to keep the text current: "updated 5m ago" every 30s, and
+        // on the minute so a reset countdown ticks over on time.
+        ctx.request_repaint_after(until_next_minute().min(Duration::from_secs(30)));
         if !self.settled {
             self.settled = settle_window(frame);
             if !self.settled {
@@ -1009,6 +1195,17 @@ impl eframe::App for App {
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
         let minimized = self.minimized;
+        let providers = self.visible();
+        let bindings: HashMap<Provider, usize> = providers
+            .iter()
+            .filter_map(|&p| Some((p, self.binding(p)?)))
+            .collect();
+        // Shown when no service is: still waiting on one, or none has a paid plan.
+        let empty = if self.all_fetched() {
+            "No Copilot, Claude or Codex plan found"
+        } else {
+            "…"
+        };
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -1021,11 +1218,11 @@ impl eframe::App for App {
             #[cfg(windows)]
             // Checked on the raw pointer so a right-click over any widget counts.
             if ui.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
-                action = native_menu(frame, zoom, refresh_mins, minimized);
+                action = native_menu(frame, &providers, zoom, refresh_mins, minimized);
             }
             #[cfg(not(windows))]
             bg.context_menu(|ui| {
-                action = egui_menu(ui, zoom, refresh_mins, minimized);
+                action = egui_menu(ui, &providers, zoom, refresh_mins, minimized);
                 if action.is_some() {
                     ui.close();
                 }
@@ -1036,15 +1233,21 @@ impl eframe::App for App {
             // Wrap the content so its real size can be measured: the panel's own
             // min_rect is always expanded to fill the window.
             let content = if minimized {
-                ui.horizontal(|ui| compact_row(ui, &self.slots, &self.logos))
+                ui.horizontal(|ui| {
+                    compact_row(ui, &providers, &self.slots, &self.logos, &bindings, empty)
+                })
             } else {
                 ui.vertical(|ui| {
-                    for (i, p) in Provider::ALL.iter().enumerate() {
+                    if providers.is_empty() {
+                        ui.label(RichText::new(empty).size(10.5).color(MUTED));
+                    }
+                    for (i, p) in providers.iter().enumerate() {
                         if i > 0 {
                             ui.add_space(5.0);
                         }
-                        let slot = self.slots.get(p).cloned().unwrap_or_default();
-                        provider_block(ui, *p, &slot, &self.logos);
+                        if let Some(slot) = self.slots.get(p) {
+                            provider_block(ui, *p, slot, &self.logos, bindings.get(p).copied());
+                        }
                     }
 
                     ui.add_space(4.0);
@@ -1062,7 +1265,7 @@ impl eframe::App for App {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let text = format!("${} / ${}", money(t.used), money(t.total));
                                 ui.label(RichText::new(text).size(10.5).color(TEXT))
-                                    .on_hover_text("Total across all three");
+                                    .on_hover_text("Total across all services");
                             });
                         }
                     });
