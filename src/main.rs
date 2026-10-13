@@ -1,37 +1,39 @@
 //! A tiny always-on-top, frameless, draggable widget that shows Copilot,
-//! Claude and Codex usage in dollars, refreshed every few minutes.
+//! Claude and Codex usage (dollars on business plans, 5-hour and weekly windows
+//! on personal ones), refreshed every few minutes.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod claude_estimate;
-mod claude_web;
-mod codex_estimate;
-mod config;
-mod estimate;
-mod estimate_history;
-#[cfg(target_os = "macos")]
-mod menubar;
-mod paths;
+mod limits;
 mod providers;
 mod renewal_lookup;
 mod timeutil;
+mod update;
 
 use config::Config;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
-use providers::{Cycle, FetchError, Meter, Problem, Provider, Unit, Usage, money, spend_meter};
-use std::collections::HashMap;
+use providers::{FetchError, Meter, Problem, Provider, Unit, Usage, money};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, local_when, now_unix, resets};
+use timeutil::{ago, now_unix, until, until_next_minute};
 
 const WIDTH: f32 = if cfg!(windows) { 320.0 } else { 270.0 };
 const MARGIN: i8 = 12;
 const MINI_MARGIN_X: i8 = 10;
 const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
+const RATIOS_KEY: &str = "ratios";
+const HIDDEN_KEY: &str = "hidden";
+/// Seconds the bar and window labels take to move over when the binding window changes.
+const SWITCH_SECS: f32 = 0.35;
+/// How far the window that is not the binding one fades towards the background.
+const FADE: f32 = 0.65;
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
 const SIZES: [f32; 8] = [0.25, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0];
@@ -51,7 +53,9 @@ const LABEL: Color32 = Color32::from_rgb(196, 199, 205);
 /// Supporting details: plan, renewal, countdowns, notes.
 const META: Color32 = Color32::from_rgb(150, 155, 165);
 const MUTED: Color32 = Color32::from_gray(135);
-const TRACK: Color32 = Color32::from_rgb(48, 50, 56);
+/// Window labels ("5h", "wk") next to a personal plan's percentages.
+const LIGHT: Color32 = Color32::from_gray(175);
+const TRACK: Color32 = Color32::from_gray(58);
 const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
@@ -63,14 +67,23 @@ struct Update {
 
 #[derive(Clone, Default)]
 struct Slot {
-    plan: Option<String>,
-    cycle: Option<Cycle>,
-    note: Option<String>,
-    estimated: Vec<String>,
-    meters: Option<Vec<Meter>>,
+    usage: Option<Usage>,
     error: Option<FetchError>,
     updated: Option<i64>,
     loading: bool,
+}
+
+impl Slot {
+    /// A service with no paid plan on this machine is left out. Others are
+    /// hidden only until their first fetch answers, so a service the user does
+    /// not have never flashes up.
+    fn visible(&self) -> bool {
+        let absent = self
+            .error
+            .as_ref()
+            .is_some_and(|e| e.problem == Problem::NotAvailable);
+        !absent && (self.usage.is_some() || self.error.is_some())
+    }
 }
 
 struct App {
@@ -84,17 +97,14 @@ struct App {
     /// Compact single-line view. Persisted, so the widget reopens the way it was left.
     minimized: bool,
     logos: HashMap<Provider, egui::TextureHandle>,
-    opacity: u32,
-    /// Decimal places for percentages.
-    precision: usize,
-    config_error: Option<String>,
-    renewal_lookup: Option<renewal_lookup::Lookup>,
-    renewal_error: Option<String>,
-    renewal_applied_at: Option<std::time::Instant>,
-    #[cfg(target_os = "macos")]
-    menubar: Option<menubar::MenuBar>,
-    #[cfg(target_os = "macos")]
-    shown: bool,
+    /// Learnt weekly cost of the 5-hour window per service name, for personal
+    /// plans. Persisted, since it takes a while to learn.
+    ratios: HashMap<String, limits::Ratio>,
+    /// Names of services the user has unticked in the menu. They are still
+    /// fetched, so ticking one again shows it straight away. Persisted.
+    hidden: HashSet<String>,
+    /// Set once an update has been installed; the UI thread then restarts.
+    restart: Arc<AtomicBool>,
 }
 
 impl App {
@@ -118,13 +128,11 @@ impl App {
         let precision = config.precision.min(3);
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
-        spawn_worker(
-            cc.egui_ctx.clone(),
-            tx,
-            refresh_rx,
-            providers.clone(),
-            config,
-        );
+        spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
+        let restart = Arc::new(AtomicBool::new(false));
+        if update::auto_enabled() {
+            spawn_auto_update(cc.egui_ctx.clone(), restart.clone());
+        }
         // Selectable labels grab clicks and drags, so right-click and drag-to-move
         // would not work over text.
         cc.egui_ctx
@@ -133,6 +141,14 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, MINIMIZED_KEY))
             .unwrap_or(false);
+        let ratios = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, RATIOS_KEY))
+            .unwrap_or_default();
+        let hidden = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, HIDDEN_KEY))
+            .unwrap_or_default();
 
         let slots = providers
             .iter()
@@ -158,46 +174,33 @@ impl App {
             settled: false,
             minimized,
             logos: load_logos(&cc.egui_ctx),
-            opacity,
-            precision,
-            config_error,
-            renewal_lookup: None,
-            renewal_error: None,
-            renewal_applied_at: None,
-            #[cfg(target_os = "macos")]
-            menubar,
-            #[cfg(target_os = "macos")]
-            shown: true,
+            ratios,
+            hidden,
+            restart,
         }
     }
 
-    /// An App with no window and no menu bar, plus the far ends of its channels.
-    #[cfg(test)]
-    fn for_test(providers: Vec<Provider>) -> (Self, Sender<Update>, Receiver<()>) {
-        let (updates, rx) = mpsc::channel();
-        let (refresh_tx, refresh_rx) = mpsc::channel();
-        let slots = providers.iter().map(|p| (*p, Slot::default())).collect();
-        let app = Self {
-            providers,
-            slots,
-            rx,
-            refresh_tx,
-            interval: Duration::from_secs(300),
-            opacity: 100,
-            precision: 1,
-            config_error: None,
-            renewal_lookup: None,
-            renewal_error: None,
-            renewal_applied_at: None,
-            settled: true,
-            minimized: false,
-            logos: HashMap::new(),
-            #[cfg(target_os = "macos")]
-            menubar: None,
-            #[cfg(target_os = "macos")]
-            shown: true,
-        };
-        (app, updates, refresh_rx)
+    /// Runs a check from the menu in the background and reports the result.
+    fn check_for_updates(&self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let restart = self.restart.clone();
+        std::thread::spawn(move || match update::check_and_install() {
+            Ok(update::Outcome::UpToDate) => message_box(
+                &format!("You have the latest version ({}).", update::CURRENT),
+                false,
+            ),
+            Ok(update::Outcome::NotReady(v)) => message_box(
+                &format!(
+                    "Version {v} is out, but its download is not ready yet. Try again in a few minutes."
+                ),
+                false,
+            ),
+            Ok(update::Outcome::Installed) => {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+            }
+            Err(e) => message_box(&format!("Could not check for updates: {e}"), true),
+        });
     }
 
     fn refresh_now(&mut self) {
@@ -265,28 +268,23 @@ impl App {
             slot.updated = Some(u.at);
             match u.result {
                 Ok(usage) => {
-                    slot.plan = usage.plan;
-                    let monthly_claude =
-                        u.provider == Provider::Claude && spend_meter(&usage.meters).is_some();
-                    if monthly_claude {
-                        self.renewal_lookup = None;
-                        self.renewal_error = None;
-                        self.renewal_applied_at = None;
-                    }
-                    if u.provider != Provider::Claude
-                        || self
-                            .renewal_applied_at
-                            .is_none_or(|applied| u.started > applied)
+                    // Personal plans learn how their two windows relate.
+                    if let Usage {
+                        meters,
+                        personal: true,
+                    } = &usage
+                        && let [five_hour, week] = meters.as_slice()
                     {
-                        slot.cycle = usage.cycle;
+                        self.ratios
+                            .entry(u.provider.name().to_string())
+                            .or_default()
+                            .observe(five_hour, week);
                     }
-                    slot.note = usage.note;
-                    slot.estimated = usage.estimated;
-                    slot.meters = Some(usage.meters);
+                    slot.usage = Some(usage);
                     slot.error = None;
                 }
                 Err(e) => {
-                    slot.meters = None;
+                    slot.usage = None;
                     slot.error = Some(e);
                 }
             }
@@ -315,26 +313,87 @@ impl App {
         }
     }
 
+    /// For a personal plan with 5-hour and weekly windows, the one that runs out
+    /// first this session (0 or 1).
+    fn binding(&self, p: Provider) -> Option<usize> {
+        let usage = self.slots.get(&p)?.usage.as_ref().filter(|u| u.personal)?;
+        let [five_hour, week] = usage.meters.as_slice() else {
+            return None;
+        };
+        let k = self
+            .ratios
+            .get(p.name())
+            .and_then(limits::Ratio::weekly_per_five_hour);
+        Some(limits::binding(five_hour, week, k))
+    }
+
+    /// The services the account has, in display order. These are listed in the
+    /// menu, ticked or not.
+    fn found(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|p| self.slots.get(p).is_some_and(Slot::visible))
+            .collect()
+    }
+
+    /// The found services the user has not unticked.
+    fn shown(&self) -> Vec<Provider> {
+        let mut found = self.found();
+        found.retain(|p| !self.hidden.contains(p.name()));
+        found
+    }
+
+    /// What the widget says when it has no service to show, in the full and the
+    /// minimized view.
+    fn empty_text(&self, found: &[Provider]) -> (&'static str, &'static str) {
+        if !found.is_empty() {
+            (
+                "All services are hidden. Right-click to show them.",
+                "All hidden",
+            )
+        } else if self.all_fetched() {
+            (
+                "No paid Copilot, Claude or Codex plan found. Sign in with gh, claude or codex and it shows up at the next refresh.",
+                "No plans found",
+            )
+        } else {
+            ("…", "…")
+        }
+    }
+
+    fn toggle(&mut self, p: Provider) {
+        if !self.hidden.remove(p.name()) {
+            self.hidden.insert(p.name().to_string());
+        }
+    }
+
+    /// True once every service has answered at least once.
+    fn all_fetched(&self) -> bool {
+        self.slots.values().all(|s| s.updated.is_some())
+    }
+
     fn last_updated(&self) -> Option<i64> {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
-    /// Sum of the dollar-denominated meters across providers. None unless there
-    /// are several, since a single one would just repeat its own row.
-    fn total(&self) -> Option<Meter> {
+    /// Sum of every dollar-denominated meter across the shown providers. Only when
+    /// at least two have one, since otherwise it repeats that provider's line.
+    fn total(&self, shown: &[Provider]) -> Option<Meter> {
         let mut used = 0.0;
         let mut total = 0.0;
-        let mut count = 0;
-        for slot in self.slots.values() {
-            for m in slot.meters.iter().flatten() {
+        let mut providers = 0;
+        for slot in shown.iter().filter_map(|p| self.slots.get(p)) {
+            let mut any = false;
+            for m in slot.usage.iter().flat_map(|u| &u.meters) {
                 if m.unit == Unit::Dollars {
                     used += m.used;
                     total += m.total;
                     count += 1;
                 }
             }
+            providers += usize::from(any);
         }
-        (count > 1).then(|| Meter {
+        (providers >= 2).then(|| Meter {
             label: None,
             used,
             total,
@@ -383,6 +442,22 @@ fn spawn_worker(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             while refresh_rx.try_recv().is_ok() {}
+        }
+    });
+}
+
+/// Checks for updates shortly after start and then every few hours, installing
+/// any newer release. Failures are ignored and retried at the next check.
+fn spawn_auto_update(ctx: egui::Context, restart: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(update::FIRST_CHECK_AFTER);
+        loop {
+            if let Ok(update::Outcome::Installed) = update::check_and_install() {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+                return;
+            }
+            std::thread::sleep(update::CHECK_EVERY);
         }
     });
 }
@@ -713,6 +788,18 @@ fn level_color(percent: f64) -> Color32 {
     }
 }
 
+/// `a` moved towards `b` by `t` (0 to 1).
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// `color` at `weight` (0 to 1) of full strength: a window that is not the
+/// binding one fades towards the background, as if disabled.
+fn weighted(color: Color32, weight: f32) -> Color32 {
+    mix(mix(color, BG, FADE), color, weight)
+}
+
 fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
     let painter = ui.painter();
@@ -771,70 +858,79 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated:
     });
 }
 
-/// The meter of a service that only reports spend with no sub-label (Copilot, or
-/// Claude and Codex on usage-based plans).
-fn spend_only(slot: &Slot) -> Option<&Meter> {
-    spend_meter(slot.meters.as_deref()?).filter(|m| m.total > 0.0)
-}
-
-struct RenewalButton<'a> {
-    running: bool,
-    error: Option<&'a str>,
-    clicked: bool,
-    cancelled: bool,
-}
-
-impl RenewalButton<'_> {
-    fn show(&mut self, ui: &mut egui::Ui, provider: Provider, slot: &Slot) {
-        if provider != Provider::Claude
-            || slot.cycle.is_some()
-            || slot.meters.as_deref().and_then(spend_meter).is_some()
-        {
-            return;
-        }
-        if self.running {
-            let spinner = ui.add(egui::Spinner::new().size(10.0).color(MUTED));
-            let response =
-                ui.interact(spinner.rect, ui.id().with("cancel-renewal"), Sense::click());
-            self.context_menu(&response);
-            response.on_hover_text(
-                "Looking up renewal — complete sign-in in Chrome. Right-click to cancel.",
-            );
-        } else {
-            let tooltip = self.error.map_or_else(
-                || "Look up Claude renewal in Chrome".to_string(),
-                |error| format!("Renewal lookup failed: {error}\nClick to retry"),
-            );
-            self.clicked |= refresh_button(ui, &tooltip, self.error.is_some());
-        }
-    }
-
-    fn context_menu(&mut self, response: &egui::Response) {
-        response.context_menu(|ui| {
-            let label = if self.running {
-                "Looking up…"
-            } else {
-                "Look up renewal"
-            };
-            if ui
-                .add_enabled(!self.running, egui::Button::new(label))
-                .clicked()
-            {
-                self.clicked = true;
-                ui.close();
+/// "42% 5h | 17% wk" right-aligned: each window's percentage coloured by level,
+/// followed by its label, each faded by its weight (see `weighted`).
+fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        // Laid out right to left, so the last window goes first.
+        for (i, (m, &w)) in meters.iter().zip(weights).rev().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("|").size(size).color(MUTED));
             }
-            if self.running {
-                ui.label("Complete sign-in in Chrome");
-                if ui.button("Cancel lookup").clicked() {
-                    self.cancelled = true;
-                    ui.close();
+            // One group per window, so its tooltip covers the label as well.
+            let window = ui.scope(|ui| {
+                if let Some(label) = &m.label {
+                    ui.label(RichText::new(label).size(size).color(weighted(LIGHT, w)));
                 }
+                let pct = m.percent();
+                ui.label(
+                    RichText::new(format!("{pct:.0}%"))
+                        .size(size)
+                        .strong()
+                        .color(weighted(level_color(pct), w)),
+                );
+            });
+            if let Some(text) = reset_tooltip(m) {
+                window.response.on_hover_text(text);
             }
-            if let Some(error) = self.error {
-                ui.label(RichText::new(error).color(ERR));
-            }
-        });
+        }
+    });
+}
+
+fn reset_tooltip(m: &Meter) -> Option<String> {
+    let at = m.resets_at?;
+    if m.label.as_deref() == Some("5h") {
+        return Some(format!("Resets in {}", until(at)));
     }
+    Some(format!("Resets on {}", timeutil::local_datetime(at)?))
+}
+
+/// Eases from the values last shown to `target` over `SWITCH_SECS` whenever the
+/// target changes, picking up from mid-way if it changes again. The first
+/// target seen for an id is shown as-is.
+fn ease<const N: usize>(ui: &egui::Ui, id: egui::Id, target: [f32; N]) -> [f32; N] {
+    #[derive(Clone, Copy)]
+    struct Tween<const N: usize> {
+        from: [f32; N],
+        to: [f32; N],
+        start: f64,
+    }
+    let at = |tw: &Tween<N>, now: f64| {
+        let t = ((now - tw.start) as f32 / SWITCH_SECS).clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        std::array::from_fn(|i| tw.from[i] + (tw.to[i] - tw.from[i]) * t)
+    };
+
+    let ctx = ui.ctx();
+    let now = ui.input(|i| i.time);
+    let mut tw = ctx.data(|d| d.get_temp::<Tween<N>>(id)).unwrap_or(Tween {
+        from: target,
+        to: target,
+        start: now,
+    });
+    if tw.to != target {
+        tw = Tween {
+            from: at(&tw, now),
+            to: target,
+            start: now,
+        };
+    }
+    ctx.data_mut(|d| d.insert_temp(id, tw));
+    if now - tw.start < f64::from(SWITCH_SECS) {
+        ctx.request_repaint();
+    }
+    at(&tw, now)
 }
 
 fn provider_block(
@@ -844,28 +940,22 @@ fn provider_block(
     precision: usize,
     renewal: &mut RenewalButton<'_>,
     logos: &HashMap<Provider, egui::TextureHandle>,
+    binding: Option<usize>,
 ) {
-    if let Some(m) = spend_only(slot) {
-        spend_row(ui, p, slot, m, precision, logos);
-    } else {
-        header(ui, p, slot, renewal, logos);
-        ui.add_space(6.0);
-        match (&slot.meters, &slot.error) {
-            (Some(meters), _) => meters_block(ui, meters, slot, precision),
-            // The reason is in the header.
-            (None, Some(_)) => bar(ui, 0.0, MUTED),
-            (None, None) => {
-                ui.label(RichText::new("loading…").size(10.5).color(MUTED));
-            }
-        }
-    }
-    if slot.meters.is_some()
-        && let Some(note) = &slot.note
-    {
-        ui.add_space(5.0);
-        ui.label(RichText::new(note).size(10.0).color(META));
-    }
-}
+    let usage = slot.usage.as_ref();
+    // A personal plan's windows all go on the header line.
+    let personal = usage.filter(|u| u.personal).map(|u| u.meters.as_slice());
+    let single = usage
+        .filter(|u| !u.personal && u.meters.len() == 1 && u.meters[0].label.is_none())
+        .map(|u| &u.meters[0]);
+    // Where the bar and the bright label sit between the 5-hour and weekly window.
+    let position = binding.map(|b| ease(ui, egui::Id::new(("binding", p.name())), [b as f32])[0]);
+    let weights: Vec<f32> = match position {
+        Some(t) => vec![1.0 - t, t],
+        None => vec![1.0; personal.map_or(0, <[Meter]>::len)],
+    };
+    // The binding window, whose reset is counted down next to the name.
+    let selected = personal.and_then(|m| m.get(binding.unwrap_or(0)));
 
 /// Name, amount and percentage on one line over one bar, as in the original
 /// widget. The plan and billing cycle move to the name's hover text.
@@ -885,193 +975,71 @@ fn spend_row(
         }
         // Usage-based plans reset monthly and need no subscription renewal lookup.
         provider_logo(ui, p, logos);
-        let response = name_link(ui, p);
-        if !hover.is_empty() {
-            response.on_hover_text(hover.join("\n"));
-        }
-        if slot.loading {
-            ui.add(egui::Spinner::new().size(10.0).color(MUTED));
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let col = Vec2::new(PCT_COL, row.y);
-            ui.allocate_ui_with_layout(col, Layout::right_to_left(Align::Center), |ui| {
-                ui.label(percent_text(m, 11.0, precision, false));
-            });
-            ui.label(RichText::new(m.summary()).size(11.0).color(TEXT));
-        });
-    });
-    ui.add_space(3.0);
-    bar(ui, m.fraction(), level_color(m.percent()));
-}
-
-/// Several usage windows sit side by side, each with its reset on its label line.
-/// A lone window, spend and "unlimited" get a full-width row.
-fn meters_block(ui: &mut egui::Ui, meters: &[Meter], slot: &Slot, precision: usize) {
-    let estimated = |m: &Meter| m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
-    let is_window = |m: &Meter| m.unit == Unit::Percent && m.total > 0.0;
-    let windows: Vec<&Meter> = meters.iter().filter(|m| is_window(m)).collect();
-    let side_by_side = windows.len() > 1;
-    // Two or four windows split into pairs; otherwise rows of three.
-    let cols = if matches!(windows.len(), 2 | 4) { 2 } else { 3 };
-
-    let mut blocks = 0;
-    if side_by_side {
-        for chunk in windows.chunks(cols) {
-            if blocks > 0 {
-                ui.add_space(6.0);
-            }
-            blocks += 1;
-            window_cells(ui, chunk, cols, precision, &estimated);
-        }
-    }
-    for m in meters.iter().filter(|m| !(side_by_side && is_window(m))) {
-        if blocks > 0 {
-            ui.add_space(6.0);
-        }
-        blocks += 1;
-        meter_row(ui, m, precision, estimated(m));
-    }
-}
-
-fn window_cells(
-    ui: &mut egui::Ui,
-    windows: &[&Meter],
-    cols: usize,
-    precision: usize,
-    estimated: &dyn Fn(&Meter) -> bool,
-) {
-    let width = (ui.available_width() - CELL_GAP * (cols - 1) as f32) / cols as f32;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = CELL_GAP;
-        for m in windows {
-            ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(width);
-                window_cell(ui, m, precision, estimated(m));
-            });
-        }
-    });
-}
-
-/// Label and reset time on one line, then the bar and percentage.
-fn window_cell(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
-    let line = Vec2::new(ui.available_width(), 12.0);
-    ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Max), |ui| {
-        if let Some(label) = &m.label {
-            ui.label(RichText::new(label).size(9.5).color(LABEL));
-        }
-        if let Some(ts) = m.resets_at {
-            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                ui.label(RichText::new(resets(ts)).size(9.0).color(META))
-                    .on_hover_text(local_when(ts));
-            });
-        }
-    });
-    ui.add_space(3.0);
-    bar(ui, m.fraction(), level_color(m.percent()));
-    ui.add_space(3.0);
-    let resp = ui.label(percent_text(m, 12.0, precision, estimated));
-    if estimated {
-        resp.on_hover_text(ESTIMATE_HOVER);
-    }
-}
-
-/// The service name, which opens its usage page when clicked.
-fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
-    let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-    let response = ui
-        .add(egui::Label::new(name).sense(Sense::click()))
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.clicked() {
-        open_url(p.url());
-    }
-    response
-}
-
-/// Service name, then plan and billing cycle in small text.
-fn header(
-    ui: &mut egui::Ui,
-    p: Provider,
-    slot: &Slot,
-    renewal: &mut RenewalButton<'_>,
-    logos: &HashMap<Provider, egui::TextureHandle>,
-) {
-    // A fixed-height, bottom-aligned row (`with_layout` would take all the height left).
-    let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
-        provider_logo(ui, p, logos);
-        name_link(ui, p);
-        renewal.show(ui, p, slot);
-        let mut info: Vec<String> = slot.plan.iter().cloned().collect();
-        let mut hover = None;
-        if let Some(c) = &slot.cycle {
-            // A countdown, recomputed every frame so it stays right as time passes.
-            info.push(format!(
-                "{} {}",
-                c.verb,
-                c.countdown(chrono::Local::now().date_naive())
-            ));
-            hover = Some(format!("{} {}", c.verb, c.when()));
-        }
-        if p == Provider::Claude && slot.cycle.is_some() {
-            if renewal.running {
-                info.push("looking up…".into());
-            } else if renewal.error.is_some() {
-                info.push("lookup failed".into());
-            }
-        }
-        if !info.is_empty() {
-            let font = egui::FontId::proportional(10.0);
-            let prefix_width = slot.plan.as_ref().map_or(0.0, |plan| {
-                ui.painter()
-                    .layout_no_wrap(format!("{plan} · "), font.clone(), META)
-                    .size()
-                    .x
-            });
-            let galley = ui.painter().layout_no_wrap(info.join(" · "), font, META);
-            let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
-            // egui aligns text boxes, not baselines: bottom-aligned, the smaller text
-            // sits 1pt below the name's baseline (measured), so lift it by that.
-            ui.painter()
-                .galley(rect.min - Vec2::new(0.0, 1.0), galley, META);
-            let resp = if p == Provider::Claude && slot.cycle.is_some() {
-                let renewal_rect =
-                    egui::Rect::from_min_max(rect.min + Vec2::new(prefix_width, 0.0), rect.max);
-                let response = ui.interact(
-                    renewal_rect,
-                    ui.id().with("claude-renewal"),
-                    Sense::click_and_drag(),
-                );
-                if response.drag_started_by(egui::PointerButton::Primary) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                renewal.context_menu(&response);
-                response.on_hover_text(
-                    renewal
-                        .error
-                        .unwrap_or("Right-click for renewal lookup actions"),
-                )
-            } else {
-                resp
-            };
-            if let Some(hover) = hover {
-                resp.on_hover_text(hover);
+        let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
+        ui.label(name);
+        if let Some(m) = selected
+            && let Some(at) = m.resets_at
+        {
+            let text = RichText::new(format!("({})", until(at))).size(11.0);
+            let countdown = ui.label(text.color(LIGHT));
+            if let Some(text) = reset_tooltip(m) {
+                countdown.on_hover_text(text);
             }
         }
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
+        }
+        if let Some(meters) = personal {
+            windows(ui, meters, &weights, 12.0);
+        } else if let Some(m) = single {
+            amounts(ui, m, 12.0);
         }
         if let Some(e) = &slot.error {
-            let color = if e.problem == Problem::NotAvailable {
-                MUTED
-            } else {
-                ERR
-            };
-            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                ui.label(RichText::new(e.problem.label()).size(12.0).color(color))
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(e.problem.label()).size(12.0).color(ERR))
                     .on_hover_text(&e.detail);
             });
         }
     });
+
+    if slot.error.is_some() {
+        bar(ui, 0.0, MUTED);
+        return;
+    }
+
+    // A personal plan's bar follows its binding window, sliding from what it
+    // showed before to the new window's level when that changes.
+    if let Some(m) = selected.filter(|_| binding.is_some()) {
+        let c = level_color(m.percent());
+        let target = [m.fraction(), c.r().into(), c.g().into(), c.b().into()];
+        let [fraction, r, g, b] = ease(ui, egui::Id::new(("bar", p.name())), target);
+        bar(ui, fraction, Color32::from_rgb(r as u8, g as u8, b as u8));
+        return;
+    }
+    let header = personal.and_then(<[Meter]>::first).or(single);
+    match (header, usage) {
+        (Some(m), _) => {
+            if m.total > 0.0 {
+                bar(ui, m.fraction(), level_color(m.percent()));
+            }
+        }
+        (None, Some(usage)) => {
+            for m in &usage.meters {
+                ui.horizontal(|ui| {
+                    if let Some(label) = &m.label {
+                        ui.label(RichText::new(label).size(11.0).color(MUTED));
+                    }
+                    amounts(ui, m, 12.0);
+                });
+                if m.total > 0.0 {
+                    bar(ui, m.fraction(), level_color(m.percent()));
+                }
+            }
+        }
+        (None, None) => {
+            ui.label(RichText::new("loading…").size(10.5).color(MUTED));
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1079,8 +1047,9 @@ enum MenuAction {
     Refresh,
     ToggleMinimized,
     Open(Provider),
+    Toggle(Provider),
     Size(f32),
-    EditConfig,
+    CheckForUpdates,
     Quit,
 }
 
@@ -1093,7 +1062,8 @@ fn minimize_label(minimized: bool) -> &'static str {
 #[cfg(windows)]
 fn native_menu(
     frame: &eframe::Frame,
-    providers: &[Provider],
+    found: &[Provider],
+    shown: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -1133,8 +1103,9 @@ fn native_menu(
     const ID_REFRESH: usize = 1;
     const ID_QUIT: usize = 2;
     const ID_MINIMIZE: usize = 3;
-    const ID_EDIT_CONFIG: usize = 4;
+    const ID_UPDATE: usize = 4;
     const ID_OPEN: usize = 10;
+    const ID_TOGGLE: usize = 20;
     const ID_SIZE: usize = 100;
 
     let hwnd = hwnd(frame)?;
@@ -1146,15 +1117,29 @@ fn native_menu(
         add(menu, MF_STRING, ID_REFRESH, "Refresh now");
         add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
         add(menu, MF_SEPARATOR, 0, "");
-        for (i, p) in providers.iter().enumerate() {
-            add(
-                menu,
-                MF_STRING,
-                ID_OPEN + i,
-                &format!("Open {} usage", p.name()),
-            );
+        if !found.is_empty() {
+            add(menu, MF_STRING | MF_GRAYED, 0, "Show");
+            for (i, p) in Provider::ALL.iter().enumerate() {
+                if found.contains(p) {
+                    let checked = if shown.contains(p) { MF_CHECKED } else { 0 };
+                    add(menu, MF_STRING | checked, ID_TOGGLE + i, p.name());
+                }
+            }
+            add(menu, MF_SEPARATOR, 0, "");
         }
-        add(menu, MF_SEPARATOR, 0, "");
+        for (i, p) in Provider::ALL.iter().enumerate() {
+            if found.contains(p) {
+                add(
+                    menu,
+                    MF_STRING,
+                    ID_OPEN + i,
+                    &format!("Open {} usage", p.name()),
+                );
+            }
+        }
+        if !found.is_empty() {
+            add(menu, MF_SEPARATOR, 0, "");
+        }
         // Owned by `menu` once appended, so destroyed along with it.
         let sizes = CreatePopupMenu();
         for (i, z) in SIZES.iter().enumerate() {
@@ -1171,10 +1156,12 @@ fn native_menu(
             );
         }
         add(menu, MF_POPUP, sizes as usize, "Size");
+        add(menu, MF_STRING, ID_UPDATE, "Check for updates");
         add(menu, MF_SEPARATOR, 0, "");
         let note = format!("Refreshes every {refresh_mins} min");
         add(menu, MF_STRING | MF_GRAYED, 0, &note);
-        add(menu, MF_STRING, ID_EDIT_CONFIG, "Edit config");
+        let version = format!("Version {}", update::CURRENT);
+        add(menu, MF_STRING | MF_GRAYED, 0, &version);
         add(menu, MF_STRING, ID_QUIT, "Quit");
 
         let mut pt = Point::default();
@@ -1197,10 +1184,13 @@ fn native_menu(
         match id {
             ID_REFRESH => Some(MenuAction::Refresh),
             ID_MINIMIZE => Some(MenuAction::ToggleMinimized),
-            ID_EDIT_CONFIG => Some(MenuAction::EditConfig),
+            ID_UPDATE => Some(MenuAction::CheckForUpdates),
             ID_QUIT => Some(MenuAction::Quit),
             _ if (ID_OPEN..ID_OPEN + providers.len()).contains(&id) => {
                 Some(MenuAction::Open(providers[id - ID_OPEN]))
+            }
+            _ if (ID_TOGGLE..ID_TOGGLE + Provider::ALL.len()).contains(&id) => {
+                Some(MenuAction::Toggle(Provider::ALL[id - ID_TOGGLE]))
             }
             _ if (ID_SIZE..ID_SIZE + SIZES.len()).contains(&id) => {
                 Some(MenuAction::Size(SIZES[id - ID_SIZE]))
@@ -1238,7 +1228,8 @@ fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, mini
 #[cfg(not(windows))]
 fn egui_menu(
     ui: &mut egui::Ui,
-    providers: &[Provider],
+    found: &[Provider],
+    shown: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -1251,12 +1242,24 @@ fn egui_menu(
         action = Some(MenuAction::ToggleMinimized);
     }
     ui.separator();
-    for &p in providers {
+    if !found.is_empty() {
+        ui.label(RichText::new("show").size(10.0).color(MUTED));
+        for &p in found {
+            let mut checked = shown.contains(&p);
+            if ui.checkbox(&mut checked, p.name()).clicked() {
+                action = Some(MenuAction::Toggle(p));
+            }
+        }
+        ui.separator();
+    }
+    for &p in found {
         if ui.button(format!("Open {} usage", p.name())).clicked() {
             action = Some(MenuAction::Open(p));
         }
     }
-    ui.separator();
+    if !found.is_empty() {
+        ui.separator();
+    }
     ui.menu_button("Size", |ui| {
         for z in SIZES {
             let label = format!("{:.0}%", z * 100.0);
@@ -1265,15 +1268,20 @@ fn egui_menu(
             }
         }
     });
+    if ui.button("Check for updates").clicked() {
+        action = Some(MenuAction::CheckForUpdates);
+    }
     ui.separator();
     ui.label(
         RichText::new(format!("refreshes every {refresh_mins} min"))
             .size(10.0)
             .color(MUTED),
     );
-    if ui.button("Edit config").clicked() {
-        action = Some(MenuAction::EditConfig);
-    }
+    ui.label(
+        RichText::new(format!("version {}", update::CURRENT))
+            .size(10.0)
+            .color(MUTED),
+    );
     if ui.button("Quit").clicked() {
         action = Some(MenuAction::Quit);
     }
@@ -1368,32 +1376,34 @@ fn compact_row(
     providers: &[Provider],
     slots: &HashMap<Provider, Slot>,
     logos: &HashMap<Provider, egui::TextureHandle>,
-    precision: usize,
+    bindings: &HashMap<Provider, usize>,
+    empty: &str,
 ) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    if providers.is_empty() {
+        ui.label(RichText::new(empty).size(11.5).color(MUTED));
+    }
     for (i, p) in providers.iter().enumerate() {
         if i > 0 {
             ui.add_space(8.0);
         }
-        let slot = slots.get(p).cloned().unwrap_or_default();
+        let Some(slot) = slots.get(p) else {
+            continue;
+        };
         provider_logo(ui, *p, logos);
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
-        // The most-used meter is the one that matters when space is this tight.
-        let top = slot
-            .meters
-            .iter()
-            .flatten()
-            .filter(|m| m.total > 0.0)
-            .max_by(|a, b| a.percent().total_cmp(&b.percent()));
-        let text = match (top, &slot.error) {
-            (Some(m), _) => {
-                let estimated = m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
-                RichText::new(percent_label(m.percent(), precision, estimated))
-                    .color(level_color(m.percent()))
-            }
-            (None, Some(e)) if e.problem == Problem::NotAvailable => {
-                RichText::new("N/A").color(MUTED)
-            }
+        // The meter that matters when space is this tight: the binding window on
+        // a personal plan, otherwise the most-used one.
+        let meters = slot.usage.iter().flat_map(|u| &u.meters);
+        let pct = match bindings.get(p) {
+            Some(&b) => meters.clone().nth(b).map(Meter::percent),
+            None => meters
+                .filter(|m| m.total > 0.0)
+                .map(Meter::percent)
+                .reduce(f64::max),
+        };
+        let text = match (pct, &slot.error) {
+            (Some(pct), _) => RichText::new(format!("{pct:.0}%")).color(level_color(pct)),
             (None, Some(_)) => RichText::new("!").color(ERR),
             (None, None) => RichText::new("…").color(MUTED),
         };
@@ -1481,6 +1491,8 @@ fn refresh_button(ui: &mut egui::Ui, tooltip: &str, error: bool) -> bool {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
+        eframe::set_value(storage, RATIOS_KEY, &self.ratios);
+        eframe::set_value(storage, HIDDEN_KEY, &self.hidden);
     }
 
     /// Runs before every `ui` pass, and is all that runs while the widget is
@@ -1505,7 +1517,9 @@ impl eframe::App for App {
         // window styles whenever its own flags change (focus, level, visibility).
         apply_window_style(frame, self.opacity);
         let ctx = root.ctx().clone();
-        ctx.request_repaint_after(Duration::from_secs(30));
+        // Repaints only to keep the text current: "updated 5m ago" every 30s, and
+        // on the minute so a reset countdown ticks over on time.
+        ctx.request_repaint_after(until_next_minute().min(Duration::from_secs(30)));
         if !self.settled {
             self.settled = settle_window(frame);
             if !self.settled {
@@ -1528,22 +1542,13 @@ impl eframe::App for App {
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
         let minimized = self.minimized;
-        let mut resized = false;
-        let mut renewal = RenewalButton {
-            running: self.renewal_lookup.is_some(),
-            error: self.renewal_error.as_deref(),
-            clicked: false,
-            cancelled: false,
-        };
-
-        // Checked on the raw pointer so a right-click over any widget counts.
-        let right_clicked = ctx.input(|i| i.pointer.button_clicked(PointerButton::Secondary));
-        // A native popup menu where there is one (Windows, and macOS with its menu
-        // bar icon), since an egui menu is clipped to this small window.
-        #[cfg(target_os = "macos")]
-        let native_menu_available = self.menubar.is_some();
-        #[cfg(not(target_os = "macos"))]
-        let native_menu_available = cfg!(windows);
+        let found = self.found();
+        let providers = self.shown();
+        let bindings: HashMap<Provider, usize> = providers
+            .iter()
+            .filter_map(|&p| Some((p, self.binding(p)?)))
+            .collect();
+        let (empty, empty_compact) = self.empty_text(&found);
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -1551,15 +1556,20 @@ impl eframe::App for App {
             if bg.drag_started_by(PointerButton::Primary) {
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
-            #[cfg(not(windows))]
-            if !native_menu_available {
-                bg.context_menu(|ui| {
-                    action = egui_menu(ui, &self.providers, zoom, refresh_mins, minimized);
-                    if action.is_some() {
-                        ui.close();
-                    }
-                });
+            // An egui menu is clipped to this small window, so Windows gets a
+            // native popup menu that can extend past it.
+            #[cfg(windows)]
+            // Checked on the raw pointer so a right-click over any widget counts.
+            if ui.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
+                action = native_menu(frame, &found, &providers, zoom, refresh_mins, minimized);
             }
+            #[cfg(not(windows))]
+            bg.context_menu(|ui| {
+                action = egui_menu(ui, &found, &providers, zoom, refresh_mins, minimized);
+                if action.is_some() {
+                    ui.close();
+                }
+            });
 
             // Vertical gaps are set explicitly so they can differ by role: tight within
             // a meter, looser between meters, widest between services.
@@ -1571,35 +1581,25 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     compact_row(
                         ui,
-                        &self.providers,
+                        &providers,
                         &self.slots,
                         &self.logos,
-                        self.precision,
+                        &bindings,
+                        empty_compact,
                     )
                 })
             } else {
                 ui.vertical(|ui| {
-                    for (i, p) in self.providers.iter().enumerate() {
-                        let slot = self.slots.get(p).cloned().unwrap_or_default();
+                    if providers.is_empty() {
+                        ui.label(RichText::new(empty).size(10.5).color(MUTED));
+                    }
+                    for (i, p) in providers.iter().enumerate() {
                         if i > 0 {
-                            // One-line spend rows stack a little tighter, as in the original.
-                            ui.add_space(if spend_only(&slot).is_some() {
-                                10.0
-                            } else {
-                                12.0
-                            });
+                            ui.add_space(5.0);
                         }
-                        provider_block(ui, *p, &slot, self.precision, &mut renewal, &self.logos);
-                    }
-                    if self.providers.is_empty() {
-                        ui.label(
-                            RichText::new("Every service is disabled in the config.")
-                                .size(10.5)
-                                .color(MUTED),
-                        );
-                    }
-                    if let Some(err) = &self.config_error {
-                        ui.label(RichText::new(err).size(10.0).color(ERR));
+                        if let Some(slot) = self.slots.get(p) {
+                            provider_block(ui, *p, slot, &self.logos, bindings.get(p).copied());
+                        }
                     }
 
                     ui.add_space(10.0);
@@ -1613,11 +1613,11 @@ impl eframe::App for App {
                             .unwrap_or_else(|| "fetching…".into());
                         ui.label(RichText::new(updated).size(9.5).color(MUTED));
 
-                        if let Some(t) = self.total() {
+                        if let Some(t) = self.total(&providers) {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let text = format!("${} / ${}", money(t.used), money(t.total));
-                                ui.label(RichText::new(text).size(10.0).color(MUTED))
-                                    .on_hover_text("Total across services");
+                                ui.label(RichText::new(text).size(10.5).color(TEXT))
+                                    .on_hover_text("Total across all services");
                             });
                         }
                     });
@@ -1647,33 +1647,26 @@ impl eframe::App for App {
             }
         });
 
-        // Shown after the content, so a widget with its own context menu (the
-        // Claude renewal lookup) can take the click.
-        if native_menu_available && right_clicked && !egui::Popup::is_any_open(&ctx) {
-            #[cfg(windows)]
-            {
-                action = native_menu(frame, &self.providers, zoom, refresh_mins, minimized);
-            }
-            #[cfg(target_os = "macos")]
-            mac_menu(frame, self, zoom, refresh_mins, minimized);
-        }
-
-        let (lookup_renewal, cancel_renewal) = (renewal.clicked, renewal.cancelled);
-        if let Some(action) = action {
-            self.apply_action(action, &ctx);
-        }
-        if resized {
-            self.settled = false;
-        }
-        if cancel_renewal {
-            self.renewal_lookup = None;
+        match action {
+            Some(MenuAction::Refresh) => refresh = true,
+            Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
+            Some(MenuAction::Open(p)) => open_url(p.url()),
+            Some(MenuAction::Toggle(p)) => self.toggle(p),
+            Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
+            Some(MenuAction::CheckForUpdates) => self.check_for_updates(&ctx),
+            Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
+            None => {}
         }
         if refresh {
             self.refresh_now();
         }
-        if lookup_renewal {
-            self.renewal_error = None;
-            self.renewal_lookup = Some(renewal_lookup::start(ctx.clone()));
+        // Closing normally lets eframe save position and size before the new
+        // version, which waits for this process to exit, starts up.
+        if self.restart.swap(false, Ordering::SeqCst) {
+            match update::restart() {
+                Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                Err(e) => message_box(&format!("Updated, but {e}"), true),
+            }
         }
     }
 }
@@ -1805,6 +1798,7 @@ fn print_usage() {
 }
 
 fn main() -> eframe::Result {
+    let mut wait_for_exit = Duration::ZERO;
     match std::env::args().nth(1).as_deref() {
         Some("usage") => {
             print_usage();
@@ -1832,6 +1826,8 @@ fn main() -> eframe::Result {
         }
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
+        // Started by the previous version after an update; it is still closing.
+        Some("--updated") => wait_for_exit = Duration::from_secs(30),
         Some(flag) => {
             return finish(Err(format!(
                 "unknown argument {flag}
@@ -1842,14 +1838,10 @@ usage: usage-widget [usage | prices | config | --startup | --no-startup]"
         None => {}
     }
 
-    #[cfg(all(target_os = "macos", not(debug_assertions)))]
-    if detach_from_terminal() {
+    if !claim_single_instance(wait_for_exit) {
         return Ok(());
     }
-
-    if !claim_single_instance() {
-        return Ok(());
-    }
+    update::cleanup();
 
     let (config, config_error) = config::load();
     let options = eframe::NativeOptions {
@@ -1948,25 +1940,38 @@ fn set_opacity(hwnd: isize, percent: u32) {
 
 /// Holds a named mutex for the life of the process; returns false if another
 /// instance already holds it (e.g. launched again, or at login while running).
+/// Keeps trying for up to `wait`, for when the other instance is about to exit.
 #[cfg(windows)]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(wait: Duration) -> bool {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateMutexW(attrs: *const core::ffi::c_void, owner: i32, name: *const u16) -> isize;
         fn GetLastError() -> u32;
+        fn CloseHandle(handle: isize) -> i32;
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
     let name = wide(r"Local\usage-widget-single-instance");
-    // The handle is deliberately never closed; Windows releases it on exit.
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS
+    let start = std::time::Instant::now();
+    loop {
+        // The handle is deliberately never closed once claimed; Windows releases it on exit.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS {
+                return true;
+            }
+            // Our own handle would keep the mutex alive, so drop it before retrying.
+            CloseHandle(handle);
+        }
+        if start.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
 #[cfg(not(windows))]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(_wait: Duration) -> bool {
     true
 }
 
@@ -2028,19 +2033,7 @@ fn finish(result: Result<String, String>) -> eframe::Result {
         Ok(msg) => (msg.clone(), false),
         Err(msg) => (msg.clone(), true),
     };
-    #[cfg(windows)]
-    {
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
-        }
-        let text_w = wide(&text);
-        let caption_w = wide("usage-widget");
-        let icon = if is_err { 0x10 } else { 0x40 }; // MB_ICONERROR / MB_ICONINFORMATION
-        unsafe {
-            MessageBoxW(0, text_w.as_ptr(), caption_w.as_ptr(), icon);
-        }
-    }
+    message_box(&text, is_err);
     if is_err {
         eprintln!("{text}");
         std::process::exit(1);
@@ -2049,75 +2042,35 @@ fn finish(result: Result<String, String>) -> eframe::Result {
     Ok(())
 }
 
-#[cfg(test)]
-mod display_tests {
-    #[test]
-    fn estimates_do_not_round_into_the_next_reported_percent() {
-        for precision in [0, 1, 2] {
-            assert_eq!(super::percent_label(87.99, precision, true), "~87.99%");
-            assert_eq!(super::percent_label(87.999, precision, true), "~87.99%");
+/// Shows a message box on Windows; elsewhere the text goes to stderr.
+fn message_box(text: &str, is_err: bool) {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
         }
-        assert_eq!(super::percent_label(87.0, 0, true), "~87.00%");
-        assert_eq!(super::percent_label(87.0, 0, false), "87%");
-        assert_eq!(super::percent_label(87.999, 3, true), "~87.990%");
+        const MB_ICONERROR: u32 = 0x10;
+        const MB_ICONINFORMATION: u32 = 0x40;
+        // Without an owner window the box could open behind the always-on-top widget.
+        const MB_SETFOREGROUND: u32 = 0x1_0000;
+        const MB_TOPMOST: u32 = 0x4_0000;
+        let text_w = wide(text);
+        let caption_w = wide("usage-widget");
+        let icon = if is_err {
+            MB_ICONERROR
+        } else {
+            MB_ICONINFORMATION
+        };
+        unsafe {
+            MessageBoxW(
+                0,
+                text_w.as_ptr(),
+                caption_w.as_ptr(),
+                icon | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
     }
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod menu_tests {
-    use super::*;
-
-    /// The commands eframe would pick up, collected the way it collects them while
-    /// the widget is hidden and no egui pass runs.
-    fn commands(
-        ctx: &egui::Context,
-        app: &mut App,
-        action: menubar::Action,
-    ) -> Vec<ViewportCommand> {
-        ctx.run_logic(&egui::RawInput::default(), |ctx| {
-            app.apply_menu_action(action, ctx);
-        })
-        .viewport_commands
-        .get(&egui::ViewportId::ROOT)
-        .cloned()
-        .unwrap_or_default()
-    }
-
-    /// A hidden widget can be brought back: nothing but this runs while it is
-    /// hidden, so the command has to come from the menu action itself.
-    #[test]
-    fn toggling_hides_the_widget_and_shows_it_again() {
-        let ctx = egui::Context::default();
-        let (mut app, _updates, _refresh_rx) = App::for_test(vec![Provider::Claude]);
-
-        let hide = commands(&ctx, &mut app, menubar::Action::ToggleWidget);
-        assert!(!app.shown);
-        assert_eq!(hide, vec![ViewportCommand::Visible(false)]);
-
-        let show = commands(&ctx, &mut app, menubar::Action::ToggleWidget);
-        assert!(app.shown);
-        assert_eq!(show, vec![ViewportCommand::Visible(true)]);
-    }
-
-    #[test]
-    fn quitting_closes_the_window_even_while_hidden() {
-        let ctx = egui::Context::default();
-        let (mut app, _updates, _refresh_rx) = App::for_test(vec![Provider::Claude]);
-        app.shown = false;
-
-        let quit = commands(&ctx, &mut app, menubar::Action::Quit);
-
-        assert_eq!(quit, vec![ViewportCommand::Close]);
-    }
-
-    #[test]
-    fn refreshing_from_the_menu_asks_the_worker_for_new_numbers() {
-        let ctx = egui::Context::default();
-        let (mut app, _updates, refresh_rx) = App::for_test(vec![Provider::Claude]);
-
-        commands(&ctx, &mut app, menubar::Action::Refresh);
-
-        assert!(app.slots[&Provider::Claude].loading);
-        assert!(refresh_rx.try_recv().is_ok());
-    }
+    #[cfg(not(windows))]
+    eprintln!("{text}");
 }
