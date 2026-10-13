@@ -34,7 +34,7 @@ An invalid or past date shows a note while usage meters keep working.
 
 Subscription plans only; usage-based plans with a monthly spend cap reset monthly and
 show no lookup. When Claude's renewal date is missing, click the tiny circular-arrow
-icon beside **Claude**. Once the date is shown, right-click **Claude** and choose
+icon to the left of **Claude**. Once the date is shown, right-click **Claude** and choose
 **Look up renewal** instead. With Node.js and Chrome
 installed, it sets up the helper automatically, opens Chrome for sign-in, and
 applies the saved date without restarting the widget. The icon becomes a spinner

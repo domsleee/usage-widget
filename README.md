@@ -5,7 +5,7 @@ Claude and Codex allowance you have used.
 
 | Business plans | Personal subscriptions |
 | --- | --- |
-| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="262" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset countdown" src="docs/personal-plans.png" /> |
+| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="291" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset time" src="docs/personal-plans.png" /> |
 
 Minimized:
 
@@ -46,7 +46,8 @@ says so; run that CLI once and it picks the new token up.
   Business/Enterprise): dollars spent against your limit, with a total at the bottom.
 - **Personal plans** (Claude Pro/Max, ChatGPT Plus/Pro): your 5-hour and weekly usage.
   The one you will run out of first is highlighted, the bar shows it, and the timer
-  shows when it resets. Copilot Pro shows its monthly allowance.
+  shows when it resets: a countdown for the 5-hour window, or a date and local time
+  for the weekly window. Copilot Pro shows its monthly allowance.
 
 Bars go green, yellow and red as you use more. Hover a service name for its plan,
 renewal date, exact reset times and additional caps. Click its name to open usage.

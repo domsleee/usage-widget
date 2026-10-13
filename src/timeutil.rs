@@ -107,6 +107,15 @@ pub fn window_until(ts: i64) -> String {
     window_countdown((ts - now_unix()).max(0))
 }
 
+/// Local reset date and time for a weekly window, for example "17 Oct 2:30pm".
+pub fn reset_date_time(ts: i64) -> String {
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|t| t.format("%-d %b %-I:%M%P").to_string())
+        .unwrap_or_default()
+}
+
 /// dd:hh:mm, or hh:mm once under a day.
 fn window_countdown(secs: i64) -> String {
     let (days, hours, mins) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);

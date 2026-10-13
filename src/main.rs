@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, local_when, now_unix, until_next_minute, window_until};
+use timeutil::{ago, local_when, now_unix, reset_date_time, until_next_minute, window_until};
 
 const WIDTH: f32 = 250.0;
 const MARGIN: i8 = 12;
@@ -496,7 +496,7 @@ impl App {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
-    /// Add only the space needed for decimal readings and a renewal control.
+    /// Fit the readings and reset label; status icons use the existing logo space.
     fn card_width(&self, ctx: &egui::Context, shown: &[Provider]) -> f32 {
         ctx.fonts_mut(|fonts| {
             let mut text_width = |text: String, size| {
@@ -511,20 +511,11 @@ impl App {
                     let slot = self.slots.get(p)?;
                     let windows = slot.windows();
                     let mut width = 13.0 + 8.0 + text_width(p.name().into(), 13.0);
-                    if let Some(at) = windows
+                    if let Some(reset) = windows
                         .get(self.binding(*p).unwrap_or(0))
-                        .and_then(|m| m.resets_at)
+                        .and_then(|m| reset_label(m))
                     {
-                        width += 8.0 + text_width(format!("({})", window_until(at)), 11.0);
-                    }
-                    if *p == Provider::Claude
-                        && slot.cycle.is_none()
-                        && slot.meters.as_deref().and_then(spend_meter).is_none()
-                    {
-                        width += 8.0 + 13.0;
-                    }
-                    if slot.loading {
-                        width += 8.0 + 10.0;
+                        width += 8.0 + text_width(format!("({reset})"), 11.0);
                     }
                     if !windows.is_empty() {
                         width += 8.0;
@@ -1099,6 +1090,16 @@ fn usage_hover(slot: &Slot, precision: usize) -> String {
     lines.join("\n")
 }
 
+fn reset_label(meter: &Meter) -> Option<String> {
+    meter.resets_at.map(|at| {
+        if matches!(meter.label.as_deref(), Some("week" | "wk")) {
+            reset_date_time(at)
+        } else {
+            window_until(at)
+        }
+    })
+}
+
 /// Primary windows share one header, fading towards the window that binds first.
 fn windows(ui: &mut egui::Ui, meters: &[&Meter], weights: &[f32], slot: &Slot, precision: usize) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1186,23 +1187,26 @@ fn provider_block(
     let weights = position.map_or_else(|| vec![1.0; personal.len()], |t| vec![1.0 - t, t]);
 
     ui.horizontal(|ui| {
-        provider_logo(ui, p, logos);
+        if renewal.available(p, slot) {
+            renewal.show(ui, p, slot);
+        } else if slot.loading {
+            ui.add(egui::Spinner::new().size(13.0).color(MUTED));
+        } else {
+            provider_logo(ui, p, logos);
+        }
         let response = name_link(ui, p);
-        if p == Provider::Claude && slot.cycle.is_some() {
+        if p == Provider::Claude {
             renewal.context_menu(&response);
         }
         response.on_hover_text(usage_hover(slot, precision));
-        if let Some(at) = selected.and_then(|m| m.resets_at) {
-            ui.label(
-                RichText::new(format!("({})", window_until(at)))
-                    .size(11.0)
-                    .color(LIGHT),
-            )
-            .on_hover_text(format!("Until this window resets · {}", local_when(at)));
-        }
-        renewal.show(ui, p, slot);
-        if slot.loading {
-            ui.add(egui::Spinner::new().size(10.0).color(MUTED));
+        if let Some(meter) = selected
+            && let Some(reset) = reset_label(meter)
+        {
+            ui.label(RichText::new(format!("({reset})")).size(11.0).color(LIGHT))
+                .on_hover_text(format!(
+                    "Resets {} · local time",
+                    local_when(meter.resets_at.unwrap())
+                ));
         }
         if !personal.is_empty() {
             windows(ui, &personal, &weights, slot, precision);
@@ -1261,15 +1265,18 @@ struct RenewalButton<'a> {
 }
 
 impl RenewalButton<'_> {
+    fn available(&self, provider: Provider, slot: &Slot) -> bool {
+        provider == Provider::Claude
+            && slot.cycle.is_none()
+            && slot.meters.as_deref().and_then(spend_meter).is_none()
+    }
+
     fn show(&mut self, ui: &mut egui::Ui, provider: Provider, slot: &Slot) {
-        if provider != Provider::Claude
-            || slot.cycle.is_some()
-            || slot.meters.as_deref().and_then(spend_meter).is_some()
-        {
+        if !self.available(provider, slot) {
             return;
         }
         if self.running {
-            let spinner = ui.add(egui::Spinner::new().size(10.0).color(MUTED));
+            let spinner = ui.add(egui::Spinner::new().size(13.0).color(MUTED));
             let response =
                 ui.interact(spinner.rect, ui.id().with("cancel-renewal"), Sense::click());
             self.context_menu(&response);
@@ -1646,6 +1653,8 @@ fn logo_color(p: Provider) -> Color32 {
 fn provider_logo(ui: &mut egui::Ui, p: Provider, logos: &HashMap<Provider, egui::TextureHandle>) {
     if let Some(logo) = logos.get(&p) {
         ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(p)));
+    } else {
+        ui.allocate_exact_size(Vec2::splat(13.0), Sense::hover());
     }
 }
 
@@ -2384,6 +2393,7 @@ fn message_box(text: &str, _is_err: bool) {
 #[cfg(test)]
 mod display_tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn estimates_do_not_round_into_the_next_reported_percent() {
@@ -2530,6 +2540,75 @@ mod display_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn refresh_and_renewal_icons_keep_header_width_and_weekly_reset_visible() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = App::for_test(vec![Provider::Claude]);
+        app.slots.insert(Provider::Claude, personal_slot());
+        assert_eq!(app.binding(Provider::Claude), Some(1));
+        let slot = &app.slots[&Provider::Claude];
+        let at = slot.windows()[1].resets_at.unwrap();
+        let date = chrono::Local.timestamp_opt(at, 0).single().unwrap();
+        let expected = format!("({})", date.format("%-d %b %-I:%M%P"));
+        let mut idle_width = None;
+        for (loading, missing_renewal, lookup_running) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let slot = app.slots.get_mut(&Provider::Claude).unwrap();
+            slot.loading = loading;
+            if missing_renewal {
+                slot.cycle = None;
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(500.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |root| {
+                    let width = app.card_width(&ctx, &app.shown());
+                    assert_eq!(width, *idle_width.get_or_insert(width));
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.inner_margin(MARGIN))
+                        .show(root, |ui| {
+                            let mut renewal = RenewalButton {
+                                running: lookup_running,
+                                error: None,
+                                clicked: false,
+                                cancelled: false,
+                            };
+                            let response = ui.vertical(|ui| {
+                                ui.set_width(width - 2.0 * f32::from(MARGIN));
+                                provider_block(
+                                    ui,
+                                    Provider::Claude,
+                                    &app.slots[&Provider::Claude],
+                                    0,
+                                    &mut renewal,
+                                    &HashMap::new(),
+                                    Some(1),
+                                );
+                            });
+                            assert!(
+                                response.response.rect.width() + 2.0 * f32::from(MARGIN)
+                                    <= width + 1.0
+                            );
+                            assert!(response.response.rect.height() < 45.0);
+                        });
+                },
+            );
+            assert!(rendered_text(&output).contains(&expected));
+            output.textures_delta.clear();
+        }
     }
 
     #[test]
