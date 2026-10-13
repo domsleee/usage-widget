@@ -695,7 +695,7 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
-/// "42% 5h / 17% wk" right-aligned: each window's percentage coloured by level,
+/// "42% 5h | 17% wk" right-aligned: each window's percentage coloured by level,
 /// followed by its label, each faded by its weight (see `weighted`).
 fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -703,7 +703,7 @@ fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
         // Laid out right to left, so the last window goes first.
         for (i, (m, &w)) in meters.iter().zip(weights).rev().enumerate() {
             if i > 0 {
-                ui.label(RichText::new("/").size(size).color(MUTED));
+                ui.label(RichText::new("|").size(size).color(MUTED));
             }
             if let Some(label) = &m.label {
                 ui.label(RichText::new(label).size(size).color(weighted(LIGHT, w)));
