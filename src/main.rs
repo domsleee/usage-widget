@@ -9,12 +9,14 @@ mod codex_estimate;
 mod config;
 mod estimate;
 mod estimate_history;
+mod limits;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod paths;
 mod providers;
 mod renewal_lookup;
 mod timeutil;
+mod update;
 
 use config::Config;
 use eframe::egui::{
@@ -22,36 +24,34 @@ use eframe::egui::{
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
 use providers::{Cycle, FetchError, Meter, Problem, Provider, Unit, Usage, money, spend_meter};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use timeutil::{ago, local_when, now_unix, resets};
+use timeutil::{ago, local_when, now_unix, until_next_minute, window_until};
 
-const WIDTH: f32 = if cfg!(windows) { 320.0 } else { 270.0 };
+const WIDTH: f32 = 250.0;
 const MARGIN: i8 = 12;
 const MINI_MARGIN_X: i8 = 10;
 const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
+const RATIOS_KEY: &str = "ratios";
+const HIDDEN_KEY: &str = "hidden";
+const SWITCH_SECS: f32 = 0.35;
+const FADE: f32 = 0.65;
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
 /// the monitor's display scaling. Ctrl +/- also works; either way it persists.
 const SIZES: [f32; 8] = [0.25, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0];
-/// Width of the meter-label column, so every reset time starts at the same x.
-const LABEL_COL: f32 = 36.0;
-/// Gap between usage windows shown side by side.
-const CELL_GAP: f32 = 6.0;
-/// Width of the percentage column on spend rows, so the amounts line up.
-const PCT_COL: f32 = 46.0;
 
 // Windows rounds the opaque window at the compositor level; macOS uses a
 // rounded panel over a transparent window.
 const BG: Color32 = Color32::from_rgb(24, 26, 32);
 const TEXT: Color32 = Color32::from_gray(232);
-/// Meter labels ("5h", "week").
-const LABEL: Color32 = Color32::from_rgb(196, 199, 205);
-/// Supporting details: plan, renewal, countdowns, notes.
 const META: Color32 = Color32::from_rgb(150, 155, 165);
 const MUTED: Color32 = Color32::from_gray(135);
-const TRACK: Color32 = Color32::from_rgb(48, 50, 56);
+const LIGHT: Color32 = Color32::from_gray(175);
+const TRACK: Color32 = Color32::from_gray(58);
 const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 
 struct Update {
@@ -63,6 +63,7 @@ struct Update {
 
 #[derive(Clone, Default)]
 struct Slot {
+    personal: bool,
     plan: Option<String>,
     cycle: Option<Cycle>,
     note: Option<String>,
@@ -71,6 +72,35 @@ struct Slot {
     error: Option<FetchError>,
     updated: Option<i64>,
     loading: bool,
+}
+
+impl Slot {
+    fn visible(&self) -> bool {
+        let absent = self
+            .error
+            .as_ref()
+            .is_some_and(|e| e.problem == Problem::NotAvailable);
+        !absent && (self.meters.is_some() || self.error.is_some())
+    }
+
+    /// Primary windows share the header; scoped caps and spend stay in the tooltip.
+    fn windows(&self) -> Vec<&Meter> {
+        if !self.personal {
+            return Vec::new();
+        }
+        self.meters
+            .iter()
+            .flatten()
+            .filter(|m| m.unit == Unit::Percent && m.total > 0.0)
+            .filter(|m| matches!(m.label.as_deref(), Some("5h" | "week" | "wk" | "mo")))
+            .collect()
+    }
+
+    fn estimated(&self, m: &Meter) -> bool {
+        m.label
+            .as_ref()
+            .is_some_and(|label| self.estimated.contains(label))
+    }
 }
 
 struct App {
@@ -84,6 +114,9 @@ struct App {
     /// Compact single-line view. Persisted, so the widget reopens the way it was left.
     minimized: bool,
     logos: HashMap<Provider, egui::TextureHandle>,
+    ratios: HashMap<String, limits::Ratio>,
+    hidden: HashSet<String>,
+    restart: Arc<AtomicBool>,
     opacity: u32,
     /// Decimal places for percentages.
     precision: usize,
@@ -114,8 +147,15 @@ impl App {
             .filter(|p| config.enabled(*p))
             .collect();
         let interval = config.refresh_interval();
-        let opacity = config.opacity;
+        let opacity = std::env::var("USAGE_WIDGET_OPACITY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(config.opacity);
         let precision = config.precision.min(3);
+        let restart = Arc::new(AtomicBool::new(false));
+        if update::auto_enabled() {
+            spawn_auto_update(cc.egui_ctx.clone(), restart.clone());
+        }
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
         spawn_worker(
@@ -133,6 +173,15 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, MINIMIZED_KEY))
             .unwrap_or(false);
+
+        let ratios = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, RATIOS_KEY))
+            .unwrap_or_default();
+        let hidden = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, HIDDEN_KEY))
+            .unwrap_or_default();
 
         let slots = providers
             .iter()
@@ -158,6 +207,9 @@ impl App {
             settled: false,
             minimized,
             logos: load_logos(&cc.egui_ctx),
+            ratios,
+            hidden,
+            restart,
             opacity,
             precision,
             config_error,
@@ -183,8 +235,11 @@ impl App {
             rx,
             refresh_tx,
             interval: Duration::from_secs(300),
+            ratios: HashMap::new(),
+            hidden: HashSet::new(),
+            restart: Arc::new(AtomicBool::new(false)),
             opacity: 100,
-            precision: 1,
+            precision: 0,
             config_error: None,
             renewal_lookup: None,
             renewal_error: None,
@@ -198,6 +253,29 @@ impl App {
             shown: true,
         };
         (app, updates, refresh_rx)
+    }
+
+    /// Runs a check from the menu in the background and reports the result.
+    fn check_for_updates(&self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let restart = self.restart.clone();
+        std::thread::spawn(move || match update::check_and_install() {
+            Ok(update::Outcome::UpToDate) => message_box(
+                &format!("You have the latest version ({}).", update::CURRENT),
+                false,
+            ),
+            Ok(update::Outcome::NotReady(v)) => message_box(
+                &format!(
+                    "Version {v} is out, but its download is not ready yet. Try again in a few minutes."
+                ),
+                false,
+            ),
+            Ok(update::Outcome::Installed) => {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+            }
+            Err(e) => message_box(&format!("Could not check for updates: {e}"), true),
+        });
     }
 
     fn refresh_now(&mut self) {
@@ -248,6 +326,8 @@ impl App {
             MenuAction::Refresh => self.refresh_now(),
             MenuAction::ToggleMinimized => self.minimized = !self.minimized,
             MenuAction::Open(p) => open_url(p.url()),
+            MenuAction::Toggle(p) => self.toggle(p),
+            MenuAction::CheckForUpdates => self.check_for_updates(ctx),
             MenuAction::Size(z) => ctx.set_zoom_factor(z),
             MenuAction::EditConfig => {
                 if let Err(e) = config::open(false) {
@@ -265,6 +345,36 @@ impl App {
             slot.updated = Some(u.at);
             match u.result {
                 Ok(usage) => {
+                    if slot.plan.is_some() && slot.plan != usage.plan {
+                        self.ratios.remove(u.provider.name());
+                    }
+                    if usage.personal {
+                        let five = usage
+                            .meters
+                            .iter()
+                            .find(|m| m.label.as_deref() == Some("5h"));
+                        let week = usage
+                            .meters
+                            .iter()
+                            .find(|m| matches!(m.label.as_deref(), Some("week" | "wk")));
+                        if let (Some(five), Some(week)) = (five, week) {
+                            let mut five = five.clone();
+                            let mut week = week.clone();
+                            for m in [&mut five, &mut week] {
+                                if m.label
+                                    .as_ref()
+                                    .is_some_and(|l| usage.estimated.contains(l))
+                                {
+                                    m.used = m.used.floor();
+                                }
+                            }
+                            self.ratios
+                                .entry(u.provider.name().to_string())
+                                .or_default()
+                                .observe(&five, &week);
+                        }
+                    }
+                    slot.personal = usage.personal;
                     slot.plan = usage.plan;
                     let monthly_claude =
                         u.provider == Provider::Claude && spend_meter(&usage.meters).is_some();
@@ -315,26 +425,170 @@ impl App {
         }
     }
 
+    /// For a personal plan with 5-hour and weekly windows, the one that runs out
+    /// first this session (0 or 1).
+    fn binding(&self, p: Provider) -> Option<usize> {
+        let slot = self.slots.get(&p)?;
+        let windows = slot.windows();
+        let [five_hour, week] = windows.as_slice() else {
+            return None;
+        };
+        if five_hour.label.as_deref() != Some("5h")
+            || !matches!(week.label.as_deref(), Some("week" | "wk"))
+        {
+            return None;
+        }
+        let k = self
+            .ratios
+            .get(p.name())
+            .and_then(limits::Ratio::weekly_per_five_hour);
+        Some(limits::binding(five_hour, week, k))
+    }
+
+    /// The services the account has, in display order. These are listed in the
+    /// menu, ticked or not.
+    fn found(&self) -> Vec<Provider> {
+        self.providers
+            .iter()
+            .copied()
+            .filter(|p| self.slots.get(p).is_some_and(Slot::visible))
+            .collect()
+    }
+
+    /// The found services the user has not unticked.
+    fn shown(&self) -> Vec<Provider> {
+        let mut found = self.found();
+        found.retain(|p| !self.hidden.contains(p.name()));
+        found
+    }
+
+    /// What the widget says when it has no service to show, in the full and the
+    /// minimized view.
+    fn empty_text(&self, found: &[Provider]) -> (&'static str, &'static str) {
+        if self.providers.is_empty() {
+            ("Every service is disabled in the config.", "All disabled")
+        } else if !found.is_empty() {
+            (
+                "All services are hidden. Right-click to show them.",
+                "All hidden",
+            )
+        } else if self.all_fetched() {
+            (
+                "No paid Copilot, Claude or Codex plan found. Sign in with gh, claude or codex and it shows up at the next refresh.",
+                "No plans found",
+            )
+        } else {
+            ("…", "…")
+        }
+    }
+
+    fn toggle(&mut self, p: Provider) {
+        if !self.hidden.remove(p.name()) {
+            self.hidden.insert(p.name().to_string());
+        }
+    }
+
+    fn all_fetched(&self) -> bool {
+        self.slots.values().all(|s| s.updated.is_some())
+    }
+
     fn last_updated(&self) -> Option<i64> {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
-    /// Sum of the dollar-denominated meters across providers. None unless there
-    /// are several, since a single one would just repeat its own row.
-    fn total(&self) -> Option<Meter> {
+    /// Add only the space needed for decimal readings and a renewal control.
+    fn card_width(&self, ctx: &egui::Context, shown: &[Provider]) -> f32 {
+        ctx.fonts_mut(|fonts| {
+            let mut text_width = |text: String, size| {
+                fonts
+                    .layout_no_wrap(text, egui::FontId::proportional(size), TEXT)
+                    .size()
+                    .x
+            };
+            shown
+                .iter()
+                .filter_map(|p| {
+                    let slot = self.slots.get(p)?;
+                    let windows = slot.windows();
+                    let mut width = 13.0 + 8.0 + text_width(p.name().into(), 13.0);
+                    if let Some(at) = windows
+                        .get(self.binding(*p).unwrap_or(0))
+                        .and_then(|m| m.resets_at)
+                    {
+                        width += 8.0 + text_width(format!("({})", window_until(at)), 11.0);
+                    }
+                    if *p == Provider::Claude
+                        && slot.cycle.is_none()
+                        && slot.meters.as_deref().and_then(spend_meter).is_none()
+                    {
+                        width += 8.0 + 13.0;
+                    }
+                    if slot.loading {
+                        width += 8.0 + 10.0;
+                    }
+                    if !windows.is_empty() {
+                        width += 8.0;
+                        for (i, m) in windows.iter().enumerate() {
+                            if i > 0 {
+                                width += 9.0 + text_width("|".into(), 12.0);
+                            }
+                            width += text_width(
+                                percent_label(m.percent(), self.precision, slot.estimated(m)),
+                                12.0,
+                            );
+                            if let Some(label) = &m.label {
+                                width += 3.0
+                                    + text_width(
+                                        if label == "week" {
+                                            "wk".into()
+                                        } else {
+                                            label.clone()
+                                        },
+                                        12.0,
+                                    );
+                            }
+                        }
+                    } else if let Some(m) = slot.meters.as_deref().and_then(spend_meter) {
+                        width += 8.0 + text_width(m.summary(), 12.0);
+                        if m.total > 0.0 {
+                            width += 8.0
+                                + text_width(
+                                    percent_label(m.percent(), self.precision, false),
+                                    12.0,
+                                );
+                        }
+                    }
+                    if let Some(e) = &slot.error {
+                        width += 8.0 + text_width(e.problem.label().into(), 12.0);
+                    }
+                    Some(width + 2.0 * f32::from(MARGIN) + 4.0)
+                })
+                .fold(WIDTH, f32::max)
+        })
+    }
+
+    /// Sum of every dollar-denominated meter across the shown providers. Only when
+    /// at least two have one, since otherwise it repeats that provider's line.
+    fn total(&self, shown: &[Provider]) -> Option<Meter> {
         let mut used = 0.0;
         let mut total = 0.0;
-        let mut count = 0;
-        for slot in self.slots.values() {
+        let mut providers = 0;
+        for slot in shown
+            .iter()
+            .filter_map(|p| self.slots.get(p))
+            .filter(|s| !s.personal)
+        {
+            let mut any = false;
             for m in slot.meters.iter().flatten() {
                 if m.unit == Unit::Dollars {
                     used += m.used;
                     total += m.total;
-                    count += 1;
+                    any = true;
                 }
             }
+            providers += usize::from(any);
         }
-        (count > 1).then(|| Meter {
+        (providers >= 2).then_some(Meter {
             label: None,
             used,
             total,
@@ -383,6 +637,22 @@ fn spawn_worker(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             while refresh_rx.try_recv().is_ok() {}
+        }
+    });
+}
+
+/// Checks for updates shortly after start and then every few hours, installing
+/// any newer release. Failures are ignored and retried at the next check.
+fn spawn_auto_update(ctx: egui::Context, restart: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(update::FIRST_CHECK_AFTER);
+        loop {
+            if let Ok(update::Outcome::Installed) = update::check_and_install() {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+                return;
+            }
+            std::thread::sleep(update::CHECK_EVERY);
         }
     });
 }
@@ -713,20 +983,31 @@ fn level_color(percent: f64) -> Color32 {
     }
 }
 
+/// `a` moved towards `b` by `t` (0 to 1).
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// `color` at `weight` (0 to 1) of full strength: a window that is not the
+/// binding one fades towards the background, as if disabled.
+fn weighted(color: Color32, weight: f32) -> Color32 {
+    mix(mix(color, BG, FADE), color, weight)
+}
+
 fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), TRACK);
+    painter.rect_filled(rect, CornerRadius::same(3), TRACK);
     if fraction > 0.0 {
         let mut fill = rect;
-        fill.set_width((rect.width() * fraction).max(4.0));
-        painter.rect_filled(fill, CornerRadius::same(2), color);
+        fill.set_width((rect.width() * fraction).max(6.0));
+        painter.rect_filled(fill, CornerRadius::same(3), color);
     }
 }
 
-const ESTIMATE_HOVER: &str = "Estimated: Codex reports whole percents, so the part of the next one \
-     comes from this computer's Codex token use. Codex cloud and other devices \
-     aren't counted.";
+const ESTIMATE_HOVER: &str = "Estimated from this computer's CLI token logs between reported \
+     percentage ticks. Web, cloud and other devices aren't counted.";
 
 /// The percentage, coloured by level, with "~" when it includes a local estimate.
 fn percent_text(m: &Meter, size: f32, precision: usize, estimated: bool) -> RichText {
@@ -771,10 +1052,205 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated:
     });
 }
 
-/// The meter of a service that only reports spend with no sub-label (Copilot, or
-/// Claude and Codex on usage-based plans).
-fn spend_only(slot: &Slot) -> Option<&Meter> {
-    spend_meter(slot.meters.as_deref()?).filter(|m| m.total > 0.0)
+/// The service name opens its usage page; plan and renewal details stay on hover.
+fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
+    let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
+    let response = ui
+        .add(egui::Label::new(name).sense(Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        open_url(p.url());
+    }
+    response
+}
+
+fn usage_hover(slot: &Slot, precision: usize) -> String {
+    let mut lines: Vec<String> = slot.plan.iter().cloned().collect();
+    if let Some(cycle) = &slot.cycle {
+        lines.push(format!(
+            "{} {} ({})",
+            cycle.verb,
+            cycle.countdown(chrono::Local::now().date_naive()),
+            cycle.when()
+        ));
+    }
+    for m in slot.meters.iter().flatten() {
+        let amount = if m.total <= 0.0 {
+            "unlimited".into()
+        } else if m.unit == Unit::Dollars {
+            m.summary()
+        } else {
+            percent_label(m.percent(), precision, slot.estimated(m))
+        };
+        let reset = m
+            .resets_at
+            .map(|at| format!(" · resets {}", local_when(at)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "{}: {amount}{reset}",
+            m.label.as_deref().unwrap_or("Usage")
+        ));
+    }
+    lines.extend(slot.note.iter().cloned());
+    lines.extend(slot.error.iter().map(|e| e.detail.clone()));
+    if !slot.estimated.is_empty() {
+        lines.push(ESTIMATE_HOVER.into());
+    }
+    lines.join("\n")
+}
+
+/// Primary windows share one header, fading towards the window that binds first.
+fn windows(ui: &mut egui::Ui, meters: &[&Meter], weights: &[f32], slot: &Slot, precision: usize) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for (i, (m, &weight)) in meters.iter().zip(weights).rev().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("|").size(12.0).color(MUTED));
+            }
+            if let Some(label) = &m.label {
+                let label = if label == "week" {
+                    "wk"
+                } else {
+                    label.as_str()
+                };
+                ui.label(
+                    RichText::new(label)
+                        .size(12.0)
+                        .color(weighted(LIGHT, weight)),
+                );
+            }
+            let response = ui.label(
+                percent_text(m, 12.0, precision, slot.estimated(m))
+                    .color(weighted(level_color(m.percent()), weight)),
+            );
+            if let Some(at) = m.resets_at {
+                response
+                    .clone()
+                    .on_hover_text(format!("Resets {}", local_when(at)));
+            }
+            if slot.estimated(m) {
+                response.on_hover_text(ESTIMATE_HOVER);
+            }
+        }
+    });
+}
+
+// Retain upstream's animation when the limiting window changes.
+fn ease<const N: usize>(ui: &egui::Ui, id: egui::Id, target: [f32; N]) -> [f32; N] {
+    #[derive(Clone, Copy)]
+    struct Tween<const N: usize> {
+        from: [f32; N],
+        to: [f32; N],
+        start: f64,
+    }
+    let at = |tw: &Tween<N>, now: f64| {
+        let t = ((now - tw.start) as f32 / SWITCH_SECS).clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        std::array::from_fn(|i| tw.from[i] + (tw.to[i] - tw.from[i]) * t)
+    };
+    let ctx = ui.ctx();
+    let now = ui.input(|i| i.time);
+    let mut tw = ctx.data(|d| d.get_temp::<Tween<N>>(id)).unwrap_or(Tween {
+        from: target,
+        to: target,
+        start: now,
+    });
+    if tw.to != target {
+        tw = Tween {
+            from: at(&tw, now),
+            to: target,
+            start: now,
+        };
+    }
+    ctx.data_mut(|d| d.insert_temp(id, tw));
+    if now - tw.start < f64::from(SWITCH_SECS) {
+        ctx.request_repaint();
+    }
+    at(&tw, now)
+}
+
+fn provider_block(
+    ui: &mut egui::Ui,
+    p: Provider,
+    slot: &Slot,
+    precision: usize,
+    renewal: &mut RenewalButton<'_>,
+    logos: &HashMap<Provider, egui::TextureHandle>,
+    binding: Option<usize>,
+) {
+    let meters = slot.meters.as_deref().unwrap_or_default();
+    let personal = slot.windows();
+    let single = (!slot.personal).then(|| spend_meter(meters)).flatten();
+    let selected = personal.get(binding.unwrap_or(0)).copied();
+    let position = binding.map(|b| ease(ui, egui::Id::new(("binding", p.name())), [b as f32])[0]);
+    let weights = position.map_or_else(|| vec![1.0; personal.len()], |t| vec![1.0 - t, t]);
+
+    ui.horizontal(|ui| {
+        provider_logo(ui, p, logos);
+        let response = name_link(ui, p);
+        if p == Provider::Claude && slot.cycle.is_some() {
+            renewal.context_menu(&response);
+        }
+        response.on_hover_text(usage_hover(slot, precision));
+        if let Some(at) = selected.and_then(|m| m.resets_at) {
+            ui.label(
+                RichText::new(format!("({})", window_until(at)))
+                    .size(11.0)
+                    .color(LIGHT),
+            )
+            .on_hover_text(format!("Until this window resets · {}", local_when(at)));
+        }
+        renewal.show(ui, p, slot);
+        if slot.loading {
+            ui.add(egui::Spinner::new().size(10.0).color(MUTED));
+        }
+        if !personal.is_empty() {
+            windows(ui, &personal, &weights, slot, precision);
+        } else if let Some(m) = single {
+            amounts(ui, m, 12.0, precision, false);
+        }
+        if let Some(error) = &slot.error {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(error.problem.label()).size(12.0).color(ERR))
+                    .on_hover_text(&error.detail);
+            });
+        }
+    });
+
+    if slot.error.is_some() {
+        bar(ui, 0.0, MUTED);
+        return;
+    }
+    if let Some(m) = selected {
+        let color = level_color(m.percent());
+        let target = [
+            m.fraction(),
+            color.r().into(),
+            color.g().into(),
+            color.b().into(),
+        ];
+        let [fraction, r, g, b] = ease(ui, egui::Id::new(("bar", p.name())), target);
+        bar(ui, fraction, Color32::from_rgb(r as u8, g as u8, b as u8));
+    } else if let Some(m) = single {
+        if m.total > 0.0 {
+            bar(ui, m.fraction(), level_color(m.percent()));
+        }
+    } else {
+        for m in meters {
+            ui.horizontal(|ui| {
+                if let Some(label) = &m.label {
+                    ui.label(RichText::new(label).size(11.0).color(MUTED));
+                }
+                amounts(ui, m, 12.0, precision, slot.estimated(m));
+            });
+            if m.total > 0.0 {
+                bar(ui, m.fraction(), level_color(m.percent()));
+            }
+        }
+    }
+    if let Some(note) = &slot.note {
+        ui.label(RichText::new(note).size(10.0).color(META));
+    }
 }
 
 struct RenewalButton<'a> {
@@ -837,249 +1313,14 @@ impl RenewalButton<'_> {
     }
 }
 
-fn provider_block(
-    ui: &mut egui::Ui,
-    p: Provider,
-    slot: &Slot,
-    precision: usize,
-    renewal: &mut RenewalButton<'_>,
-    logos: &HashMap<Provider, egui::TextureHandle>,
-) {
-    if let Some(m) = spend_only(slot) {
-        spend_row(ui, p, slot, m, precision, logos);
-    } else {
-        header(ui, p, slot, renewal, logos);
-        ui.add_space(6.0);
-        match (&slot.meters, &slot.error) {
-            (Some(meters), _) => meters_block(ui, meters, slot, precision),
-            // The reason is in the header.
-            (None, Some(_)) => bar(ui, 0.0, MUTED),
-            (None, None) => {
-                ui.label(RichText::new("loading…").size(10.5).color(MUTED));
-            }
-        }
-    }
-    if slot.meters.is_some()
-        && let Some(note) = &slot.note
-    {
-        ui.add_space(5.0);
-        ui.label(RichText::new(note).size(10.0).color(META));
-    }
-}
-
-/// Name, amount and percentage on one line over one bar, as in the original
-/// widget. The plan and billing cycle move to the name's hover text.
-fn spend_row(
-    ui: &mut egui::Ui,
-    p: Provider,
-    slot: &Slot,
-    m: &Meter,
-    precision: usize,
-    logos: &HashMap<Provider, egui::TextureHandle>,
-) {
-    let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
-        let mut hover: Vec<String> = slot.plan.iter().cloned().collect();
-        if let Some(c) = &slot.cycle {
-            hover.push(format!("{} {}", c.verb, c.when()));
-        }
-        // Usage-based plans reset monthly and need no subscription renewal lookup.
-        provider_logo(ui, p, logos);
-        let response = name_link(ui, p);
-        if !hover.is_empty() {
-            response.on_hover_text(hover.join("\n"));
-        }
-        if slot.loading {
-            ui.add(egui::Spinner::new().size(10.0).color(MUTED));
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let col = Vec2::new(PCT_COL, row.y);
-            ui.allocate_ui_with_layout(col, Layout::right_to_left(Align::Center), |ui| {
-                ui.label(percent_text(m, 11.0, precision, false));
-            });
-            ui.label(RichText::new(m.summary()).size(11.0).color(TEXT));
-        });
-    });
-    ui.add_space(3.0);
-    bar(ui, m.fraction(), level_color(m.percent()));
-}
-
-/// Several usage windows sit side by side, each with its reset on its label line.
-/// A lone window, spend and "unlimited" get a full-width row.
-fn meters_block(ui: &mut egui::Ui, meters: &[Meter], slot: &Slot, precision: usize) {
-    let estimated = |m: &Meter| m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
-    let is_window = |m: &Meter| m.unit == Unit::Percent && m.total > 0.0;
-    let windows: Vec<&Meter> = meters.iter().filter(|m| is_window(m)).collect();
-    let side_by_side = windows.len() > 1;
-    // Two or four windows split into pairs; otherwise rows of three.
-    let cols = if matches!(windows.len(), 2 | 4) { 2 } else { 3 };
-
-    let mut blocks = 0;
-    if side_by_side {
-        for chunk in windows.chunks(cols) {
-            if blocks > 0 {
-                ui.add_space(6.0);
-            }
-            blocks += 1;
-            window_cells(ui, chunk, cols, precision, &estimated);
-        }
-    }
-    for m in meters.iter().filter(|m| !(side_by_side && is_window(m))) {
-        if blocks > 0 {
-            ui.add_space(6.0);
-        }
-        blocks += 1;
-        meter_row(ui, m, precision, estimated(m));
-    }
-}
-
-fn window_cells(
-    ui: &mut egui::Ui,
-    windows: &[&Meter],
-    cols: usize,
-    precision: usize,
-    estimated: &dyn Fn(&Meter) -> bool,
-) {
-    let width = (ui.available_width() - CELL_GAP * (cols - 1) as f32) / cols as f32;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = CELL_GAP;
-        for m in windows {
-            ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(width);
-                window_cell(ui, m, precision, estimated(m));
-            });
-        }
-    });
-}
-
-/// Label and reset time on one line, then the bar and percentage.
-fn window_cell(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
-    let line = Vec2::new(ui.available_width(), 12.0);
-    ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Max), |ui| {
-        if let Some(label) = &m.label {
-            ui.label(RichText::new(label).size(9.5).color(LABEL));
-        }
-        if let Some(ts) = m.resets_at {
-            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                ui.label(RichText::new(resets(ts)).size(9.0).color(META))
-                    .on_hover_text(local_when(ts));
-            });
-        }
-    });
-    ui.add_space(3.0);
-    bar(ui, m.fraction(), level_color(m.percent()));
-    ui.add_space(3.0);
-    let resp = ui.label(percent_text(m, 12.0, precision, estimated));
-    if estimated {
-        resp.on_hover_text(ESTIMATE_HOVER);
-    }
-}
-
-/// The service name, which opens its usage page when clicked.
-fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
-    let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-    let response = ui
-        .add(egui::Label::new(name).sense(Sense::click()))
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.clicked() {
-        open_url(p.url());
-    }
-    response
-}
-
-/// Service name, then plan and billing cycle in small text.
-fn header(
-    ui: &mut egui::Ui,
-    p: Provider,
-    slot: &Slot,
-    renewal: &mut RenewalButton<'_>,
-    logos: &HashMap<Provider, egui::TextureHandle>,
-) {
-    // A fixed-height, bottom-aligned row (`with_layout` would take all the height left).
-    let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Max), |ui| {
-        provider_logo(ui, p, logos);
-        name_link(ui, p);
-        renewal.show(ui, p, slot);
-        let mut info: Vec<String> = slot.plan.iter().cloned().collect();
-        let mut hover = None;
-        if let Some(c) = &slot.cycle {
-            // A countdown, recomputed every frame so it stays right as time passes.
-            info.push(format!(
-                "{} {}",
-                c.verb,
-                c.countdown(chrono::Local::now().date_naive())
-            ));
-            hover = Some(format!("{} {}", c.verb, c.when()));
-        }
-        if p == Provider::Claude && slot.cycle.is_some() {
-            if renewal.running {
-                info.push("looking up…".into());
-            } else if renewal.error.is_some() {
-                info.push("lookup failed".into());
-            }
-        }
-        if !info.is_empty() {
-            let font = egui::FontId::proportional(10.0);
-            let prefix_width = slot.plan.as_ref().map_or(0.0, |plan| {
-                ui.painter()
-                    .layout_no_wrap(format!("{plan} · "), font.clone(), META)
-                    .size()
-                    .x
-            });
-            let galley = ui.painter().layout_no_wrap(info.join(" · "), font, META);
-            let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
-            // egui aligns text boxes, not baselines: bottom-aligned, the smaller text
-            // sits 1pt below the name's baseline (measured), so lift it by that.
-            ui.painter()
-                .galley(rect.min - Vec2::new(0.0, 1.0), galley, META);
-            let resp = if p == Provider::Claude && slot.cycle.is_some() {
-                let renewal_rect =
-                    egui::Rect::from_min_max(rect.min + Vec2::new(prefix_width, 0.0), rect.max);
-                let response = ui.interact(
-                    renewal_rect,
-                    ui.id().with("claude-renewal"),
-                    Sense::click_and_drag(),
-                );
-                if response.drag_started_by(egui::PointerButton::Primary) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                renewal.context_menu(&response);
-                response.on_hover_text(
-                    renewal
-                        .error
-                        .unwrap_or("Right-click for renewal lookup actions"),
-                )
-            } else {
-                resp
-            };
-            if let Some(hover) = hover {
-                resp.on_hover_text(hover);
-            }
-        }
-        if slot.loading {
-            ui.add(egui::Spinner::new().size(10.0).color(MUTED));
-        }
-        if let Some(e) = &slot.error {
-            let color = if e.problem == Problem::NotAvailable {
-                MUTED
-            } else {
-                ERR
-            };
-            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                ui.label(RichText::new(e.problem.label()).size(12.0).color(color))
-                    .on_hover_text(&e.detail);
-            });
-        }
-    });
-}
-
 #[derive(Clone, Copy)]
 enum MenuAction {
     Refresh,
     ToggleMinimized,
     Open(Provider),
+    Toggle(Provider),
     Size(f32),
+    CheckForUpdates,
     EditConfig,
     Quit,
 }
@@ -1093,7 +1334,8 @@ fn minimize_label(minimized: bool) -> &'static str {
 #[cfg(windows)]
 fn native_menu(
     frame: &eframe::Frame,
-    providers: &[Provider],
+    found: &[Provider],
+    shown: &[Provider],
     zoom: f32,
     refresh_mins: u64,
     minimized: bool,
@@ -1133,8 +1375,10 @@ fn native_menu(
     const ID_REFRESH: usize = 1;
     const ID_QUIT: usize = 2;
     const ID_MINIMIZE: usize = 3;
-    const ID_EDIT_CONFIG: usize = 4;
+    const ID_UPDATE: usize = 4;
+    const ID_EDIT_CONFIG: usize = 5;
     const ID_OPEN: usize = 10;
+    const ID_TOGGLE: usize = 20;
     const ID_SIZE: usize = 100;
 
     let hwnd = hwnd(frame)?;
@@ -1146,15 +1390,29 @@ fn native_menu(
         add(menu, MF_STRING, ID_REFRESH, "Refresh now");
         add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
         add(menu, MF_SEPARATOR, 0, "");
-        for (i, p) in providers.iter().enumerate() {
-            add(
-                menu,
-                MF_STRING,
-                ID_OPEN + i,
-                &format!("Open {} usage", p.name()),
-            );
+        if !found.is_empty() {
+            add(menu, MF_STRING | MF_GRAYED, 0, "Show");
+            for (i, p) in Provider::ALL.iter().enumerate() {
+                if found.contains(p) {
+                    let checked = if shown.contains(p) { MF_CHECKED } else { 0 };
+                    add(menu, MF_STRING | checked, ID_TOGGLE + i, p.name());
+                }
+            }
+            add(menu, MF_SEPARATOR, 0, "");
         }
-        add(menu, MF_SEPARATOR, 0, "");
+        for (i, p) in Provider::ALL.iter().enumerate() {
+            if found.contains(p) {
+                add(
+                    menu,
+                    MF_STRING,
+                    ID_OPEN + i,
+                    &format!("Open {} usage", p.name()),
+                );
+            }
+        }
+        if !found.is_empty() {
+            add(menu, MF_SEPARATOR, 0, "");
+        }
         // Owned by `menu` once appended, so destroyed along with it.
         let sizes = CreatePopupMenu();
         for (i, z) in SIZES.iter().enumerate() {
@@ -1171,9 +1429,12 @@ fn native_menu(
             );
         }
         add(menu, MF_POPUP, sizes as usize, "Size");
+        add(menu, MF_STRING, ID_UPDATE, "Check for updates");
         add(menu, MF_SEPARATOR, 0, "");
         let note = format!("Refreshes every {refresh_mins} min");
         add(menu, MF_STRING | MF_GRAYED, 0, &note);
+        let version = format!("Version {}", update::CURRENT);
+        add(menu, MF_STRING | MF_GRAYED, 0, &version);
         add(menu, MF_STRING, ID_EDIT_CONFIG, "Edit config");
         add(menu, MF_STRING, ID_QUIT, "Quit");
 
@@ -1197,10 +1458,14 @@ fn native_menu(
         match id {
             ID_REFRESH => Some(MenuAction::Refresh),
             ID_MINIMIZE => Some(MenuAction::ToggleMinimized),
+            ID_UPDATE => Some(MenuAction::CheckForUpdates),
             ID_EDIT_CONFIG => Some(MenuAction::EditConfig),
             ID_QUIT => Some(MenuAction::Quit),
-            _ if (ID_OPEN..ID_OPEN + providers.len()).contains(&id) => {
-                Some(MenuAction::Open(providers[id - ID_OPEN]))
+            _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
+                Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
+            }
+            _ if (ID_TOGGLE..ID_TOGGLE + Provider::ALL.len()).contains(&id) => {
+                Some(MenuAction::Toggle(Provider::ALL[id - ID_TOGGLE]))
             }
             _ if (ID_SIZE..ID_SIZE + SIZES.len()).contains(&id) => {
                 Some(MenuAction::Size(SIZES[id - ID_SIZE]))
@@ -1208,6 +1473,72 @@ fn native_menu(
             _ => None,
         }
     }
+}
+
+#[cfg(not(windows))]
+fn egui_menu(
+    ui: &mut egui::Ui,
+    found: &[Provider],
+    shown: &[Provider],
+    zoom: f32,
+    refresh_mins: u64,
+    minimized: bool,
+) -> Option<MenuAction> {
+    let mut action = None;
+    if ui.button("Refresh now").clicked() {
+        action = Some(MenuAction::Refresh);
+    }
+    if ui.button(minimize_label(minimized)).clicked() {
+        action = Some(MenuAction::ToggleMinimized);
+    }
+    ui.separator();
+    if !found.is_empty() {
+        ui.label(RichText::new("show").size(10.0).color(MUTED));
+        for &p in found {
+            let mut checked = shown.contains(&p);
+            if ui.checkbox(&mut checked, p.name()).clicked() {
+                action = Some(MenuAction::Toggle(p));
+            }
+        }
+        ui.separator();
+    }
+    for &p in found {
+        if ui.button(format!("Open {} usage", p.name())).clicked() {
+            action = Some(MenuAction::Open(p));
+        }
+    }
+    if !found.is_empty() {
+        ui.separator();
+    }
+    ui.menu_button("Size", |ui| {
+        for z in SIZES {
+            let label = format!("{:.0}%", z * 100.0);
+            if ui.radio((zoom - z).abs() < 0.01, label).clicked() {
+                action = Some(MenuAction::Size(z));
+            }
+        }
+    });
+    if cfg!(windows) && ui.button("Check for updates").clicked() {
+        action = Some(MenuAction::CheckForUpdates);
+    }
+    ui.separator();
+    ui.label(
+        RichText::new(format!("refreshes every {refresh_mins} min"))
+            .size(10.0)
+            .color(MUTED),
+    );
+    ui.label(
+        RichText::new(format!("version {}", update::CURRENT))
+            .size(10.0)
+            .color(MUTED),
+    );
+    if ui.button("Edit config").clicked() {
+        action = Some(MenuAction::EditConfig);
+    }
+    if ui.button("Quit").clicked() {
+        action = Some(MenuAction::Quit);
+    }
+    action
 }
 
 /// The right-click menu as a native popup from the menu bar's menu library. The
@@ -1227,57 +1558,13 @@ fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, mini
     unsafe {
         bar.popup(
             appkit.ns_view.as_ptr(),
-            &app.providers,
+            &app.found(),
+            &app.shown(),
             zoom,
             refresh_mins,
             minimized,
         )
     }
-}
-
-#[cfg(not(windows))]
-fn egui_menu(
-    ui: &mut egui::Ui,
-    providers: &[Provider],
-    zoom: f32,
-    refresh_mins: u64,
-    minimized: bool,
-) -> Option<MenuAction> {
-    let mut action = None;
-    if ui.button("Refresh now").clicked() {
-        action = Some(MenuAction::Refresh);
-    }
-    if ui.button(minimize_label(minimized)).clicked() {
-        action = Some(MenuAction::ToggleMinimized);
-    }
-    ui.separator();
-    for &p in providers {
-        if ui.button(format!("Open {} usage", p.name())).clicked() {
-            action = Some(MenuAction::Open(p));
-        }
-    }
-    ui.separator();
-    ui.menu_button("Size", |ui| {
-        for z in SIZES {
-            let label = format!("{:.0}%", z * 100.0);
-            if ui.radio((zoom - z).abs() < 0.01, label).clicked() {
-                action = Some(MenuAction::Size(z));
-            }
-        }
-    });
-    ui.separator();
-    ui.label(
-        RichText::new(format!("refreshes every {refresh_mins} min"))
-            .size(10.0)
-            .color(MUTED),
-    );
-    if ui.button("Edit config").clicked() {
-        action = Some(MenuAction::EditConfig);
-    }
-    if ui.button("Quit").clicked() {
-        action = Some(MenuAction::Quit);
-    }
-    action
 }
 
 /// Opens a link in the default browser.
@@ -1369,8 +1656,13 @@ fn compact_row(
     slots: &HashMap<Provider, Slot>,
     logos: &HashMap<Provider, egui::TextureHandle>,
     precision: usize,
+    bindings: &HashMap<Provider, usize>,
+    empty: &str,
 ) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    if providers.is_empty() {
+        ui.label(RichText::new(empty).size(11.5).color(MUTED));
+    }
     for (i, p) in providers.iter().enumerate() {
         if i > 0 {
             ui.add_space(8.0);
@@ -1378,13 +1670,16 @@ fn compact_row(
         let slot = slots.get(p).cloned().unwrap_or_default();
         provider_logo(ui, *p, logos);
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
-        // The most-used meter is the one that matters when space is this tight.
-        let top = slot
-            .meters
-            .iter()
-            .flatten()
-            .filter(|m| m.total > 0.0)
-            .max_by(|a, b| a.percent().total_cmp(&b.percent()));
+        let top = bindings
+            .get(p)
+            .and_then(|&b| slot.windows().get(b).copied())
+            .or_else(|| {
+                slot.meters
+                    .iter()
+                    .flatten()
+                    .filter(|m| m.total > 0.0)
+                    .max_by(|a, b| a.percent().total_cmp(&b.percent()))
+            });
         let text = match (top, &slot.error) {
             (Some(m), _) => {
                 let estimated = m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
@@ -1399,36 +1694,13 @@ fn compact_row(
         };
         let resp = ui.label(text.size(11.5).strong());
         // What the full card would say under the numbers: stale data, its age, errors.
-        let mut hover: Vec<String> = slot.note.iter().cloned().collect();
-        hover.extend(slot.error.iter().map(|e| e.detail.clone()));
+        let hover = usage_hover(&slot, precision);
         if !hover.is_empty() {
-            if top.is_some() {
+            if top.is_some() && slot.note.is_some() {
                 ui.label(RichText::new("*").size(11.5).color(META));
             }
-            resp.on_hover_text(format!("{}: {}", p.name(), hover.join("\n")));
+            resp.on_hover_text(format!("{}: {}", p.name(), hover));
         }
-    }
-}
-
-/// Label, reset time and amount on one line, over a thin bar.
-fn meter_row(ui: &mut egui::Ui, m: &Meter, precision: usize, estimated: bool) {
-    ui.horizontal(|ui| {
-        let size = Vec2::new(LABEL_COL, ui.spacing().interact_size.y);
-        ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_width(LABEL_COL);
-            if let Some(label) = &m.label {
-                ui.label(RichText::new(label).size(11.0).color(LABEL));
-            }
-        });
-        if let Some(ts) = m.resets_at {
-            ui.label(RichText::new(resets(ts)).size(9.5).color(META))
-                .on_hover_text(local_when(ts));
-        }
-        amounts(ui, m, 12.0, precision, estimated);
-    });
-    if m.total > 0.0 {
-        ui.add_space(3.0);
-        bar(ui, m.fraction(), level_color(m.percent()));
     }
 }
 
@@ -1481,6 +1753,8 @@ fn refresh_button(ui: &mut egui::Ui, tooltip: &str, error: bool) -> bool {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
+        eframe::set_value(storage, RATIOS_KEY, &self.ratios);
+        eframe::set_value(storage, HIDDEN_KEY, &self.hidden);
     }
 
     /// Runs before every `ui` pass, and is all that runs while the widget is
@@ -1489,7 +1763,12 @@ impl eframe::App for App {
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
         #[cfg(target_os = "macos")]
-        self.handle_menu(_ctx);
+        {
+            self.handle_menu(_ctx);
+            if let Some(bar) = &self.menubar {
+                bar.set_services(&self.found(), &self.shown());
+            }
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1505,7 +1784,7 @@ impl eframe::App for App {
         // window styles whenever its own flags change (focus, level, visibility).
         apply_window_style(frame, self.opacity);
         let ctx = root.ctx().clone();
-        ctx.request_repaint_after(Duration::from_secs(30));
+        ctx.request_repaint_after(until_next_minute().min(Duration::from_secs(30)));
         if !self.settled {
             self.settled = settle_window(frame);
             if !self.settled {
@@ -1528,6 +1807,14 @@ impl eframe::App for App {
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
         let minimized = self.minimized;
+        let found = self.found();
+        let providers = self.shown();
+        let bindings: HashMap<Provider, usize> = providers
+            .iter()
+            .filter_map(|&p| Some((p, self.binding(p)?)))
+            .collect();
+        let (empty, empty_compact) = self.empty_text(&found);
+        let full_width = self.card_width(&ctx, &providers);
         let mut resized = false;
         let mut renewal = RenewalButton {
             running: self.renewal_lookup.is_some(),
@@ -1554,16 +1841,12 @@ impl eframe::App for App {
             #[cfg(not(windows))]
             if !native_menu_available {
                 bg.context_menu(|ui| {
-                    action = egui_menu(ui, &self.providers, zoom, refresh_mins, minimized);
+                    action = egui_menu(ui, &found, &providers, zoom, refresh_mins, minimized);
                     if action.is_some() {
                         ui.close();
                     }
                 });
             }
-
-            // Vertical gaps are set explicitly so they can differ by role: tight within
-            // a meter, looser between meters, widest between services.
-            ui.spacing_mut().item_spacing.y = 0.0;
 
             // Wrap the content so its real size can be measured: the panel's own
             // min_rect is always expanded to fill the window.
@@ -1571,38 +1854,41 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     compact_row(
                         ui,
-                        &self.providers,
+                        &providers,
                         &self.slots,
                         &self.logos,
                         self.precision,
+                        &bindings,
+                        empty_compact,
                     )
                 })
             } else {
                 ui.vertical(|ui| {
-                    for (i, p) in self.providers.iter().enumerate() {
-                        let slot = self.slots.get(p).cloned().unwrap_or_default();
-                        if i > 0 {
-                            // One-line spend rows stack a little tighter, as in the original.
-                            ui.add_space(if spend_only(&slot).is_some() {
-                                10.0
-                            } else {
-                                12.0
-                            });
-                        }
-                        provider_block(ui, *p, &slot, self.precision, &mut renewal, &self.logos);
+                    ui.set_width(full_width - margin.sum().x);
+                    if providers.is_empty() {
+                        ui.label(RichText::new(empty).size(10.5).color(MUTED));
                     }
-                    if self.providers.is_empty() {
-                        ui.label(
-                            RichText::new("Every service is disabled in the config.")
-                                .size(10.5)
-                                .color(MUTED),
-                        );
+                    for (i, p) in providers.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(5.0);
+                        }
+                        if let Some(slot) = self.slots.get(p) {
+                            provider_block(
+                                ui,
+                                *p,
+                                slot,
+                                self.precision,
+                                &mut renewal,
+                                &self.logos,
+                                bindings.get(p).copied(),
+                            );
+                        }
                     }
                     if let Some(err) = &self.config_error {
                         ui.label(RichText::new(err).size(10.0).color(ERR));
                     }
 
-                    ui.add_space(10.0);
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if refresh_button(ui, "Refresh now", false) {
                             refresh = true;
@@ -1613,11 +1899,11 @@ impl eframe::App for App {
                             .unwrap_or_else(|| "fetching…".into());
                         ui.label(RichText::new(updated).size(9.5).color(MUTED));
 
-                        if let Some(t) = self.total() {
+                        if let Some(t) = self.total(&providers) {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let text = format!("${} / ${}", money(t.used), money(t.total));
-                                ui.label(RichText::new(text).size(10.0).color(MUTED))
-                                    .on_hover_text("Total across services");
+                                ui.label(RichText::new(text).size(10.5).color(TEXT))
+                                    .on_hover_text("Total across shown services");
                             });
                         }
                     });
@@ -1634,7 +1920,7 @@ impl eframe::App for App {
                 if minimized {
                     size.x + margin.sum().x
                 } else {
-                    WIDTH
+                    full_width
                 },
                 (size.y + margin.sum().y).min(1200.0),
             );
@@ -1652,7 +1938,7 @@ impl eframe::App for App {
         if native_menu_available && right_clicked && !egui::Popup::is_any_open(&ctx) {
             #[cfg(windows)]
             {
-                action = native_menu(frame, &self.providers, zoom, refresh_mins, minimized);
+                action = native_menu(frame, &found, &providers, zoom, refresh_mins, minimized);
             }
             #[cfg(target_os = "macos")]
             mac_menu(frame, self, zoom, refresh_mins, minimized);
@@ -1674,6 +1960,12 @@ impl eframe::App for App {
         if lookup_renewal {
             self.renewal_error = None;
             self.renewal_lookup = Some(renewal_lookup::start(ctx.clone()));
+        }
+        if self.restart.swap(false, Ordering::SeqCst) {
+            match update::restart() {
+                Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                Err(e) => message_box(&format!("Updated, but {e}"), true),
+            }
         }
     }
 }
@@ -1699,6 +1991,7 @@ mod lookup_tests {
                 .send(Update {
                     provider: Provider::Claude,
                     result: Ok(Usage {
+                        personal: false,
                         plan: None,
                         cycle: None,
                         note: None,
@@ -1748,6 +2041,7 @@ mod lookup_tests {
             .send(Update {
                 provider: Provider::Claude,
                 result: Ok(Usage {
+                    personal: false,
                     plan: None,
                     cycle: None,
                     note: None,
@@ -1805,6 +2099,7 @@ fn print_usage() {
 }
 
 fn main() -> eframe::Result {
+    let mut wait_for_exit = Duration::ZERO;
     match std::env::args().nth(1).as_deref() {
         Some("usage") => {
             print_usage();
@@ -1830,6 +2125,7 @@ fn main() -> eframe::Result {
                 Err(e) => finish(Err(e)),
             };
         }
+        Some("--updated") => wait_for_exit = Duration::from_secs(30),
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
         Some(flag) => {
@@ -1847,10 +2143,11 @@ usage: usage-widget [usage | prices | config | --startup | --no-startup]"
         return Ok(());
     }
 
-    if !claim_single_instance() {
+    if !claim_single_instance(wait_for_exit) {
         return Ok(());
     }
 
+    update::cleanup();
     let (config, config_error) = config::load();
     let options = eframe::NativeOptions {
         persist_window: true,
@@ -1948,28 +2245,42 @@ fn set_opacity(hwnd: isize, percent: u32) {
 
 /// Holds a named mutex for the life of the process; returns false if another
 /// instance already holds it (e.g. launched again, or at login while running).
+/// Keeps trying for up to `wait`, for when the other instance is about to exit.
 #[cfg(windows)]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(wait: Duration) -> bool {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateMutexW(attrs: *const core::ffi::c_void, owner: i32, name: *const u16) -> isize;
         fn GetLastError() -> u32;
+        fn CloseHandle(handle: isize) -> i32;
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
     let name = wide(r"Local\usage-widget-single-instance");
-    // The handle is deliberately never closed; Windows releases it on exit.
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS
+    let start = std::time::Instant::now();
+    loop {
+        // The handle is deliberately never closed once claimed; Windows releases it on exit.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS {
+                return true;
+            }
+            // Our own handle would keep the mutex alive, so drop it before retrying.
+            CloseHandle(handle);
+        }
+        if start.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
 #[cfg(not(windows))]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(_wait: Duration) -> bool {
     true
 }
 
+#[cfg(windows)]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Registers (or removes) this exe in the per-user Run key so it starts at login.
@@ -2028,19 +2339,7 @@ fn finish(result: Result<String, String>) -> eframe::Result {
         Ok(msg) => (msg.clone(), false),
         Err(msg) => (msg.clone(), true),
     };
-    #[cfg(windows)]
-    {
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
-        }
-        let text_w = wide(&text);
-        let caption_w = wide("usage-widget");
-        let icon = if is_err { 0x10 } else { 0x40 }; // MB_ICONERROR / MB_ICONINFORMATION
-        unsafe {
-            MessageBoxW(0, text_w.as_ptr(), caption_w.as_ptr(), icon);
-        }
-    }
+    message_box(&text, is_err);
     if is_err {
         eprintln!("{text}");
         std::process::exit(1);
@@ -2049,8 +2348,43 @@ fn finish(result: Result<String, String>) -> eframe::Result {
     Ok(())
 }
 
+/// Shows a message box on Windows; elsewhere the text goes to stderr.
+fn message_box(text: &str, _is_err: bool) {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
+        }
+        const MB_ICONERROR: u32 = 0x10;
+        const MB_ICONINFORMATION: u32 = 0x40;
+        // Without an owner window the box could open behind the always-on-top widget.
+        const MB_SETFOREGROUND: u32 = 0x1_0000;
+        const MB_TOPMOST: u32 = 0x4_0000;
+        let text_w = wide(text);
+        let caption_w = wide("usage-widget");
+        let icon = if _is_err {
+            MB_ICONERROR
+        } else {
+            MB_ICONINFORMATION
+        };
+        unsafe {
+            MessageBoxW(
+                0,
+                text_w.as_ptr(),
+                caption_w.as_ptr(),
+                icon | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!("{text}");
+}
+
 #[cfg(test)]
 mod display_tests {
+    use super::*;
+
     #[test]
     fn estimates_do_not_round_into_the_next_reported_percent() {
         for precision in [0, 1, 2] {
@@ -2060,6 +2394,237 @@ mod display_tests {
         assert_eq!(super::percent_label(87.0, 0, true), "~87.00%");
         assert_eq!(super::percent_label(87.0, 0, false), "87%");
         assert_eq!(super::percent_label(87.999, 3, true), "~87.990%");
+    }
+
+    fn window(label: &str, used: f64, resets_at: i64) -> Meter {
+        Meter {
+            label: Some(label.into()),
+            used,
+            total: 100.0,
+            unit: Unit::Percent,
+            resets_at: Some(resets_at),
+        }
+    }
+
+    fn personal_slot() -> Slot {
+        let now = now_unix();
+        Slot {
+            personal: true,
+            plan: Some("Max 5x".into()),
+            cycle: Some(Cycle {
+                verb: "renews".into(),
+                at: now + 9 * 86_400,
+                date_only: true,
+            }),
+            meters: Some(vec![
+                window("5h", 80.12, now + 3600),
+                window("week", 90.0, now + 4 * 86_400),
+                window("fable wk", 98.0, now + 4 * 86_400),
+            ]),
+            estimated: vec!["5h".into()],
+            updated: Some(now),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hidden_and_unavailable_services_are_excluded_from_totals() {
+        let (mut app, _, _) = App::for_test(Provider::ALL.to_vec());
+        assert!(app.found().is_empty());
+        for (p, used) in [
+            (Provider::Copilot, 20.0),
+            (Provider::Claude, 30.0),
+            (Provider::Codex, 40.0),
+        ] {
+            app.slots.insert(
+                p,
+                Slot {
+                    meters: Some(vec![Meter {
+                        label: None,
+                        used,
+                        total: 100.0,
+                        unit: Unit::Dollars,
+                        resets_at: None,
+                    }]),
+                    updated: Some(now_unix()),
+                    ..Default::default()
+                },
+            );
+        }
+        app.toggle(Provider::Claude);
+        let shown = app.shown();
+        assert_eq!(shown, [Provider::Copilot, Provider::Codex]);
+        let total = app.total(&shown).unwrap();
+        assert_eq!((total.used, total.total), (60.0, 200.0));
+        app.slots.get_mut(&Provider::Codex).unwrap().error = Some(FetchError {
+            problem: Problem::NotAvailable,
+            detail: "no paid plan".into(),
+        });
+        assert_eq!(app.shown(), [Provider::Copilot]);
+        assert!(app.total(&app.shown()).is_none());
+        app.toggle(Provider::Copilot);
+        assert_eq!(app.empty_text(&app.found()).1, "All hidden");
+    }
+
+    #[test]
+    fn primary_windows_keep_scoped_caps_and_renewals_in_hover_text() {
+        let slot = personal_slot();
+        assert_eq!(
+            slot.windows()
+                .iter()
+                .map(|m| m.label.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["5h", "week"]
+        );
+        let hover = usage_hover(&slot, 0);
+        assert!(hover.contains("Max 5x"));
+        assert!(hover.contains("renews 9d"));
+        assert!(hover.contains("5h: ~80.12%"));
+        assert!(hover.contains("fable wk: 98%"));
+    }
+
+    #[test]
+    fn first_fetch_retains_learned_ratio_and_plan_change_resets_it() {
+        let (mut app, updates, _) = App::for_test(vec![Provider::Claude]);
+        let now = now_unix();
+        let mut ratio = limits::Ratio::default();
+        ratio.observe(
+            &window("5h", 0.0, now + 3600),
+            &window("week", 0.0, now + 4 * 86_400),
+        );
+        ratio.observe(
+            &window("5h", 30.0, now + 3600),
+            &window("week", 3.0, now + 4 * 86_400),
+        );
+        app.ratios.insert("Claude".into(), ratio);
+        for (plan, expected) in [("Max 5x", Some(0.1)), ("Max 20x", None)] {
+            updates
+                .send(Update {
+                    provider: Provider::Claude,
+                    result: Ok(Usage {
+                        personal: true,
+                        plan: Some(plan.into()),
+                        cycle: None,
+                        note: None,
+                        estimated: vec!["5h".into()],
+                        meters: vec![
+                            window("5h", 30.47, now + 3600),
+                            window("week", 3.0, now + 4 * 86_400),
+                        ],
+                    }),
+                    at: now,
+                    started: std::time::Instant::now(),
+                })
+                .unwrap();
+            app.drain();
+            assert_eq!(app.ratios["Claude"].weekly_per_five_hour(), expected);
+        }
+    }
+
+    fn rendered_text(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Text(t) => Some(t.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn estimates_fit_one_header_and_one_bar_and_compact_uses_binding() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = App::for_test(vec![Provider::Claude]);
+        app.slots.insert(Provider::Claude, personal_slot());
+        let resets = now_unix();
+        let mut ratio = limits::Ratio::default();
+        ratio.observe(
+            &window("5h", 0.0, resets + 3600),
+            &window("week", 0.0, resets + 4 * 86_400),
+        );
+        ratio.observe(
+            &window("5h", 30.0, resets + 3600),
+            &window("week", 3.0, resets + 4 * 86_400),
+        );
+        app.ratios.insert("Claude".into(), ratio);
+        assert_eq!(app.binding(Provider::Claude), Some(0));
+        let mut height = 0.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(500.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |root| {
+                let width = app.card_width(&ctx, &app.shown());
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.inner_margin(MARGIN))
+                    .show(root, |ui| {
+                        let mut renewal = RenewalButton {
+                            running: false,
+                            error: None,
+                            clicked: false,
+                            cancelled: false,
+                        };
+                        let response = ui.vertical(|ui| {
+                            ui.set_width(width - 2.0 * f32::from(MARGIN));
+                            provider_block(
+                                ui,
+                                Provider::Claude,
+                                &app.slots[&Provider::Claude],
+                                0,
+                                &mut renewal,
+                                &HashMap::new(),
+                                Some(0),
+                            )
+                        });
+                        height = response.response.rect.height();
+                        assert!(
+                            response.response.rect.width() + 2.0 * f32::from(MARGIN) <= width + 1.0,
+                            "rendered width {} exceeds requested {width}",
+                            response.response.rect.width() + 2.0 * f32::from(MARGIN)
+                        );
+                    });
+            },
+        );
+        assert!(height < 45.0, "header and bar expanded to {height}");
+        let text = rendered_text(&output);
+        assert!(text.iter().any(|t| t == "~80.12%"), "{text:?}");
+        assert!(text.iter().any(|t| t == "90%"));
+        assert!(!text.iter().any(|t| t.contains("fable")));
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .filter(|s| matches!(&s.shape, Shape::Rect(r) if r.fill == TRACK))
+                .count(),
+            1
+        );
+
+        output.textures_delta.clear();
+        let bindings = HashMap::from([(Provider::Claude, 0)]);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                ui.horizontal(|ui| {
+                    compact_row(
+                        ui,
+                        &[Provider::Claude],
+                        &app.slots,
+                        &HashMap::new(),
+                        0,
+                        &bindings,
+                        "",
+                    )
+                });
+            });
+        });
+        let text = rendered_text(&output);
+        assert!(text.iter().any(|t| t == "~80.12%"), "{text:?}");
+        assert!(!text.iter().any(|t| t == "98%"));
+        output.textures_delta.clear();
     }
 }
 

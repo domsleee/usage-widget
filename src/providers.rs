@@ -8,9 +8,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
@@ -74,6 +73,8 @@ pub enum Unit {
 
 #[derive(Serialize)]
 pub struct Usage {
+    /// Personal subscriptions use percent windows in the compact header.
+    pub personal: bool,
     /// Subscription name, e.g. "Max 5x" or "Enterprise".
     pub plan: Option<String>,
     /// When the plan renews or its quota resets.
@@ -203,7 +204,7 @@ pub fn tls() -> ureq::tls::TlsConfig {
         .build()
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(tls())
         .timeout_global(Some(Duration::from_secs(25)))
@@ -310,12 +311,8 @@ fn jwt_exp(token: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Token refresh via the owning CLI
+// Errors
 // ---------------------------------------------------------------------------
-
-/// Minimum gap between headless CLI runs per provider, so a persistent auth
-/// failure does not spend a prompt on every refresh.
-const REFRESH_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 /// What went wrong reading a service, shown in short on the widget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,74 +359,11 @@ impl FetchError {
             detail: detail.into(),
         }
     }
-
-    /// An expired or rejected token, which running the owning CLI may refresh.
-    fn needs_refresh(&self) -> bool {
-        matches!(self.problem, Problem::TokenExpired | Problem::TokenRejected)
-    }
-
-    fn with_cause(self, why: &str) -> Self {
-        FetchError::new(self.problem, format!("{} ({why})", self.detail))
-    }
 }
 
 impl From<String> for FetchError {
     fn from(e: String) -> Self {
         FetchError::new(Problem::Other, e)
-    }
-}
-
-/// Runs `fetch`; on an expired or rejected token runs `refresh` and tries once more.
-fn with_refresh<T>(
-    mut fetch: impl FnMut() -> Result<T, FetchError>,
-    refresh: fn() -> Result<(), String>,
-) -> Result<T, FetchError> {
-    match fetch() {
-        Err(e) if e.needs_refresh() => match refresh() {
-            Ok(()) => fetch(),
-            Err(why) => Err(e.with_cause(&why)),
-        },
-        r => r,
-    }
-}
-
-/// Runs a CLI headlessly and waits for it, rate-limited by `last`. `program` is
-/// tried as-is and then with `.cmd`, since npm installs ship a shim that
-/// Command only finds by full name.
-fn run_headless(last: &Mutex<Option<Instant>>, program: &str, args: &[&str]) -> Result<(), String> {
-    {
-        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|t| t.elapsed() < REFRESH_COOLDOWN) {
-            return Err("auto-refresh tried recently".into());
-        }
-        *last = Some(Instant::now());
-    }
-
-    let spawn = |program: &str| {
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(std::env::temp_dir())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        no_window(&mut cmd);
-        cmd.spawn()
-    };
-    let mut child = spawn(program)
-        .or_else(|_| spawn(&format!("{program}.cmd")))
-        .map_err(|e| format!("could not run {program}: {e}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => return Err(format!("headless {program} failed")),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
-            _ => {
-                let _ = child.kill();
-                return Err(format!("headless {program} timed out"));
-            }
-        }
     }
 }
 
@@ -439,10 +373,10 @@ fn run_headless(last: &Mutex<Option<Instant>>, program: &str, args: &[&str]) -> 
 
 fn github_token() -> Result<String, FetchError> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(t) = std::env::var(var) {
-            if !t.trim().is_empty() {
-                return Ok(t.trim().to_string());
-            }
+        if let Ok(t) = std::env::var(var)
+            && !t.trim().is_empty()
+        {
+            return Ok(t.trim().to_string());
         }
     }
     let mut cmd = Command::new("gh");
@@ -512,6 +446,9 @@ fn copilot() -> Result<Usage, FetchError> {
             at,
         });
     Ok(Usage {
+        personal: json["copilot_plan"]
+            .as_str()
+            .is_some_and(|p| p.starts_with("individual")),
         plan: copilot_plan(&json),
         cycle,
         note: None,
@@ -521,6 +458,18 @@ fn copilot() -> Result<Usage, FetchError> {
 }
 
 fn copilot_meters(json: &Value) -> Result<Vec<Meter>, FetchError> {
+    let plan = json["copilot_plan"].as_str().unwrap_or_default();
+    if plan == "free"
+        || (plan.starts_with("individual")
+            && json["access_type_sku"]
+                .as_str()
+                .is_some_and(|s| s.contains("free")))
+    {
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "Copilot Free has no paid plan to track",
+        ));
+    }
     let snap = &json["quota_snapshots"]["premium_interactions"];
     if snap.is_null() {
         return Err(FetchError::new(
@@ -543,6 +492,19 @@ fn copilot_meters(json: &Value) -> Result<Vec<Meter>, FetchError> {
     let used = f64_of(&snap["credits_used"])
         .or_else(|| f64_of(&snap["remaining"]).map(|r| total - r))
         .unwrap_or(0.0);
+    if plan.starts_with("individual") {
+        return Ok(vec![Meter {
+            label: Some("mo".into()),
+            used: if total > 0.0 {
+                used / total * 100.0
+            } else {
+                0.0
+            },
+            total: if total > 0.0 { 100.0 } else { 0.0 },
+            unit: Unit::Percent,
+            resets_at: None,
+        }]);
+    }
     Ok(vec![Meter {
         label: None,
         used: used * COPILOT_USD_PER_CREDIT,
@@ -557,6 +519,7 @@ fn copilot_plan(json: &Value) -> Option<String> {
     Some(
         match json["copilot_plan"].as_str().filter(|s| !s.is_empty())? {
             "individual" if sku.contains("pro_plus") => "Pro+".into(),
+            "individual_pro" => "Pro+".into(),
             "individual" if sku.contains("free") => "Free".into(),
             "individual" => "Pro".into(),
             other => title_case(other),
@@ -765,7 +728,7 @@ fn claude_should_call(api: bool, now: i64, newest: Option<i64>, state: &ClaudeSt
 
 fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
     let api = config.api;
-    let mut creds = claude_credentials();
+    let creds = claude_credentials();
     let ClaudeCodeState {
         cache,
         account,
@@ -775,6 +738,13 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
     } = claude_code_state();
     let mut state = ClaudeState::load();
     let now = now_unix();
+    let plan = profile_plan.or_else(|| claude_oauth(&creds).ok().and_then(claude_plan));
+    if plan.as_deref() == Some("Free") {
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "Claude Free has no plan usage to track",
+        ));
+    }
     if note_account(&mut state, account.as_deref(), now) {
         state.save();
     }
@@ -795,17 +765,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
     let mut problem = None;
     if claude_should_call(api, now, newest, &state) {
         state.last_attempt = now;
-        let first = claude_api(claude_oauth(&creds), version.as_deref());
-        let result = match first {
-            Err(ClaudeError::Fetch(e)) if e.needs_refresh() => match refresh_claude_token() {
-                Ok(()) => {
-                    creds = claude_credentials();
-                    claude_api(claude_oauth(&creds), version.as_deref())
-                }
-                Err(why) => Err(e.with_cause(&why).into()),
-            },
-            r => r,
-        };
+        let result = claude_api(claude_oauth(&creds), version.as_deref());
         match result {
             Ok(usage) => {
                 state.last = Some(Snapshot {
@@ -823,8 +783,6 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
         }
         state.save();
     }
-    let oauth = claude_oauth(&creds);
-    let plan = profile_plan.or_else(|| oauth.ok().and_then(claude_plan));
 
     let rate_limited = now < state.blocked_until;
     let snap = [cache.as_ref(), state.last.as_ref()]
@@ -930,6 +888,9 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
         None => note,
     };
     Ok(Usage {
+        personal: plan
+            .as_deref()
+            .is_some_and(|p| p == "Pro" || p.starts_with("Max")),
         plan,
         cycle,
         note,
@@ -1072,10 +1033,17 @@ fn claude_code_state() -> ClaudeCodeState {
     };
     let account = v["oauthAccount"]["accountUuid"].as_str().map(String::from);
     let version = v["lastReleaseNotesSeen"].as_str().map(String::from);
-    let org = v["oauthAccount"]["organizationUuid"].as_str().map(String::from);
+    let org = v["oauthAccount"]["organizationUuid"]
+        .as_str()
+        .map(String::from);
     let plan = v["oauthAccount"]["organizationType"]
         .as_str()
-        .and_then(|kind| plan_name(kind, v["oauthAccount"]["organizationRateLimitTier"].as_str()));
+        .and_then(|kind| {
+            plan_name(
+                kind,
+                v["oauthAccount"]["organizationRateLimitTier"].as_str(),
+            )
+        });
     let c = &v["cachedUsageUtilization"];
     // Ignore a cache left behind by another account.
     let cache = (account.is_none() || c["accountUuid"].as_str() == account.as_deref())
@@ -1110,27 +1078,6 @@ impl From<FetchError> for ClaudeError {
     fn from(e: FetchError) -> Self {
         ClaudeError::Fetch(e)
     }
-}
-
-/// Claude Code only refreshes its OAuth token while it runs, so an idle machine
-/// ends up with an expired one. A one-line headless prompt on the smallest model
-/// makes it refresh and write the new token back to its credentials store.
-fn refresh_claude_token() -> Result<(), String> {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    run_headless(
-        &LAST,
-        "claude",
-        &[
-            "-p",
-            "--model",
-            "haiku",
-            "--max-turns",
-            "1",
-            "--no-session-persistence",
-            "--strict-mcp-config",
-            "reply with ok",
-        ],
-    )
 }
 
 /// The usage endpoint answers unknown clients with 429s after a few calls but
@@ -1204,12 +1151,10 @@ fn plan_name(kind: &str, tier: Option<&str>) -> Option<String> {
     }
     let name = title_case(kind);
     // Keep the "5x".
-    let tier = tier
-        .and_then(|t| t.rsplit('_').next())
-        .filter(|t| {
-            t.strip_suffix('x')
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        });
+    let tier = tier.and_then(|t| t.rsplit('_').next()).filter(|t| {
+        t.strip_suffix('x')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    });
     Some(match tier {
         Some(t) => format!("{name} {t}"),
         None => name,
@@ -1305,31 +1250,7 @@ fn claude_meters(json: &Value) -> Vec<Meter> {
 // ---------------------------------------------------------------------------
 
 fn codex(estimate: bool) -> Result<Usage, FetchError> {
-    with_refresh(|| codex_once(estimate), refresh_codex_token)
-}
-
-/// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it
-/// runs. A one-line `codex exec` at low reasoning effort makes it refresh and
-/// write the new token back to `auth.json`. The user config is skipped so a
-/// costly default model/effort or MCP servers are not used for it.
-fn refresh_codex_token() -> Result<(), String> {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    run_headless(
-        &LAST,
-        "codex",
-        &[
-            "exec",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--sandbox",
-            "read-only",
-            "-c",
-            "model_reasoning_effort=\"low\"",
-            "reply with ok",
-        ],
-    )
+    codex_once(estimate)
 }
 
 fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
@@ -1342,13 +1263,13 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
             "no tokens.access_token; log in with `codex`",
         )
     })?;
-    if let Some(exp) = jwt_exp(token) {
-        if exp < now_unix() {
-            return Err(FetchError::new(
-                Problem::TokenExpired,
-                "Codex token expired; run `codex` once to refresh",
-            ));
-        }
+    if let Some(exp) = jwt_exp(token)
+        && exp < now_unix()
+    {
+        return Err(FetchError::new(
+            Problem::TokenExpired,
+            "Codex token expired; run `codex` once to refresh",
+        ));
     }
     let account_id = tokens["account_id"].as_str().unwrap_or("");
 
@@ -1375,12 +1296,20 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
         }
     }
 
+    if json["plan_type"].as_str() == Some("free") {
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "ChatGPT Free has no paid plan to track",
+        ));
+    }
+    let personal = codex_personal(&json);
     let plan = codex_plan(&json);
     let cycle = codex_cycle(&headers, account_id);
     let mut meters = codex_meters(&json);
     if meters.is_empty() {
         if json["credits"]["unlimited"].as_bool() == Some(true) {
             return Ok(Usage {
+                personal: false,
                 plan,
                 cycle,
                 note: None,
@@ -1421,6 +1350,7 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
         }
     }
     Ok(Usage {
+        personal,
         plan,
         cycle,
         note,
@@ -1465,6 +1395,13 @@ fn codex_plan(json: &Value) -> Option<String> {
     )
 }
 
+fn codex_personal(json: &Value) -> bool {
+    matches!(
+        json["plan_type"].as_str(),
+        Some("plus" | "pro" | "prolite" | "go")
+    )
+}
+
 fn codex_meters(json: &Value) -> Vec<Meter> {
     let mut meters = Vec::new();
 
@@ -1487,7 +1424,11 @@ fn codex_meters(json: &Value) -> Vec<Meter> {
     }
 
     let lim = &json["spend_control"]["individual_limit"];
-    if let (Some(used), Some(limit)) = (f64_of(&lim["used"]), f64_of(&lim["limit"])) {
+    if let (false, Some(used), Some(limit)) = (
+        codex_personal(json),
+        f64_of(&lim["used"]),
+        f64_of(&lim["limit"]),
+    ) {
         meters.push(Meter {
             label: if meters.is_empty() {
                 None
@@ -1612,6 +1553,35 @@ mod tests {
     }
 
     #[test]
+    fn copilot_personal_is_a_monthly_percentage_and_free_is_absent() {
+        let json = serde_json::json!({ "copilot_plan": "individual_pro", "quota_snapshots": { "premium_interactions": { "entitlement": 1500, "remaining": 1125 } } });
+        let meters = copilot_meters(&json).unwrap();
+        assert_eq!(meters[0].label.as_deref(), Some("mo"));
+        assert_eq!(meters[0].unit, Unit::Percent);
+        assert_eq!(meters[0].percent(), 25.0);
+        for free in [
+            serde_json::json!({ "copilot_plan": "free" }),
+            serde_json::json!({ "copilot_plan": "individual", "access_type_sku": "copilot_free" }),
+        ] {
+            assert!(matches!(copilot_meters(&free), Err(e) if e.problem == Problem::NotAvailable));
+        }
+    }
+
+    #[test]
+    fn codex_personal_keeps_fractional_windows_and_excludes_business_spend() {
+        let mut json = serde_json::json!({ "plan_type": "prolite", "rate_limit": { "primary_window": { "used_percent": 71.37, "limit_window_seconds": 604800, "reset_at": 1789462965 } }, "spend_control": { "individual_limit": { "used": "1250", "limit": "12500" } } });
+        assert!(codex_personal(&json));
+        let meters = codex_meters(&json);
+        assert_eq!(meters.len(), 1);
+        assert_eq!(meters[0].used, 71.37);
+        assert_eq!(meters[0].resets_at, Some(1789462965));
+        json["plan_type"] = serde_json::json!("business");
+        assert!(!codex_personal(&json));
+        let meters = codex_meters(&json);
+        assert_eq!(meters[1].summary(), "$50 / $500");
+    }
+
+    #[test]
     fn copilot_without_quota_is_not_available() {
         let json = serde_json::json!({ "quota_snapshots": {} });
         assert!(matches!(
@@ -1627,19 +1597,6 @@ mod tests {
             read_json_file(&path, "log in"),
             Err(e) if e.problem == Problem::NotAvailable
         ));
-    }
-
-    #[test]
-    fn failed_token_refresh_keeps_the_problem() {
-        fn expired() -> Result<Vec<Meter>, FetchError> {
-            Err(FetchError::new(Problem::TokenExpired, "token expired"))
-        }
-        fn refresh_fails() -> Result<(), String> {
-            Err("auto-refresh tried recently".into())
-        }
-        let e = with_refresh(expired, refresh_fails).unwrap_err();
-        assert_eq!(e.problem, Problem::TokenExpired);
-        assert_eq!(e.detail, "token expired (auto-refresh tried recently)");
     }
 
     #[test]
@@ -1875,15 +1832,17 @@ mod tests {
                     renewal_date: Some(date.into()),
                     ..Default::default()
                 };
-                let mut state = ClaudeState::default();
-                state.renewal = Some((
-                    0,
-                    Cycle {
-                        verb: "renews".into(),
-                        at: 1,
-                        date_only: true,
-                    },
-                ));
+                let mut state = ClaudeState {
+                    renewal: Some((
+                        0,
+                        Cycle {
+                            verb: "renews".into(),
+                            at: 1,
+                            date_only: true,
+                        },
+                    )),
+                    ..Default::default()
+                };
                 let meters = claude_meters(&serde_json::json!({
                     "extra_usage": { "used_credits": 10, "monthly_limit": total }
                 }));

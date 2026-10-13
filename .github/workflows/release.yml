@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and attach the exe to (e.g. v1.0.3)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:TAG) {
+            throw "Tag $env:TAG does not match Cargo.toml version $version"
+          }
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Attach exe to release
+        shell: pwsh
+        run: gh release upload $env:TAG target/release/usage-widget.exe --clobber --repo ${{ github.repository }}

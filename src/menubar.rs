@@ -26,6 +26,7 @@ pub struct MenuBar {
     _tray: TrayIcon,
     toggle: MenuItem,
     actions: Vec<(MenuId, Action)>,
+    services: Vec<(Provider, CheckMenuItem)>,
     rx: Receiver<MenuId>,
     /// The items of the last right-click popup. AppKit delivers a choice after
     /// the popup has closed, so it arrives with the menu bar's clicks.
@@ -46,6 +47,14 @@ impl MenuBar {
             })
             .collect();
         let edit = MenuItem::new("Edit config", true, None);
+        let services: Vec<_> = providers
+            .iter()
+            .map(|&p| (p, CheckMenuItem::new(p.name(), false, true, None)))
+            .collect();
+        let show = Submenu::new("Show", true);
+        for (_, item) in &services {
+            show.append(item).map_err(|e| e.to_string())?;
+        }
         let quit = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
@@ -53,6 +62,7 @@ impl MenuBar {
             |item: &dyn tray_icon::menu::IsMenuItem| menu.append(item).map_err(|e| e.to_string());
         append(&toggle)?;
         append(&refresh)?;
+        append(&show)?;
         append(&PredefinedMenuItem::separator())?;
         for (item, _) in &opens {
             append(item)?;
@@ -71,6 +81,11 @@ impl MenuBar {
             opens
                 .iter()
                 .map(|(item, p)| (item.id().clone(), Action::Open(*p))),
+        );
+        actions.extend(
+            services
+                .iter()
+                .map(|(p, item)| (item.id().clone(), Action::Widget(MenuAction::Toggle(*p)))),
         );
 
         // Clicks arrive on the main thread; wake the UI so it acts on them straight
@@ -93,6 +108,7 @@ impl MenuBar {
             _tray: tray,
             toggle,
             actions,
+            services,
             rx,
             popup_actions: RefCell::default(),
         })
@@ -125,6 +141,7 @@ impl MenuBar {
         &self,
         ns_view: *const std::ffi::c_void,
         providers: &[Provider],
+        shown: &[Provider],
         zoom: f32,
         refresh_mins: u64,
         minimized: bool,
@@ -144,11 +161,22 @@ impl MenuBar {
         );
         let opens: Vec<MenuItem> = providers
             .iter()
-            .map(|&p| item(&format!("Open {} usage", p.name()), Some(MenuAction::Open(p))))
+            .map(|&p| {
+                item(
+                    &format!("Open {} usage", p.name()),
+                    Some(MenuAction::Open(p)),
+                )
+            })
             .collect();
         let note = item(&format!("Refreshes every {refresh_mins} min"), None);
         let edit = item("Edit config", Some(MenuAction::EditConfig));
         let quit = item("Quit", Some(MenuAction::Quit));
+        let show = Submenu::new("Show", true);
+        for &p in providers {
+            let check = CheckMenuItem::new(p.name(), true, shown.contains(&p), None);
+            actions.push((check.id().clone(), MenuAction::Toggle(p)));
+            let _ = show.append(&check);
+        }
         let sizes = Submenu::new("Size", true);
         for z in SIZES {
             let size = CheckMenuItem::new(
@@ -164,6 +192,9 @@ impl MenuBar {
         let menu = Menu::new();
         let separator = PredefinedMenuItem::separator;
         let _ = menu.append_items(&[&refresh, &minimize, &separator()]);
+        if !providers.is_empty() {
+            let _ = menu.append_items(&[&show, &separator()]);
+        }
         for open in &opens {
             let _ = menu.append(open);
         }
@@ -177,6 +208,13 @@ impl MenuBar {
     pub fn set_widget_shown(&self, shown: bool) {
         self.toggle
             .set_text(if shown { "Hide widget" } else { "Show widget" });
+    }
+
+    pub fn set_services(&self, found: &[Provider], shown: &[Provider]) {
+        for (p, item) in &self.services {
+            item.set_enabled(found.contains(p));
+            item.set_checked(shown.contains(p));
+        }
     }
 }
 

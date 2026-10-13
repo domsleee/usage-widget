@@ -1,156 +1,88 @@
 # usage-widget
 
-Always-on-top widget for GitHub Copilot, Claude and Codex usage, plans and renewals.
+A small always-on-top Windows and macOS widget that shows how much of your GitHub Copilot,
+Claude and Codex allowance you have used.
 
-| Dollar budgets | Plan usage windows |
+| Business plans | Personal subscriptions |
 | --- | --- |
-| <img width="270" height="147" alt="Widget showing Copilot, Claude and Codex spend against their budgets, one line each, with a combined total" src="docs/usage-widget-dollars.png" /> | <img width="270" height="173" alt="Widget showing Claude and Codex plans with renewal dates, usage windows side by side and reset times" src="docs/usage-widget.png" /> |
+| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="262" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset countdown" src="docs/personal-plans.png" /> |
 
 Minimized:
 
-<img width="483" height="171" alt="Minimized one-line widget with logos and coloured percentages" src="https://github.com/user-attachments/assets/d055487b-2c99-4984-b1cd-de8b0e231424" />
+<img width="227" alt="Minimized widget: one line with each service's logo and estimated percentage" src="docs/minimized.png" />
 
 ## Install
 
-Needs Rust. Built for Windows; runs on macOS without `--startup`.
+Build this branch with [Rust](https://rustup.rs):
 
 ```bash
-cargo install --git https://github.com/pepsi-enjoyer/usage-widget
-usage-widget --startup   # start at login; --no-startup undoes
+cargo install --git https://github.com/domsleee/usage-widget --branch usage-details-and-estimates
 usage-widget
 ```
 
-Quit the widget, then re-run `cargo install` and start it again to upgrade. On Windows
-only one copy runs at a time.
+On Windows, run `usage-widget --startup` once to start at login
+(`--no-startup` undoes it). On macOS it lives in the menu bar, without a Dock icon,
+and returns the terminal prompt when started as a release build.
 
-## Use
+Windows supports upstream's release updater. Set `USAGE_WIDGET_AUTO_UPDATE=0` to
+keep this branch's additions when newer upstream releases are published; upgrade
+this branch by running `cargo install` again. The upstream Windows executable
+has only upstream's features.
 
-- Drag to move; position is remembered (on Windows, pulled back on screen if its monitor is gone).
-- Right-click: refresh, minimize, size, usage pages, edit config, quit (no taskbar entry).
-- Minimize shrinks it to one line (`COP 87%  CLD 83%  CDX 99%` with logos), showing the
-  most-used window per service. The widget reopens in whichever mode it was left in.
-- A service not set up here (no `gh` login or Copilot plan, never logged in to Claude
-  Code or Codex) shows "Not Available" with an empty bar, or `N/A` when minimized.
-  Other problems, like an expired token or no connection, show a short reason in red,
-  or `!` when minimized. Hover it for the full message.
-- Size scales it from 25% to 200% on top of display scaling (Ctrl +/- also works).
-- macOS: lives in the menu bar, with no Dock icon or Cmd+Tab entry. Its menu also hides and shows the widget. Started from a terminal, it runs in the background and returns the prompt.
+## Setup
 
-`usage-widget usage` prints subscription usage as JSON without opening a window,
-using the same providers and config as the widget, with local estimates disabled.
-The [subscription-usage skill](skills/subscription-usage/SKILL.md) lets agents read it.
-`usage-widget prices` prints the estimator's token rates per million tokens,
-separating normal input, cache reads, Claude cache writes and output. Codex uses
-credits; Claude uses relative cost weights for calibration. Unlisted Codex models
-use the displayed fallback, and Claude models match a family or the default.
+There is nothing to log in to. The widget uses the logins your CLIs already have:
 
-## Config
+- **Copilot:** the GitHub CLI (`gh auth login`)
+- **Claude:** Claude Code (`claude`)
+- **Codex:** the Codex CLI (`codex`)
 
-`usage-widget config` creates and opens `config.toml` (in `$VISUAL`/`$EDITOR` if set):
-`%APPDATA%\usage-widget\` on Windows, `~/Library/Application Support/usage-widget/` on
-macOS. Restart the widget after editing.
+Only services you have a paid plan with are shown. If a token expires, the widget
+says so; run that CLI once and it picks the new token up.
 
-```toml
-refresh_mins = 5    # minutes between refreshes, minimum 1
-opacity = 85        # window opacity, 20-100
-precision = 1       # decimal places for percentages, 0-3
+## What it shows
 
-[copilot]
-enabled = true      # false hides a service; same key under each
+- **Business plans** (Copilot Business/Enterprise, Claude Team/Enterprise, ChatGPT
+  Business/Enterprise): dollars spent against your limit, with a total at the bottom.
+- **Personal plans** (Claude Pro/Max, ChatGPT Plus/Pro): your 5-hour and weekly usage.
+  The one you will run out of first is highlighted, the bar shows it, and the timer
+  shows when it resets. Copilot Pro shows its monthly allowance.
 
-[claude]
-enabled = true
-api = true          # false = read Claude Code's cache only
-browser_cookies = false  # macOS: read the claude.ai login cookie for the renewal date
-# renewal_date = "2026-10-12"  # optional manual next billing date, including Windows
-estimate = false    # estimate between percentage ticks from local logs; shown with ~
+Bars go green, yellow and red as you use more. Hover a service name for its plan,
+renewal date, exact reset times and additional caps. Click its name to open usage.
 
-[codex]
-enabled = true
-estimate = false    # as for Claude
-```
+Optional local estimates fill in the fraction between percentage ticks and show
+`~`. The widget keeps the same compact layout and widens only when decimals need
+more room.
 
-`claude.renewal_date` uses your local calendar date and overrides browser lookup.
-Update it after each renewal; the widget does not assume a monthly billing schedule.
-An invalid or past date shows a note while usage meters keep working.
+## Using it
 
-### Look up Claude's renewal date with Playwright
+- Drag it anywhere. It remembers where it was.
+- Right-click to refresh, minimize, resize, check for updates, open each service's
+  usage page, or quit.
+- Untick a service under Show in the right-click menu to hide it. Tick it again to
+  bring it back.
+- On macOS, the menu bar menu also hides and shows the widget.
+- Hover a red error to see the full message.
 
-Subscription plans only; usage-based plans with a monthly spend cap reset monthly and
-show no lookup. When Claude's renewal date is missing, click the tiny circular-arrow
-icon beside **Claude**. Once the date is shown, right-click the renewal text and choose
-**Look up renewal** instead. With Node.js and Chrome
-installed, it sets up the helper automatically, opens Chrome for sign-in, and
-applies the saved date without restarting the widget. The icon becomes a spinner
-while a lookup is running, or turns red on failure; hover for details and click to retry.
+Run `usage-widget config` to edit refresh interval, opacity, percentage precision
+and provider settings. Claude renewal lookup and local estimates are optional;
+see [settings, renewals and estimates](docs/usage-details.md).
 
-To run the helper separately from this checkout:
+`usage-widget usage` prints subscription usage as JSON without opening a window.
+`usage-widget prices` prints the estimator's token rates per model. The
+[subscription-usage skill](skills/subscription-usage/SKILL.md) exposes both to agents.
 
-```powershell
-npm ci --prefix scripts
-npm --prefix scripts run claude-renewal
-```
+Environment variables override the matching config settings:
 
-The helper opens regular Chrome with a separate profile. Complete any verification
-and sign in to Claude there on the first run. Playwright attaches only after the
-Claude app opens; it does not run during verification or sign-in. The profile
-remembers that session for future lookups. The helper checks the workspace
-against Claude Code's account, reads the subscription date, and saves
-`claude.renewal_date` in your config. Run it again
-after each renewal; this is an on-demand lookup, with no extension or background
-browser polling. Cancelled subscriptions leave the config unchanged.
+| Variable | Does | Default |
+| --- | --- | --- |
+| `USAGE_WIDGET_REFRESH_MINS` | Minutes between refreshes | `5` |
+| `USAGE_WIDGET_OPACITY` | Window opacity, 20-100 | `85` |
+| `USAGE_WIDGET_AUTO_UPDATE` | `0` turns off automatic updates | on |
 
-The helper preserves existing settings, formatting and comments, and keeps the
-first backup as `config.toml.before-renewal`. Unsupported TOML layouts are left
-unchanged with an error. The browser profile is
-stored in `claude-browser` beside the config. Use `-- --browser msedge` for Edge;
-`-- --config <path> --profile <directory>` allows separate test settings and login.
+## Notes
 
-While the helper is open, its dedicated browser exposes a debugging endpoint to
-local processes on this computer. It closes immediately after reading the date.
-Widget lookups have a timeout and stop their processes when the widget closes;
-right-click the renewal text to cancel an active lookup. Progress and failures
-appear beside the renewal text. Estimated usage always shows at least two decimal
-places so it cannot round up to the next reported percentage.
-
-Installation has its own two-minute timeout. Each browser lookup gets a separate
-budget, including five minutes for sign-in and a fresh minute for the workspace
-API. Date-only renewals use calendar-day labels, including “today”, without
-claiming a billing time. Fractional usage reported by a service is kept as-is;
-local estimates apply only to whole-percent readings.
-
-## Credentials
-
-Reuses the CLIs' stored credentials; never writes them.
-
-| Service | Credential |
-| --- | --- |
-| Copilot | `gh auth token`, `GITHUB_TOKEN` or `GH_TOKEN` |
-| Claude | `~/.claude/.credentials.json` (macOS: keychain) |
-| Codex | `~/.codex/auth.json` |
-
-API endpoints are undocumented.
-
-### Claude Code status line
-
-For live Claude 5-hour and weekly usage, the widget needs your Claude Code status
-line to save its input. Add these lines to the start of your status line script,
-then use `$INPUT` wherever the script previously read stdin:
-
-```bash
-INPUT=$(cat)
-case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-statusline.json;; esac
-```
-
-This updates usage as you use Claude Code, without extra requests. Without it,
-the widget uses cached data and polls at most every 3 minutes, subject to rate limits.
-
-Estimates only cover local logs; Claude needs a few percentage ticks to calibrate.
-With `estimate = true`, daily JSONL history retains readings, token counts,
-calibration and predictions until manually removed. It excludes conversations and
-credentials. See [estimate history](docs/estimate-history.md) for paths, token
-totals and replay rules.
-Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,
-with a keychain access prompt on first use. An expired token is refreshed with a
-one-line `claude -p` on Haiku or `codex exec` at low effort (each at most every 15 min).
-Dollar rates: `src/providers.rs`. Logos: [Simple Icons](https://simpleicons.org) (CC0).
+The usage numbers come from the same endpoints the CLIs and web settings pages use.
+They are not officially documented and may change. Logos are from
+[Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
