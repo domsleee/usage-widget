@@ -1,5 +1,6 @@
-//! Small time helpers so we don't need chrono for a couple of conversions.
+//! Time parsing, countdowns and local reset dates.
 
+use chrono::{Local, TimeZone};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_unix() -> i64 {
@@ -24,6 +25,14 @@ pub fn ago(ts: i64) -> String {
 /// Time left until a future timestamp as dd:hh:mm.
 pub fn until(ts: i64) -> String {
     countdown((ts - now_unix()).max(0))
+}
+
+/// A reset date in the computer's time zone, including its offset at that date.
+pub fn local_datetime(ts: i64) -> Option<String> {
+    Local.timestamp_opt(ts, 0).single().map(|date| {
+        date.format("%a %-d %b %Y, %H:%M\nLocal time (UTC%:z)")
+            .to_string()
+    })
 }
 
 /// dd:hh:mm, or hh:mm once under a day.

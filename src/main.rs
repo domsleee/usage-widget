@@ -709,14 +709,27 @@ fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
                 ui.label(RichText::new(label).size(size).color(weighted(LIGHT, w)));
             }
             let pct = m.percent();
-            ui.label(
+            let percentage = ui.label(
                 RichText::new(format!("{pct:.0}%"))
                     .size(size)
                     .strong()
                     .color(weighted(level_color(pct), w)),
             );
+            if let Some(text) = reset_tooltip(m) {
+                percentage.on_hover_text(text);
+            }
         }
     });
+}
+
+fn reset_tooltip(m: &Meter) -> Option<String> {
+    let date = timeutil::local_datetime(m.resets_at?)?;
+    let window = match m.label.as_deref() {
+        Some("5h") => "5-hour window",
+        Some("wk") => "Weekly window",
+        _ => "Usage window",
+    };
+    Some(format!("{window} resets\n{date}"))
 }
 
 /// Eases from the values last shown to `target` over `SWITCH_SECS` whenever the
@@ -782,10 +795,14 @@ fn provider_block(
         provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.label(name);
-        if let Some(at) = selected.and_then(|m| m.resets_at) {
+        if let Some(m) = selected
+            && let Some(at) = m.resets_at
+        {
             let text = RichText::new(format!("({})", until(at))).size(11.0);
-            ui.label(text.color(LIGHT))
-                .on_hover_text("Until this window resets");
+            let countdown = ui.label(text.color(LIGHT));
+            if let Some(text) = reset_tooltip(m) {
+                countdown.on_hover_text(text);
+            }
         }
         if slot.loading {
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));

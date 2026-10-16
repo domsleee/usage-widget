@@ -55,6 +55,8 @@ Bars go green, yellow and red as you use more.
 - Untick a service under Show in the right-click menu to hide it. Tick it again to
   bring it back.
 - Hover a red error to see the full message.
+- Hover a personal plan's countdown or percentage to see that window's reset date
+  and time in your local time zone.
 
 Optional settings, as environment variables:
 
