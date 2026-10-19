@@ -705,18 +705,21 @@ fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
             if i > 0 {
                 ui.label(RichText::new("|").size(size).color(MUTED));
             }
-            if let Some(label) = &m.label {
-                ui.label(RichText::new(label).size(size).color(weighted(LIGHT, w)));
-            }
-            let pct = m.percent();
-            let percentage = ui.label(
-                RichText::new(format!("{pct:.0}%"))
-                    .size(size)
-                    .strong()
-                    .color(weighted(level_color(pct), w)),
-            );
+            // One group per window, so its tooltip covers the label as well.
+            let window = ui.scope(|ui| {
+                if let Some(label) = &m.label {
+                    ui.label(RichText::new(label).size(size).color(weighted(LIGHT, w)));
+                }
+                let pct = m.percent();
+                ui.label(
+                    RichText::new(format!("{pct:.0}%"))
+                        .size(size)
+                        .strong()
+                        .color(weighted(level_color(pct), w)),
+                );
+            });
             if let Some(text) = reset_tooltip(m) {
-                percentage.on_hover_text(text);
+                window.response.on_hover_text(text);
             }
         }
     });
