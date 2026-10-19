@@ -723,13 +723,11 @@ fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
 }
 
 fn reset_tooltip(m: &Meter) -> Option<String> {
-    let date = timeutil::local_datetime(m.resets_at?)?;
-    let window = match m.label.as_deref() {
-        Some("5h") => "5-hour window",
-        Some("wk") => "Weekly window",
-        _ => "Usage window",
-    };
-    Some(format!("{window} resets\n{date}"))
+    let at = m.resets_at?;
+    if m.label.as_deref() == Some("5h") {
+        return Some(format!("Resets in {}", until(at)));
+    }
+    Some(format!("Resets on {}", timeutil::local_datetime(at)?))
 }
 
 /// Eases from the values last shown to `target` over `SWITCH_SECS` whenever the

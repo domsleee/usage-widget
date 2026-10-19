@@ -27,12 +27,12 @@ pub fn until(ts: i64) -> String {
     countdown((ts - now_unix()).max(0))
 }
 
-/// A reset date in the computer's time zone, including its offset at that date.
+/// A reset date in the computer's time zone, as "Fri 16 Oct 2026, 14:30".
 pub fn local_datetime(ts: i64) -> Option<String> {
-    Local.timestamp_opt(ts, 0).single().map(|date| {
-        date.format("%a %-d %b %Y, %H:%M\nLocal time (UTC%:z)")
-            .to_string()
-    })
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|date| date.format("%a %-d %b %Y, %H:%M").to_string())
 }
 
 /// dd:hh:mm, or hh:mm once under a day.
