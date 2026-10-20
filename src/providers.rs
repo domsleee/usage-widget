@@ -4,9 +4,10 @@
 use crate::timeutil::{now_unix, parse_rfc3339};
 use base64::Engine;
 use serde_json::Value;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
@@ -14,6 +15,10 @@ const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widg
 const COPILOT_USD_PER_CREDIT: f64 = 500.0 / 50_000.0;
 /// Codex workspace spend credits: 12,500 credits = $500.
 const CODEX_USD_PER_CREDIT: f64 = 500.0 / 12_500.0;
+/// Cheapest Codex model, for the headless run that refreshes its token.
+const CODEX_REFRESH_MODEL: &str = "gpt-6-luna";
+/// How long a headless CLI run may take before it is given up on.
+const HEADLESS_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provider {
@@ -47,6 +52,65 @@ impl Provider {
             Provider::Copilot => "https://github.com/settings/copilot/features",
             Provider::Claude => "https://claude.ai/new#settings/usage",
             Provider::Codex => "https://chatgpt.com/#settings/Usage",
+        }
+    }
+
+    /// Whether the token comes from a CLI that only refreshes it while it runs,
+    /// which `refresh_token` can make it do. `gh auth token` does not expire.
+    pub fn refreshes_token(self) -> bool {
+        matches!(self, Provider::Claude | Provider::Codex)
+    }
+
+    /// Runs a one-line headless prompt on the CLI's cheapest model, so it
+    /// refreshes its token and writes it back for the next fetch to pick up.
+    /// This spends a little usage, so it is only done when asked for.
+    pub fn refresh_token(self) -> Result<(), String> {
+        match self {
+            Provider::Copilot => Err("the gh token does not expire".into()),
+            Provider::Claude => run_headless(
+                "claude",
+                &[
+                    "-p",
+                    "--model",
+                    "haiku",
+                    "--effort",
+                    "low",
+                    "--max-turns",
+                    "1",
+                    "--no-session-persistence",
+                    "--strict-mcp-config",
+                    "--tools",
+                    "",
+                    "--disable-slash-commands",
+                    "--setting-sources",
+                    "",
+                    "--system-prompt",
+                    "Reply with ok.",
+                    "ok",
+                ],
+            ),
+            Provider::Codex => {
+                // The user config is skipped so a costly default model or effort
+                // and MCP servers are not used for it.
+                let run = |model: &[&str]| {
+                    let mut args = vec![
+                        "exec",
+                        "--skip-git-repo-check",
+                        "--ephemeral",
+                        "--ignore-user-config",
+                        "--ignore-rules",
+                        "--sandbox",
+                        "read-only",
+                        "-c",
+                        "model_reasoning_effort=\"low\"",
+                    ];
+                    args.extend(model);
+                    args.push("Reply with ok.");
+                    run_headless("codex", &args)
+                };
+                // Once that model is retired, the default one still refreshes.
+                run(&["-m", CODEX_REFRESH_MODEL]).or_else(|_| run(&[]))
+            }
         }
     }
 
@@ -181,6 +245,59 @@ fn no_window(cmd: &mut Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+/// Runs a CLI with no window or input, and fails with the last line it wrote to
+/// stderr if it does not succeed within `HEADLESS_TIMEOUT`.
+fn run_headless(program: &str, args: &[&str]) -> Result<(), String> {
+    let spawn = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        no_window(&mut cmd);
+        cmd.spawn()
+    };
+    // npm installs the CLIs as .cmd shims, which Command does not look for.
+    let mut child = spawn(program)
+        .or_else(|_| spawn(&format!("{program}.cmd")))
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    // Read on another thread so a chatty CLI cannot fill the pipe and stall.
+    let mut stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(e) = stderr.as_mut() {
+            let _ = e.read_to_string(&mut text);
+        }
+        text
+    });
+
+    let deadline = Instant::now() + HEADLESS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            // The reader is left behind: a process the shim started may still
+            // hold the pipe open.
+            Ok(None) => {
+                let _ = child.kill();
+                return Err(format!("{program} timed out"));
+            }
+            Err(e) => return Err(format!("{program} did not finish: {e}")),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let text = reader.join().unwrap_or_default();
+    Err(match text.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(line) => format!("{program} failed: {}", line.trim()),
+        None => format!("{program} failed ({status})"),
+    })
 }
 
 fn home() -> Result<PathBuf, String> {
@@ -442,9 +559,10 @@ fn copilot_usage(json: &Value) -> Result<Usage, FetchError> {
 // ---------------------------------------------------------------------------
 
 /// Claude Code only refreshes its OAuth token while it runs, so on an idle machine
-/// the token expires. The widget never refreshes it itself (that would rotate the
-/// refresh token under Claude Code, or spend usage on a headless prompt), so it
-/// asks for Claude Code to be run and picks the new token up on the next refresh.
+/// the token expires. The widget never refreshes it itself, since that would
+/// rotate the refresh token under Claude Code. It asks for Claude Code to be run,
+/// by hand or with `Provider::refresh_token`, and picks the new token up on the
+/// next refresh.
 fn claude() -> Result<Usage, FetchError> {
     let path = home()?.join(".claude").join(".credentials.json");
     let creds = read_json_file(&path, "log in with `claude`")?;
@@ -467,7 +585,7 @@ fn claude() -> Result<Usage, FetchError> {
         if exp_ms / 1000 < now_unix() {
             return Err(FetchError::new(
                 Problem::TokenExpired,
-                "Claude token expired; run `claude` once to refresh",
+                "Claude token expired; right-click > Refresh token, or run `claude`",
             ));
         }
     }
@@ -485,7 +603,7 @@ fn claude() -> Result<Usage, FetchError> {
         401 | 403 => {
             return Err(FetchError::new(
                 Problem::TokenRejected,
-                "Claude token rejected; run `claude` once to refresh",
+                "Claude token rejected; right-click > Refresh token, or run `claude`",
             ));
         }
         s => {
@@ -586,7 +704,8 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, FetchError> {
 // ---------------------------------------------------------------------------
 
 /// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it runs,
-/// so an expired token is reported until `codex` is run again.
+/// so an expired token is reported until `codex` is run again, by hand or with
+/// `Provider::refresh_token`.
 fn codex() -> Result<Usage, FetchError> {
     let path = home()?.join(".codex").join("auth.json");
     let auth_file = read_json_file(&path, "log in with `codex`")?;
@@ -602,7 +721,7 @@ fn codex() -> Result<Usage, FetchError> {
         if exp < now_unix() {
             return Err(FetchError::new(
                 Problem::TokenExpired,
-                "Codex token expired; run `codex` once to refresh",
+                "Codex token expired; right-click > Refresh token, or run `codex`",
             ));
         }
     }
@@ -619,7 +738,7 @@ fn codex() -> Result<Usage, FetchError> {
         401 | 403 => {
             return Err(FetchError::new(
                 Problem::TokenRejected,
-                "Codex token rejected; run `codex` once to refresh",
+                "Codex token rejected; right-click > Refresh token, or run `codex`",
             ));
         }
         s => {

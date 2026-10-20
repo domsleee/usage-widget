@@ -35,7 +35,9 @@ There is nothing to log in to. The widget uses the logins your CLIs already have
 - **Codex:** the Codex CLI (`codex`)
 
 Only services you have a paid plan with are shown. If a token expires, the widget
-says so; run that CLI once and it picks the new token up.
+says so; run that CLI once and it picks the new token up. Right-click > Refresh
+token does that for Claude or Codex: it runs a one-line prompt on the cheapest
+model, which uses a little of your allowance, then refreshes.
 
 ## What it shows
 
@@ -50,8 +52,8 @@ Bars go green, yellow and red as you use more.
 ## Using it
 
 - Drag it anywhere. It remembers where it was.
-- Right-click to refresh, minimize, resize, check for updates, open each service's
-  usage page, or quit.
+- Right-click to refresh, refresh a service's token, minimize, resize, check for
+  updates, open each service's usage page, or quit.
 - Untick a service under Show in the right-click menu to hide it. Tick it again to
   bring it back.
 - Hover a red error to see the full message.
