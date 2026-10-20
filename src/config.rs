@@ -16,7 +16,7 @@ opacity = 85
 
 # Decimal places for percentages, 0-3. The services currently report whole
 # percents, so extra places show as zeros.
-precision = 1
+precision = 0
 
 [copilot]
 enabled = true
@@ -94,7 +94,7 @@ impl Default for Config {
         Self {
             refresh_mins: 5,
             opacity: 85,
-            precision: 1,
+            precision: 0,
             copilot: Service::default(),
             claude: Claude::default(),
             codex: Codex::default(),
@@ -130,7 +130,12 @@ impl Config {
     }
 
     pub fn refresh_interval(&self) -> Duration {
-        Duration::from_secs(60 * self.refresh_mins.max(1))
+        let minutes = std::env::var("USAGE_WIDGET_REFRESH_MINS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|m| *m >= 1)
+            .unwrap_or(self.refresh_mins.max(1));
+        Duration::from_secs(60_u64.saturating_mul(minutes))
     }
 }
 

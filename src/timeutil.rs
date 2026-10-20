@@ -1,6 +1,6 @@
-//! Time parsing, countdowns and local reset dates.
+//! Small time helpers.
 
-use chrono::{Local, TimeZone};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_unix() -> i64 {
@@ -78,30 +78,6 @@ where
     format!("{day} {time}")
 }
 
-/// When a usage window resets: a countdown within a day ("2h 10m"), otherwise the
-/// local weekday and 24-hour time ("Tue 19:01", "Wed 6:00").
-pub fn resets(ts: i64) -> String {
-    match Local
-        .timestamp_opt((ts + 30).div_euclid(60) * 60, 0)
-        .single()
-    {
-        Some(t) => reset_label(ts - now_unix(), &t),
-        None => until(ts),
-    }
-}
-
-fn reset_label<Tz: TimeZone>(secs: i64, t: &DateTime<Tz>) -> String
-where
-    Tz::Offset: std::fmt::Display,
-{
-    if secs < 86_400 {
-        countdown(secs)
-    } else {
-        // No leading zero on the hour: side-by-side windows have little room.
-        t.format("%a %-H:%M").to_string()
-    }
-}
-
 /// Coarse remaining time for long spans like a billing cycle: "11d", "7h", "12m"
 /// or "now". Rounds down, so it never promises more time than is left.
 pub fn until_short(ts: i64) -> String {
@@ -129,6 +105,14 @@ pub fn ago(ts: i64) -> String {
 /// Time left until a future timestamp as dd:hh:mm.
 pub fn window_until(ts: i64) -> String {
     window_countdown((ts - now_unix()).max(0))
+}
+
+/// A reset date in the computer's time zone, as "Fri 16 Oct 2026, 14:30".
+pub fn local_datetime(ts: i64) -> Option<String> {
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|date| date.format("%a %-d %b %Y, %H:%M").to_string())
 }
 
 /// Local reset date and time for a weekly window, for example "17 Oct 2:30pm".
@@ -190,24 +174,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_labels() {
-        let tz = FixedOffset::east_opt(10 * 3600).unwrap();
-        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&tz);
-        // Within a day: a countdown.
-        assert_eq!(
-            reset_label(2 * 3600 + 10 * 60, &at("2026-09-11T07:01:00Z")),
-            "2h 10m"
-        );
-        assert_eq!(reset_label(12 * 60, &at("2026-09-11T05:03:00Z")), "12m");
-        // Further out: the weekday and 24-hour time.
-        assert_eq!(
-            reset_label(4 * 86_400 + 8 * 3600, &at("2026-09-15T09:01:00Z")),
-            "Tue 19:01"
-        );
-        assert_eq!(reset_label(86_400, &at("2026-09-11T22:00:00Z")), "Sat 8:00");
-    }
-
-    #[test]
     fn short_countdowns() {
         let got: Vec<String> = [
             -5,
@@ -223,94 +189,5 @@ mod tests {
         .map(short)
         .collect();
         assert_eq!(got, ["now", "now", "1m", "59m", "1h", "7h", "1d", "11d"]);
-    }
-}
-
-/// Time left until a future timestamp as dd:hh:mm.
-pub fn until(ts: i64) -> String {
-    countdown((ts - now_unix()).max(0))
-}
-
-/// A reset date in the computer's time zone, as "Fri 16 Oct 2026, 14:30".
-pub fn local_datetime(ts: i64) -> Option<String> {
-    Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .map(|date| date.format("%a %-d %b %Y, %H:%M").to_string())
-}
-
-/// dd:hh:mm, or hh:mm once under a day.
-fn countdown(secs: i64) -> String {
-    let (days, hours, mins) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
-    if days > 0 {
-        format!("{days:02}:{hours:02}:{mins:02}")
-    } else {
-        format!("{hours:02}:{mins:02}")
-    }
-}
-
-/// Time to the next whole minute, so a countdown ticks over on time.
-pub fn until_next_minute() -> std::time::Duration {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() % 60_000)
-        .unwrap_or(0);
-    std::time::Duration::from_millis(60_000 - millis as u64)
-}
-
-/// Parses an RFC 3339 timestamp ("2026-10-13T17:59:59.94+00:00" or "...Z") to
-/// unix seconds. Fractional seconds are dropped.
-pub fn parse_rfc3339(s: &str) -> Option<i64> {
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    let rest = s.get(19..)?;
-    let zone = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
-    let offset = match zone {
-        "Z" | "z" | "" => 0,
-        z => {
-            let sign = if z.starts_with('-') { -1 } else { 1 };
-            let oh = z.get(1..3)?.parse::<i64>().ok()?;
-            let om = z.get(4..6)?.parse::<i64>().ok()?;
-            sign * (oh * 3600 + om * 60)
-        }
-    };
-    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset)
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn countdown_drops_days_under_a_day() {
-        assert_eq!(countdown(86_400 + 2 * 3600 + 3 * 60 + 4), "01:02:03");
-        assert_eq!(countdown(86_400), "01:00:00");
-        assert_eq!(countdown(3 * 3600 + 29 * 60 + 59), "03:29");
-        assert_eq!(countdown(42), "00:00");
-    }
-
-    #[test]
-    fn parses_rfc3339() {
-        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(
-            parse_rfc3339("2026-10-13T02:35:28.308Z"),
-            Some(1_791_858_928)
-        );
-        assert_eq!(
-            parse_rfc3339("2026-10-13T12:35:28.943648+10:00"),
-            Some(1_791_858_928)
-        );
-        assert_eq!(parse_rfc3339("not a time"), None);
     }
 }

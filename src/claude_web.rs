@@ -335,8 +335,7 @@ mod mac {
             // RFC 6070, two rounds, first 16 bytes.
             assert_eq!(
                 pbkdf2_sha1(b"password", b"salt", 2),
-                unhex("ea6c014dc72d6f8ccd1ed92ace1d41f0")
-                    .and_then(|k| k.try_into().ok())
+                unhex("ea6c014dc72d6f8ccd1ed92ace1d41f0").and_then(|k| k.try_into().ok())
             );
         }
 

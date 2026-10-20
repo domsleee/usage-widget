@@ -2,7 +2,8 @@
 //! corresponding CLI (gh, Claude Code, Codex). The only thing persisted is
 //! Claude's last API response, rate-limit backoff and renewal date (see `ClaudeState`).
 
-use crate::timeutil::{now_unix, parse_rfc3339};
+use crate::config::Config;
+use crate::timeutil::{age, now_unix, parse_rfc3339, until};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,10 +53,7 @@ impl Provider {
         }
     }
 
-    /// `Problem::NotAvailable` when the account has no paid plan with this
-    /// service (not signed in on this machine, or on a free plan), so the widget
-    /// leaves it out.
-    pub fn fetch(self) -> Result<Usage, FetchError> {
+    pub fn fetch(self, config: &Config) -> Result<Usage, FetchError> {
         match self {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(&config.claude),
@@ -64,16 +62,8 @@ impl Provider {
     }
 }
 
-/// What a service reported for the signed-in account.
-#[derive(Clone, Debug)]
-pub struct Usage {
-    pub meters: Vec<Meter>,
-    /// A personal subscription (Claude Pro/Max, ChatGPT Plus/Pro, Copilot Pro).
-    /// Its meters are percent windows, shown on one line with no dollar amounts.
-    pub personal: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Unit {
     /// Amount in whole currency units.
     Dollars,
@@ -83,6 +73,8 @@ pub enum Unit {
 
 #[derive(Serialize)]
 pub struct Usage {
+    /// Personal subscriptions use percent windows in the compact header.
+    pub personal: bool,
     /// Subscription name, e.g. "Max 5x" or "Enterprise".
     pub plan: Option<String>,
     /// When the plan renews or its quota resets.
@@ -143,8 +135,16 @@ pub struct Meter {
     pub used: f64,
     pub total: f64,
     pub unit: Unit,
-    /// When a usage window next resets, as unix seconds.
+    /// Unix timestamp when a rolling window (5h, week) resets. Monthly spend leaves this unset.
     pub resets_at: Option<i64>,
+}
+
+/// Monthly spend without rolling usage windows, including uncapped accounts.
+pub fn spend_meter(meters: &[Meter]) -> Option<&Meter> {
+    match meters {
+        [m] if m.unit == Unit::Dollars && m.label.is_none() => Some(m),
+        _ => None,
+    }
 }
 
 impl Meter {
@@ -194,7 +194,9 @@ pub fn money(v: f64) -> String {
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-pub(crate) fn agent() -> ureq::Agent {
+/// The OS TLS stack (SChannel on Windows) trusting the OS certificate store, so
+/// corporate TLS-inspecting proxies whose root is installed there just work.
+pub fn tls() -> ureq::tls::TlsConfig {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     TlsConfig::builder()
         .provider(TlsProvider::NativeTls)
@@ -202,7 +204,7 @@ pub(crate) fn agent() -> ureq::Agent {
         .build()
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(tls())
         .timeout_global(Some(Duration::from_secs(25)))
@@ -290,14 +292,6 @@ fn f64_of(v: &Value) -> Option<f64> {
     }
 }
 
-/// A timestamp given as unix seconds or as RFC 3339 text.
-fn time_of(v: &Value) -> Option<i64> {
-    match v {
-        Value::String(s) => parse_rfc3339(s),
-        v => i64_of(v),
-    }
-}
-
 fn i64_of(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -365,15 +359,6 @@ impl FetchError {
             detail: detail.into(),
         }
     }
-
-    /// An expired or rejected token, which running the owning CLI may refresh.
-    fn needs_refresh(&self) -> bool {
-        matches!(self.problem, Problem::TokenExpired | Problem::TokenRejected)
-    }
-
-    fn with_cause(self, why: &str) -> Self {
-        FetchError::new(self.problem, format!("{} ({why})", self.detail))
-    }
 }
 
 impl From<String> for FetchError {
@@ -388,10 +373,10 @@ impl From<String> for FetchError {
 
 fn github_token() -> Result<String, FetchError> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(t) = std::env::var(var) {
-            if !t.trim().is_empty() {
-                return Ok(t.trim().to_string());
-            }
+        if let Ok(t) = std::env::var(var)
+            && !t.trim().is_empty()
+        {
+            return Ok(t.trim().to_string());
         }
     }
     let mut cmd = Command::new("gh");
@@ -451,12 +436,35 @@ fn copilot() -> Result<Usage, FetchError> {
         }
     }
 
-    copilot_usage(&json)
+    // Seats are billed to the org or enterprise; the monthly quota reset is the only date.
+    let cycle = json["quota_reset_date_utc"]
+        .as_str()
+        .and_then(parse_rfc3339)
+        .map(|at| Cycle {
+            date_only: false,
+            verb: "resets".into(),
+            at,
+        });
+    Ok(Usage {
+        personal: json["copilot_plan"]
+            .as_str()
+            .is_some_and(|p| p.starts_with("individual")),
+        plan: copilot_plan(&json),
+        cycle,
+        note: None,
+        estimated: Vec::new(),
+        meters: copilot_meters(&json)?,
+    })
 }
 
-fn copilot_usage(json: &Value) -> Result<Usage, FetchError> {
-    let plan = json["copilot_plan"].as_str().unwrap_or("");
-    if plan == "free" {
+fn copilot_meters(json: &Value) -> Result<Vec<Meter>, FetchError> {
+    let plan = json["copilot_plan"].as_str().unwrap_or_default();
+    if plan == "free"
+        || (plan.starts_with("individual")
+            && json["access_type_sku"]
+                .as_str()
+                .is_some_and(|s| s.contains("free")))
+    {
         return Err(FetchError::new(
             Problem::NotAvailable,
             "Copilot Free has no paid plan to track",
@@ -472,51 +480,38 @@ fn copilot_usage(json: &Value) -> Result<Usage, FetchError> {
 
     let total = f64_of(&snap["entitlement"]).unwrap_or(0.0);
     if total <= 0.0 && snap["unlimited"].as_bool() == Some(true) {
-        return Ok(Usage {
-            meters: vec![Meter {
-                label: Some("unlimited".into()),
-                used: 0.0,
-                total: 0.0,
-                unit: Unit::Percent,
-                resets_at: None,
-            }],
-            personal: false,
-        });
+        return Ok(vec![Meter {
+            label: Some("unlimited".into()),
+            used: 0.0,
+            total: 0.0,
+            unit: Unit::Percent,
+            resets_at: None,
+        }]);
     }
 
     let used = f64_of(&snap["credits_used"])
         .or_else(|| f64_of(&snap["remaining"]).map(|r| total - r))
         .unwrap_or(0.0);
-
-    // Copilot Pro and Pro+ ("individual", "individual_pro") have no rolling
-    // windows, only the monthly allowance.
     if plan.starts_with("individual") {
-        return Ok(Usage {
-            meters: vec![Meter {
-                label: Some("mo".into()),
-                used: if total > 0.0 {
-                    used / total * 100.0
-                } else {
-                    0.0
-                },
-                total: 100.0,
-                unit: Unit::Percent,
-                resets_at: None,
-            }],
-            personal: true,
-        });
-    }
-
-    Ok(Usage {
-        meters: vec![Meter {
-            label: None,
-            used: used * COPILOT_USD_PER_CREDIT,
-            total: total * COPILOT_USD_PER_CREDIT,
-            unit: Unit::Dollars,
+        return Ok(vec![Meter {
+            label: Some("mo".into()),
+            used: if total > 0.0 {
+                used / total * 100.0
+            } else {
+                0.0
+            },
+            total: if total > 0.0 { 100.0 } else { 0.0 },
+            unit: Unit::Percent,
             resets_at: None,
-        }],
-        personal: false,
-    })
+        }]);
+    }
+    Ok(vec![Meter {
+        label: None,
+        used: used * COPILOT_USD_PER_CREDIT,
+        total: total * COPILOT_USD_PER_CREDIT,
+        unit: Unit::Dollars,
+        resets_at: None,
+    }])
 }
 
 fn copilot_plan(json: &Value) -> Option<String> {
@@ -524,6 +519,7 @@ fn copilot_plan(json: &Value) -> Option<String> {
     Some(
         match json["copilot_plan"].as_str().filter(|s| !s.is_empty())? {
             "individual" if sku.contains("pro_plus") => "Pro+".into(),
+            "individual_pro" => "Pro+".into(),
             "individual" if sku.contains("free") => "Free".into(),
             "individual" => "Pro".into(),
             other => title_case(other),
@@ -535,35 +531,584 @@ fn copilot_plan(json: &Value) -> Option<String> {
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
-/// Claude Code only refreshes its OAuth token while it runs, so on an idle machine
-/// the token expires. The widget never refreshes it itself (that would rotate the
-/// refresh token under Claude Code, or spend usage on a headless prompt), so it
-/// asks for Claude Code to be run and picks the new token up on the next refresh.
-fn claude() -> Result<Usage, FetchError> {
+fn claude_credentials() -> Result<Value, FetchError> {
     let path = home()?.join(".claude").join(".credentials.json");
-    let creds = read_json_file(&path, "log in with `claude`")?;
-    let oauth = &creds["claudeAiOauth"];
-    // Signed in with an API key rather than a Claude plan.
+    #[cfg(target_os = "macos")]
+    if !path.exists() {
+        return claude_keychain_credentials();
+    }
+    read_json_file(&path, "log in with `claude`")
+}
+
+/// Claude Code on macOS keeps its credentials in the login keychain, not on disk.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials() -> Result<Value, FetchError> {
+    let out = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output()
+        .map_err(|e| format!("cannot run `security` ({e})"))?;
+    if !out.status.success() {
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "no Claude Code credentials in keychain; log in with `claude`",
+        ));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| FetchError::from(format!("bad JSON in keychain entry: {e}")))
+}
+
+/// Anthropic limits usage calls per OAuth token, and Claude Code spends the same
+/// budget. Claude Code caches its own responses in ~/.claude.json, so read that
+/// and call the API only when it is stale, and no more than once per this many
+/// seconds. Clients that identify as Claude Code are reported safe at this rate.
+const CLAUDE_POLL_SECS: i64 = 180;
+/// Older Claude data is flagged as old, and a 429 pauses calls at least this long.
+const CLAUDE_FRESH_SECS: i64 = 15 * 60;
+/// Sent when ~/.claude.json doesn't name a version; it need not be exact.
+const CLAUDE_CODE_VERSION: &str = "2.1.276";
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Snapshot {
+    at: i64,
+    usage: Value,
+    /// The Claude account it belongs to, so a login switch doesn't show old usage.
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// Our last API response, rate-limit backoff and renewal date, kept across restarts.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ClaudeState {
+    last: Option<Snapshot>,
+    last_attempt: i64,
+    blocked_until: i64,
+    /// The claude.ai renewal (`browser_cookies`) and when it was fetched.
+    renewal: Option<(i64, Cycle)>,
+    renewal_attempt: i64,
+    /// Claude Code's organization and plan when `renewal` was fetched.
+    renewal_org: Option<String>,
+    renewal_plan: Option<String>,
+    /// The Claude Code account last seen, and since when (0 if it was the first).
+    account: Option<String>,
+    account_since: i64,
+}
+
+impl ClaudeState {
+    fn path() -> Option<PathBuf> {
+        crate::paths::cache_dir().map(|d| d.join("usage-widget").join("claude.json"))
+    }
+
+    fn load() -> Self {
+        Self::path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(bytes) = serde_json::to_vec(self) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+}
+
+/// Claude Code hands the statusline command live `rate_limits` taken from each
+/// response's headers; a statusline script can save that JSON here (see README).
+fn claude_statusline() -> Option<(i64, Value)> {
+    let path = home()
+        .ok()?
+        .join(".claude")
+        .join("usage-widget-statusline.json");
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let at = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let mut v = read_json_file(&path, "").ok()?;
+    let rate_limits = v["rate_limits"].take();
+    rate_limits.is_object().then_some((at, rate_limits))
+}
+
+/// Records the Claude Code account, and when it last changed. A switch also ends
+/// the old account's rate-limit backoff, since the limit is per OAuth token.
+/// Returns whether `state` changed.
+fn note_account(state: &mut ClaudeState, account: Option<&str>, now: i64) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    if state.account.as_deref() == Some(account) {
+        return false;
+    }
+    if state.account.is_some() {
+        state.account_since = now;
+        state.blocked_until = 0;
+        state.last_attempt = 0;
+    } else {
+        // The first account seen keeps whatever the statusline file already holds.
+        state.account_since = 0;
+    }
+    state.account = Some(account.to_string());
+    true
+}
+
+/// Overwrites (or adds) the 5h and weekly meters from statusline `rate_limits`.
+fn apply_statusline(meters: &mut Vec<Meter>, rate_limits: &Value) {
+    for (i, (key, label)) in [("five_hour", "5h"), ("seven_day", "week")]
+        .into_iter()
+        .enumerate()
+    {
+        let w = &rate_limits[key];
+        let Some(used) = f64_of(&w["used_percentage"]) else {
+            continue;
+        };
+        // Seconds per the docs; tolerate milliseconds.
+        let resets_at =
+            i64_of(&w["resets_at"]).map(|t| if t > 100_000_000_000 { t / 1000 } else { t });
+        match meters
+            .iter_mut()
+            .find(|m| m.label.as_deref() == Some(label))
+        {
+            Some(m) => {
+                m.used = used;
+                m.resets_at = resets_at.or(m.resets_at);
+            }
+            None => meters.insert(
+                i.min(meters.len()),
+                Meter {
+                    label: Some(label.into()),
+                    used,
+                    total: 100.0,
+                    unit: Unit::Percent,
+                    resets_at,
+                },
+            ),
+        }
+    }
+}
+
+/// The "old" note for Claude. Live statusline figures cover only 5h and week, so
+/// when they are fresh, name the meters that came from the older full response.
+fn claude_staleness(
+    now: i64,
+    live_at: Option<i64>,
+    snap_at: Option<i64>,
+    labels: &[&str],
+) -> Option<String> {
+    match (live_at, snap_at) {
+        (Some(live), Some(snap)) if now - live < CLAUDE_FRESH_SECS => {
+            let others: Vec<&str> = labels
+                .iter()
+                .copied()
+                .filter(|l| !matches!(*l, "5h" | "week"))
+                .collect();
+            (now - snap >= CLAUDE_FRESH_SECS && !others.is_empty())
+                .then(|| format!("{} {} old", others.join(", "), age(snap)))
+        }
+        (live, snap) => {
+            let at = live.into_iter().chain(snap).max()?;
+            (now - at >= CLAUDE_FRESH_SECS).then(|| format!("{} old", age(at)))
+        }
+    }
+}
+
+fn claude_should_call(api: bool, now: i64, newest: Option<i64>, state: &ClaudeState) -> bool {
+    let fresh = newest.is_some_and(|at| now - at < CLAUDE_POLL_SECS);
+    api && !fresh && now >= state.blocked_until && now - state.last_attempt >= CLAUDE_POLL_SECS
+}
+
+fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
+    let api = config.api;
+    let creds = claude_credentials();
+    let ClaudeCodeState {
+        cache,
+        account,
+        version,
+        org,
+        plan: profile_plan,
+    } = claude_code_state();
+    let mut state = ClaudeState::load();
+    let now = now_unix();
+    let plan = profile_plan.or_else(|| claude_oauth(&creds).ok().and_then(claude_plan));
+    if plan.as_deref() == Some("Free") {
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "Claude Free has no plan usage to track",
+        ));
+    }
+    if note_account(&mut state, account.as_deref(), now) {
+        state.save();
+    }
+    // Our saved response is only good for the account it was fetched for.
+    if account.is_some() && state.last.as_ref().is_some_and(|s| s.account != account) {
+        state.last = None;
+    }
+
+    // The statusline refreshes only 5h and week, so it doesn't make the rest fresh.
+    // It doesn't name an account either, so after a switch anything written before
+    // the switch was noticed is ignored until a session of the new account rewrites it.
+    let statusline = claude_statusline().filter(|(at, _)| *at > state.account_since);
+    let newest = [&cache, &state.last]
+        .into_iter()
+        .flatten()
+        .map(|s| s.at)
+        .max();
+    let mut problem = None;
+    if claude_should_call(api, now, newest, &state) {
+        state.last_attempt = now;
+        let result = claude_api(claude_oauth(&creds), version.as_deref());
+        match result {
+            Ok(usage) => {
+                state.last = Some(Snapshot {
+                    // When it arrived; a token refresh can take a while.
+                    at: now_unix(),
+                    usage,
+                    account: account.clone(),
+                })
+            }
+            Err(ClaudeError::RateLimited(retry_after)) => {
+                // From when the 429 arrived; a token refresh can take a while.
+                state.blocked_until = now_unix() + retry_after.max(CLAUDE_FRESH_SECS);
+            }
+            Err(ClaudeError::Fetch(e)) => problem = Some(e),
+        }
+        state.save();
+    }
+
+    let rate_limited = now < state.blocked_until;
+    let snap = [cache.as_ref(), state.last.as_ref()]
+        .into_iter()
+        .flatten()
+        .max_by_key(|s| s.at);
+    let mut meters = snap
+        .as_ref()
+        .map(|s| claude_meters(&s.usage))
+        .unwrap_or_default();
+    let snap_at = snap.as_ref().map(|s| s.at);
+    // Live 5h/weekly numbers from the statusline beat an older full response.
+    let mut live_at = None;
+    if let Some((at, rate_limits)) = statusline
+        && snap_at.is_none_or(|d| at > d)
+    {
+        apply_statusline(&mut meters, &rate_limits);
+        live_at = Some(at);
+    }
+    // When the 5h and week readings were taken.
+    let Some(data_at) = live_at.or(snap_at).filter(|_| !meters.is_empty()) else {
+        return Err(if rate_limited {
+            FetchError::new(
+                Problem::RateLimited,
+                format!(
+                    "Claude rate limited; retrying in {}",
+                    until(state.blocked_until)
+                ),
+            )
+        } else {
+            // Not logged in shows as such even when the API was not called.
+            problem
+                .or_else(|| creds.as_ref().err().cloned())
+                .unwrap_or_else(|| {
+                    FetchError::new(
+                        Problem::Other,
+                        "no Claude usage cached yet; open Claude Code",
+                    )
+                })
+        });
+    };
+
+    // Claude reports whole percents; estimate the part of the next one from local use.
+    let mut estimated = Vec::new();
+    let mut history_problem = None;
+    if config.estimate {
+        let plan = plan.clone().unwrap_or_default();
+        // Rounded: statusline figures carry float noise (55.00000000000001).
+        let readings: Vec<(String, f64, i64)> = meters
+            .iter()
+            .filter(|m| {
+                m.unit == Unit::Percent && matches!(m.label.as_deref(), Some("5h" | "week"))
+            })
+            .filter_map(|m| Some((m.label.clone()?, m.used, m.resets_at?)))
+            .collect();
+        let refs: Vec<(&str, f64, i64)> = readings
+            .iter()
+            .map(|(label, pct, window)| (label.as_str(), *pct, *window))
+            .collect();
+        let source = if live_at.is_some() {
+            "statusline"
+        } else {
+            "usage_snapshot"
+        };
+        let fractions = crate::claude_estimate::fractions(&refs, data_at, &plan, source)
+            .unwrap_or_else(|e| {
+                history_problem = Some(e);
+                vec![None; readings.len()]
+            });
+        for ((label, pct, _), fraction) in readings.iter().zip(fractions) {
+            if let Some(fraction) = fraction
+                && let Some(m) = meters.iter_mut().find(|m| m.label.as_ref() == Some(label))
+            {
+                m.used = pct.round() + fraction;
+                estimated.push(label.clone());
+            }
+        }
+    }
+
+    let note = claude_note(
+        now,
+        live_at,
+        snap_at,
+        &meters,
+        state.blocked_until,
+        problem.map(|e| e.detail),
+    );
+    let (cycle, renewal_problem) = claude_renewal(
+        config,
+        &mut state,
+        now,
+        &meters,
+        org.as_deref(),
+        plan.as_deref(),
+    );
+    // Say why the renewal date is missing, but only when there is none to show.
+    let note = match renewal_problem.filter(|_| cycle.is_none()) {
+        Some(e) => Some(note.map_or(format!("renewal: {e}"), |n| format!("{n} · renewal: {e}"))),
+        None => note,
+    };
+    let note = match history_problem {
+        Some(e) => Some(note.map_or_else(|| e.clone(), |n| format!("{n} · {e}"))),
+        None => note,
+    };
+    Ok(Usage {
+        personal: plan
+            .as_deref()
+            .is_some_and(|p| p == "Pro" || p.starts_with("Max")),
+        plan,
+        cycle,
+        note,
+        estimated,
+        meters,
+    })
+}
+
+fn claude_note(
+    now: i64,
+    live_at: Option<i64>,
+    snap_at: Option<i64>,
+    meters: &[Meter],
+    blocked_until: i64,
+    problem: Option<String>,
+) -> Option<String> {
+    let labels: Vec<&str> = meters.iter().filter_map(|m| m.label.as_deref()).collect();
+    let stale = claude_staleness(now, live_at, snap_at, &labels)?;
+    let mut notes = Vec::new();
+    if spend_meter(meters).is_none() {
+        notes.push(stale);
+    }
+    if now < blocked_until {
+        notes.push(format!("rate limited · retry {}", until(blocked_until)));
+    } else if let Some(problem) = problem {
+        notes.push(problem);
+    }
+    (!notes.is_empty()).then(|| notes.join(" · "))
+}
+
+fn claude_renewal(
+    config: &crate::config::Claude,
+    state: &mut ClaudeState,
+    now: i64,
+    meters: &[Meter],
+    org: Option<&str>,
+    plan: Option<&str>,
+) -> (Option<Cycle>, Option<String>) {
+    // Monthly spend needs neither a manual subscription date nor browser lookup.
+    if spend_meter(meters).is_some() {
+        return (None, None);
+    }
+    let manual_cycle = config
+        .renewal_date
+        .as_deref()
+        .map(|date| manual_claude_cycle(date, chrono::Local::now().date_naive()));
+    let mut renewal_problem = manual_cycle
+        .as_ref()
+        .and_then(|c| c.as_ref().err())
+        .cloned();
+    // A date looked up for another organization belongs to another account, and a
+    // plan change starts a new billing cycle.
+    let changed = |was: &Option<String>, now: Option<&str>| now.is_some() && was.as_deref() != now;
+    if state.renewal.is_some()
+        && (changed(&state.renewal_org, org) || changed(&state.renewal_plan, plan))
+    {
+        state.renewal = None;
+        state.renewal_attempt = 0;
+    }
+    if config.browser_cookies && !matches!(&manual_cycle, Some(Ok(_))) {
+        // Fetch daily and again once the saved date has passed; after a failure retry
+        // at most hourly, so a denied keychain prompt doesn't return every refresh.
+        let due = state
+            .renewal
+            .as_ref()
+            .is_none_or(|(fetched, c)| now - fetched >= 86_400 || now >= c.at);
+        if due && now - state.renewal_attempt >= 3600 {
+            state.renewal_attempt = now;
+            match crate::claude_web::cycle(org) {
+                Ok(c) => {
+                    state.renewal = Some((now, c));
+                    state.renewal_org = org.map(String::from);
+                    state.renewal_plan = plan.map(String::from);
+                }
+                Err(e) => {
+                    renewal_problem = Some(renewal_problem.map_or_else(
+                        || e.clone(),
+                        |manual| format!("{manual}; browser lookup: {e}"),
+                    ))
+                }
+            }
+            state.save();
+        }
+    }
+
+    let cycle = match manual_cycle {
+        Some(Ok(cycle)) => Some(cycle),
+        _ => state
+            .renewal
+            .as_ref()
+            .filter(|_| config.browser_cookies)
+            .map(|(_, c)| c.clone()),
+    };
+    (cycle, renewal_problem)
+}
+
+/// A manually supplied next billing date, without guessing the billing cadence.
+pub(crate) fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Result<Cycle, String> {
+    use chrono::{Local, NaiveDate, TimeZone};
+
+    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .filter(|d| d.format("%Y-%m-%d").to_string() == date)
+        .ok_or("set claude.renewal_date to a valid YYYY-MM-DD date")?;
+    if parsed < today {
+        return Err("the renewal date has passed; use the refresh icon beside Claude to look it up again, or update claude.renewal_date".into());
+    }
+    let at = Local
+        .from_local_datetime(&parsed.and_hms_opt(0, 0, 0).unwrap())
+        .earliest()
+        .ok_or("claude.renewal_date has no local midnight; choose another date")?
+        .timestamp();
+    Ok(Cycle {
+        date_only: true,
+        verb: "renews".into(),
+        at,
+    })
+}
+
+/// What ~/.claude.json says about the logged-in Claude Code install.
+#[derive(Default)]
+struct ClaudeCodeState {
+    /// Claude Code's latest /api/oauth/usage response, if it belongs to `account`.
+    cache: Option<Snapshot>,
+    account: Option<String>,
+    /// The newest Claude Code version that has run, e.g. "2.1.276".
+    version: Option<String>,
+    /// The claude.ai organization Claude Code is logged in to.
+    org: Option<String>,
+    /// The plan per Claude Code's profile, which it refreshes as it runs.
+    plan: Option<String>,
+}
+
+fn claude_code_state() -> ClaudeCodeState {
+    let Some(v) = home()
+        .ok()
+        .and_then(|h| read_json_file(&h.join(".claude.json"), "").ok())
+    else {
+        return ClaudeCodeState::default();
+    };
+    let account = v["oauthAccount"]["accountUuid"].as_str().map(String::from);
+    let version = v["lastReleaseNotesSeen"].as_str().map(String::from);
+    let org = v["oauthAccount"]["organizationUuid"]
+        .as_str()
+        .map(String::from);
+    let plan = v["oauthAccount"]["organizationType"]
+        .as_str()
+        .and_then(|kind| {
+            plan_name(
+                kind,
+                v["oauthAccount"]["organizationRateLimitTier"].as_str(),
+            )
+        });
+    let c = &v["cachedUsageUtilization"];
+    // Ignore a cache left behind by another account.
+    let cache = (account.is_none() || c["accountUuid"].as_str() == account.as_deref())
+        .then(|| {
+            Some(Snapshot {
+                at: i64_of(&c["fetchedAtMs"])? / 1000,
+                usage: c["utilization"].clone(),
+                account: account.clone(),
+            })
+        })
+        .flatten();
+    ClaudeCodeState {
+        cache,
+        account,
+        version,
+        org,
+        plan,
+    }
+}
+
+fn claude_oauth(creds: &Result<Value, FetchError>) -> Result<&Value, &FetchError> {
+    creds.as_ref().map(|c| &c["claudeAiOauth"])
+}
+
+enum ClaudeError {
+    /// Seconds from `Retry-After`, 0 when absent.
+    RateLimited(i64),
+    Fetch(FetchError),
+}
+
+impl From<FetchError> for ClaudeError {
+    fn from(e: FetchError) -> Self {
+        ClaudeError::Fetch(e)
+    }
+}
+
+/// The usage endpoint answers unknown clients with 429s after a few calls but
+/// gives Claude Code a generous limit, so identify as Claude Code.
+fn claude_user_agent(version: Option<&str>) -> String {
+    let version = version
+        .filter(|v| {
+            v.split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .unwrap_or(CLAUDE_CODE_VERSION);
+    format!("claude-code/{version}")
+}
+
+fn claude_api(
+    oauth: Result<&Value, &FetchError>,
+    version: Option<&str>,
+) -> Result<Value, ClaudeError> {
+    let oauth = oauth.map_err(|e| e.clone())?;
     let token = oauth["accessToken"].as_str().ok_or_else(|| {
         FetchError::new(
             Problem::NotAvailable,
             "no claudeAiOauth.accessToken; log in with `claude`",
         )
     })?;
-    let plan = oauth["subscriptionType"].as_str().unwrap_or("");
-    if plan == "free" {
+    if i64_of(&oauth["expiresAt"]).is_some_and(|ms| ms / 1000 < now_unix()) {
         return Err(FetchError::new(
-            Problem::NotAvailable,
-            "Claude Free has no plan usage to track",
-        ));
-    }
-    if let Some(exp_ms) = i64_of(&oauth["expiresAt"]) {
-        if exp_ms / 1000 < now_unix() {
-            return Err(FetchError::new(
-                Problem::TokenExpired,
-                "Claude token expired; run `claude` once to refresh",
-            ));
-        }
+            Problem::TokenExpired,
+            "Claude token expired; run `claude` once to refresh",
+        )
+        .into());
     }
 
     let auth = format!("Bearer {token}");
@@ -588,42 +1133,52 @@ fn claude() -> Result<Usage, FetchError> {
     }
 }
 
-    claude_usage(&json, matches!(plan, "pro" | "max"))
+/// The plan from the OAuth credentials. These are written at login, so a plan
+/// change since then only shows in Claude Code's profile (`ClaudeCodeState::plan`).
+fn claude_plan(oauth: &Value) -> Option<String> {
+    plan_name(
+        oauth["subscriptionType"].as_str()?,
+        oauth["rateLimitTier"].as_str(),
+    )
 }
 
-fn claude_usage(json: &Value, personal: bool) -> Result<Usage, FetchError> {
-    // A personal plan shows just its 5-hour and weekly windows.
-    let windows: &[(&str, &str)] = if personal {
-        &[("five_hour", "5h"), ("seven_day", "wk")]
-    } else {
-        &[
-            ("five_hour", "5h"),
-            ("seven_day", "week"),
-            ("seven_day_opus", "opus wk"),
-            ("seven_day_sonnet", "sonnet wk"),
-        ]
-    };
+/// "Max 5x" from a subscription kind ("max", or the profile's "claude_max") and a
+/// rate-limit tier like "default_claude_max_5x".
+fn plan_name(kind: &str, tier: Option<&str>) -> Option<String> {
+    let kind = kind.strip_prefix("claude_").unwrap_or(kind);
+    if kind.is_empty() {
+        return None;
+    }
+    let name = title_case(kind);
+    // Keep the "5x".
+    let tier = tier.and_then(|t| t.rsplit('_').next()).filter(|t| {
+        t.strip_suffix('x')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    });
+    Some(match tier {
+        Some(t) => format!("{name} {t}"),
+        None => name,
+    })
+}
+
+fn claude_meters(json: &Value) -> Vec<Meter> {
     let mut meters = Vec::new();
-    for (key, label) in windows {
+    for (key, label) in [
+        ("five_hour", "5h"),
+        ("seven_day", "week"),
+        ("seven_day_opus", "opus wk"),
+        ("seven_day_sonnet", "sonnet wk"),
+    ] {
         let w = &json[key];
         if let Some(util) = f64_of(&w["utilization"]) {
             meters.push(Meter {
-                label: Some((*label).into()),
+                label: Some(label.into()),
                 used: util,
                 total: 100.0,
                 unit: Unit::Percent,
-                resets_at: time_of(&w["resets_at"]),
+                resets_at: w["resets_at"].as_str().and_then(parse_rfc3339),
             });
         }
-    }
-    if personal {
-        if meters.is_empty() {
-            return Err(FetchError::new(
-                Problem::BadResponse,
-                "no usage windows in response",
-            ));
-        }
-        return Ok(Usage { meters, personal });
     }
 
     // Per-model weekly caps (e.g. Fable) are only reported in `limits`.
@@ -687,40 +1242,34 @@ fn claude_usage(json: &Value, personal: bool) -> Result<Usage, FetchError> {
             });
         }
     }
-
-    if meters.is_empty() {
-        return Err(FetchError::new(
-            Problem::BadResponse,
-            "no usage windows in response",
-        ));
-    }
-    Ok(Usage { meters, personal })
+    meters
 }
 
 // ---------------------------------------------------------------------------
 // Codex (Codex CLI ChatGPT token)
 // ---------------------------------------------------------------------------
 
-/// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it runs,
-/// so an expired token is reported until `codex` is run again.
-fn codex() -> Result<Usage, FetchError> {
+fn codex(estimate: bool) -> Result<Usage, FetchError> {
+    codex_once(estimate)
+}
+
+fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
     let path = home()?.join(".codex").join("auth.json");
     let auth_file = read_json_file(&path, "log in with `codex`")?;
     let tokens = &auth_file["tokens"];
-    // Signed in with an API key rather than a ChatGPT plan.
     let token = tokens["access_token"].as_str().ok_or_else(|| {
         FetchError::new(
             Problem::NotAvailable,
             "no tokens.access_token; log in with `codex`",
         )
     })?;
-    if let Some(exp) = jwt_exp(token) {
-        if exp < now_unix() {
-            return Err(FetchError::new(
-                Problem::TokenExpired,
-                "Codex token expired; run `codex` once to refresh",
-            ));
-        }
+    if let Some(exp) = jwt_exp(token)
+        && exp < now_unix()
+    {
+        return Err(FetchError::new(
+            Problem::TokenExpired,
+            "Codex token expired; run `codex` once to refresh",
+        ));
     }
     let account_id = tokens["account_id"].as_str().unwrap_or("");
 
@@ -747,47 +1296,139 @@ fn codex() -> Result<Usage, FetchError> {
         }
     }
 
-    codex_usage(&json)
-}
-
-fn codex_usage(json: &Value) -> Result<Usage, FetchError> {
-    let plan = json["plan_type"].as_str().unwrap_or("");
-    if plan == "free" {
+    if json["plan_type"].as_str() == Some("free") {
         return Err(FetchError::new(
             Problem::NotAvailable,
             "ChatGPT Free has no paid plan to track",
         ));
     }
-    // ChatGPT plans billed to the user rather than a workspace.
-    let personal = matches!(plan, "plus" | "pro" | "go");
+    let personal = codex_personal(&json);
+    let plan = codex_plan(&json);
+    let cycle = codex_cycle(&headers, account_id);
+    let mut meters = codex_meters(&json);
+    if meters.is_empty() {
+        if json["credits"]["unlimited"].as_bool() == Some(true) {
+            return Ok(Usage {
+                personal: false,
+                plan,
+                cycle,
+                note: None,
+                estimated: Vec::new(),
+                meters: vec![Meter {
+                    label: Some("unlimited".into()),
+                    used: 0.0,
+                    total: 0.0,
+                    unit: Unit::Percent,
+                    resets_at: None,
+                }],
+            });
+        }
+        return Err(FetchError::new(
+            Problem::BadResponse,
+            "no rate limit or spend data in response",
+        ));
+    }
 
+    // Codex reports whole percents; estimate the part of the next one from local use.
+    let mut estimated = Vec::new();
+    let mut note = None;
+    if estimate {
+        let plan_type = json["plan_type"].as_str().unwrap_or_default();
+        if let Some(week) = meters
+            .iter_mut()
+            .find(|m| m.label.as_deref() == Some("week") && m.unit == Unit::Percent)
+            && let Some(window) = week.resets_at
+        {
+            match crate::codex_estimate::fraction(week.used, window, plan_type, observed_at) {
+                Ok(Some(fraction)) => {
+                    week.used = week.used.round() + fraction.clamp(0.0, 0.99);
+                    estimated.extend(week.label.clone());
+                }
+                Ok(None) => {}
+                Err(e) => note = Some(e),
+            }
+        }
+    }
+    Ok(Usage {
+        personal,
+        plan,
+        cycle,
+        note,
+        estimated,
+        meters,
+    })
+}
+
+/// When the ChatGPT plan renews, or ends once cancelled, from the subscription record.
+fn codex_cycle(headers: &[(&str, &str)], account_id: &str) -> Option<Cycle> {
+    if account_id.is_empty() {
+        return None;
+    }
+    let url = format!("https://chatgpt.com/backend-api/subscriptions?account_id={account_id}");
+    let (200, sub) = get_json(&url, headers).ok()? else {
+        return None;
+    };
+    let at = sub["active_until"].as_str().and_then(parse_rfc3339)?;
+    let verb = if sub["will_renew"].as_bool() == Some(false) {
+        "ends"
+    } else {
+        "renews"
+    };
+    Some(Cycle {
+        date_only: false,
+        verb: verb.into(),
+        at,
+    })
+}
+
+// Fractional service readings are already more precise than this estimator.
+pub(crate) fn whole_percent(value: f64) -> Option<f64> {
+    (value.is_finite() && (value - value.round()).abs() < 1e-9).then(|| value.round())
+}
+
+fn codex_plan(json: &Value) -> Option<String> {
+    Some(
+        match json["plan_type"].as_str().filter(|s| !s.is_empty())? {
+            "prolite" => "Pro Lite".into(),
+            other => title_case(other),
+        },
+    )
+}
+
+fn codex_personal(json: &Value) -> bool {
+    matches!(
+        json["plan_type"].as_str(),
+        Some("plus" | "pro" | "prolite" | "go")
+    )
+}
+
+fn codex_meters(json: &Value) -> Vec<Meter> {
     let mut meters = Vec::new();
 
     let rl = &json["rate_limit"];
-    let week = if personal { "wk" } else { "week" };
-    for (key, fallback) in [("primary_window", "5h"), ("secondary_window", week)] {
+    for (key, fallback) in [("primary_window", "5h"), ("secondary_window", "week")] {
         let w = &rl[key];
         if let Some(pct) = f64_of(&w["used_percent"]) {
             let label = i64_of(&w["limit_window_seconds"])
-                .map(|secs| window_label(secs, week))
+                .map(window_label)
                 .unwrap_or_else(|| fallback.into());
-            let resets_at = time_of(&w["reset_at"])
-                .or_else(|| i64_of(&w["reset_after_seconds"]).map(|s| now_unix() + s));
             meters.push(Meter {
                 label: Some(label),
                 used: pct,
                 total: 100.0,
                 unit: Unit::Percent,
-                resets_at,
+                resets_at: i64_of(&w["reset_at"])
+                    .or_else(|| i64_of(&w["reset_after_seconds"]).map(|s| now_unix() + s)),
             });
         }
     }
 
-    // A personal plan shows just its windows.
     let lim = &json["spend_control"]["individual_limit"];
-    if let (false, Some(used), Some(limit)) =
-        (personal, f64_of(&lim["used"]), f64_of(&lim["limit"]))
-    {
+    if let (false, Some(used), Some(limit)) = (
+        codex_personal(json),
+        f64_of(&lim["used"]),
+        f64_of(&lim["limit"]),
+    ) {
         meters.push(Meter {
             label: if meters.is_empty() {
                 None
@@ -800,32 +1441,12 @@ fn codex_usage(json: &Value) -> Result<Usage, FetchError> {
             resets_at: None,
         });
     }
-
-    if meters.is_empty() {
-        if json["credits"]["unlimited"].as_bool() == Some(true) {
-            return Ok(Usage {
-                meters: vec![Meter {
-                    label: Some("unlimited".into()),
-                    used: 0.0,
-                    total: 0.0,
-                    unit: Unit::Percent,
-                    resets_at: None,
-                }],
-                personal: false,
-            });
-        }
-        return Err(FetchError::new(
-            Problem::BadResponse,
-            "no rate limit or spend data in response",
-        ));
-    }
-    Ok(Usage { meters, personal })
+    meters
 }
 
-/// "5h", "2d", or `week` for windows of six days or more.
-fn window_label(secs: i64, week: &str) -> String {
+fn window_label(secs: i64) -> String {
     if secs >= 6 * 86_400 {
-        week.into()
+        "week".into()
     } else if secs >= 86_400 {
         format!("{}d", secs / 86_400)
     } else {
@@ -851,17 +1472,6 @@ fn title_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn not_available<T>(r: Result<T, FetchError>) -> bool {
-        matches!(r, Err(e) if e.problem == Problem::NotAvailable)
-    }
-
-    fn pcts(u: &Usage) -> Vec<(String, f64)> {
-        u.meters
-            .iter()
-            .map(|m| (m.label.clone().unwrap_or_default(), m.percent()))
-            .collect()
-    }
 
     #[test]
     fn account_switch_resets_backoff_and_distrusts_older_statusline() {
@@ -913,7 +1523,6 @@ mod tests {
     fn copilot_entitlement_takes_precedence_over_unlimited() {
         for unlimited in [false, true] {
             let json = serde_json::json!({
-                "copilot_plan": "enterprise",
                 "quota_snapshots": {
                     "premium_interactions": {
                         "unlimited": unlimited,
@@ -923,12 +1532,11 @@ mod tests {
                     }
                 }
             });
-            let usage = copilot_usage(&json).unwrap();
-            assert!(!usage.personal);
-            assert_eq!(usage.meters.len(), 1);
-            assert_eq!(usage.meters[0].label, None);
-            assert_eq!(usage.meters[0].unit, Unit::Dollars);
-            assert_eq!(usage.meters[0].summary(), "$0 / $1,500");
+            let meters = copilot_meters(&json).unwrap();
+            assert_eq!(meters.len(), 1);
+            assert_eq!(meters[0].label, None);
+            assert_eq!(meters[0].unit, Unit::Dollars);
+            assert_eq!(meters[0].summary(), "$0 / $1,500");
         }
     }
 
@@ -939,83 +1547,56 @@ mod tests {
                 "premium_interactions": { "unlimited": true, "entitlement": 0 }
             }
         });
-        let usage = copilot_usage(&json).unwrap();
-        assert_eq!(usage.meters[0].label.as_deref(), Some("unlimited"));
-        assert_eq!(usage.meters[0].total, 0.0);
+        let meters = copilot_meters(&json).unwrap();
+        assert_eq!(meters[0].label.as_deref(), Some("unlimited"));
+        assert_eq!(meters[0].total, 0.0);
     }
 
     #[test]
-    fn copilot_personal_and_free_plans() {
-        let json = serde_json::json!({
-            "copilot_plan": "individual_pro",
-            "quota_snapshots": {
-                "premium_interactions": { "entitlement": 1500, "remaining": 1125 }
-            }
-        });
-        let usage = copilot_usage(&json).unwrap();
-        assert!(usage.personal);
-        assert_eq!(pcts(&usage), [("mo".to_string(), 25.0)]);
+    fn copilot_personal_is_a_monthly_percentage_and_free_is_absent() {
+        let json = serde_json::json!({ "copilot_plan": "individual_pro", "quota_snapshots": { "premium_interactions": { "entitlement": 1500, "remaining": 1125 } } });
+        let meters = copilot_meters(&json).unwrap();
+        assert_eq!(meters[0].label.as_deref(), Some("mo"));
+        assert_eq!(meters[0].unit, Unit::Percent);
+        assert_eq!(meters[0].percent(), 25.0);
+        for free in [
+            serde_json::json!({ "copilot_plan": "free" }),
+            serde_json::json!({ "copilot_plan": "individual", "access_type_sku": "copilot_free" }),
+        ] {
+            assert!(matches!(copilot_meters(&free), Err(e) if e.problem == Problem::NotAvailable));
+        }
+    }
 
-        let free = serde_json::json!({ "copilot_plan": "free", "quota_snapshots": {} });
-        assert!(not_available(copilot_usage(&free)));
+    #[test]
+    fn codex_personal_keeps_fractional_windows_and_excludes_business_spend() {
+        let mut json = serde_json::json!({ "plan_type": "prolite", "rate_limit": { "primary_window": { "used_percent": 71.37, "limit_window_seconds": 604800, "reset_at": 1789462965 } }, "spend_control": { "individual_limit": { "used": "1250", "limit": "12500" } } });
+        assert!(codex_personal(&json));
+        let meters = codex_meters(&json);
+        assert_eq!(meters.len(), 1);
+        assert_eq!(meters[0].used, 71.37);
+        assert_eq!(meters[0].resets_at, Some(1789462965));
+        json["plan_type"] = serde_json::json!("business");
+        assert!(!codex_personal(&json));
+        let meters = codex_meters(&json);
+        assert_eq!(meters[1].summary(), "$50 / $500");
     }
 
     #[test]
     fn copilot_without_quota_is_not_available() {
         let json = serde_json::json!({ "quota_snapshots": {} });
-        assert!(not_available(copilot_usage(&json)));
+        assert!(matches!(
+            copilot_meters(&json),
+            Err(e) if e.problem == Problem::NotAvailable
+        ));
     }
 
     #[test]
     fn missing_credentials_file_is_not_available() {
         let path = std::env::temp_dir().join("usage-widget-test-missing.json");
-        assert!(not_available(read_json_file(&path, "log in")));
-    }
-
-    #[test]
-    fn claude_personal_shows_only_windows() {
-        let json = serde_json::json!({
-            "five_hour": { "utilization": 42.0 },
-            "seven_day": { "utilization": 17.0 },
-            "seven_day_opus": { "utilization": 5.0 },
-            "extra_usage": { "used_credits": 500.0, "monthly_limit": 2000.0 }
-        });
-        let usage = claude_usage(&json, true).unwrap();
-        assert!(usage.personal);
-        assert_eq!(
-            pcts(&usage),
-            [("5h".to_string(), 42.0), ("wk".to_string(), 17.0)]
-        );
-
-        let business = claude_usage(&json, false).unwrap();
-        assert!(!business.personal);
-        assert_eq!(business.meters.len(), 4);
-        assert_eq!(business.meters[3].unit, Unit::Dollars);
-    }
-
-    #[test]
-    fn codex_plans() {
-        let windows = serde_json::json!({
-            "primary_window": { "used_percent": 30, "limit_window_seconds": 18_000 },
-            "secondary_window": { "used_percent": 60, "limit_window_seconds": 604_800 }
-        });
-        let spend = serde_json::json!({ "individual_limit": { "used": "1250", "limit": "12500" } });
-
-        let plus = serde_json::json!({ "plan_type": "plus", "rate_limit": windows, "spend_control": spend });
-        let usage = codex_usage(&plus).unwrap();
-        assert!(usage.personal);
-        assert_eq!(
-            pcts(&usage),
-            [("5h".to_string(), 30.0), ("wk".to_string(), 60.0)]
-        );
-
-        let business = serde_json::json!({ "plan_type": "business", "rate_limit": null, "spend_control": spend });
-        let usage = codex_usage(&business).unwrap();
-        assert!(!usage.personal);
-        assert_eq!(usage.meters[0].summary(), "$50 / $500");
-
-        let free = serde_json::json!({ "plan_type": "free", "rate_limit": windows });
-        assert!(not_available(codex_usage(&free)));
+        assert!(matches!(
+            read_json_file(&path, "log in"),
+            Err(e) if e.problem == Problem::NotAvailable
+        ));
     }
 
     #[test]
@@ -1028,8 +1609,8 @@ mod tests {
         assert_eq!(money(518.94), "518.94");
         assert_eq!(money(1000.0), "1,000");
         assert_eq!(money(12_345.5), "12,345.50");
-        assert_eq!(window_label(18_000, "week"), "5h");
-        assert_eq!(window_label(604_800, "week"), "week");
+        assert_eq!(window_label(18_000), "5h");
+        assert_eq!(window_label(604_800), "week");
     }
 
     fn labels(meters: &[Meter]) -> Vec<(&str, f64, Option<i64>)> {
@@ -1251,15 +1832,17 @@ mod tests {
                     renewal_date: Some(date.into()),
                     ..Default::default()
                 };
-                let mut state = ClaudeState::default();
-                state.renewal = Some((
-                    0,
-                    Cycle {
-                        verb: "renews".into(),
-                        at: 1,
-                        date_only: true,
-                    },
-                ));
+                let mut state = ClaudeState {
+                    renewal: Some((
+                        0,
+                        Cycle {
+                            verb: "renews".into(),
+                            at: 1,
+                            date_only: true,
+                        },
+                    )),
+                    ..Default::default()
+                };
                 let meters = claude_meters(&serde_json::json!({
                     "extra_usage": { "used_credits": 10, "monthly_limit": total }
                 }));

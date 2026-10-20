@@ -1,6 +1,6 @@
 # usage-widget
 
-A small always-on-top Windows widget that shows how much of your GitHub Copilot,
+A small always-on-top Windows and macOS widget that shows how much of your GitHub Copilot,
 Claude and Codex allowance you have used.
 
 | Business plans | Personal subscriptions |
@@ -9,22 +9,25 @@ Claude and Codex allowance you have used.
 
 Minimized:
 
-<img width="272" alt="Minimized widget: one line with each service's logo and percentage" src="docs/minimized.png" />
+<img width="227" alt="Minimized widget: one line with each service's logo and estimated percentage" src="docs/minimized.png" />
 
 ## Install
 
-Download `usage-widget.exe` from the
-[latest release](https://github.com/pepsi-enjoyer/usage-widget/releases/latest), put it
-somewhere permanent and run it. To start it at login, run `usage-widget --startup`
-once (`--no-startup` undoes it).
-
-Or build it with [Rust](https://rustup.rs):
+Build this branch with [Rust](https://rustup.rs):
 
 ```bash
-cargo install --git https://github.com/pepsi-enjoyer/usage-widget
+cargo install --git https://github.com/domsleee/usage-widget --branch usage-details-and-estimates
+usage-widget
 ```
 
-It updates itself from new releases.
+On Windows, run `usage-widget --startup` once to start at login
+(`--no-startup` undoes it). On macOS it lives in the menu bar, without a Dock icon,
+and returns the terminal prompt when started as a release build.
+
+Windows supports upstream's release updater. Set `USAGE_WIDGET_AUTO_UPDATE=0` to
+keep this branch's additions when newer upstream releases are published; upgrade
+this branch by running `cargo install` again. The upstream Windows executable
+has only upstream's features.
 
 ## Setup
 
@@ -46,26 +49,34 @@ says so; run that CLI once and it picks the new token up.
   shows when it resets: a countdown for the 5-hour window, or a date and local time
   for the weekly window. Copilot Pro shows its monthly allowance.
 
-Bars go green, yellow and red as you use more.
+Bars go green, yellow and red as you use more. Hover a service name for its plan,
+renewal date, exact reset times and additional caps. Click its name to open usage.
 
-`usage-widget usage` prints subscription usage as JSON without opening a window,
-using the same providers and config as the widget, with local estimates disabled.
-The [subscription-usage skill](skills/subscription-usage/SKILL.md) lets agents read it.
-`usage-widget prices` prints the estimator's token rates per million tokens,
-separating normal input, cache reads, Claude cache writes and output. Codex uses
-credits; Claude uses relative cost weights for calibration. Unlisted Codex models
-use the displayed fallback, and Claude models match a family or the default.
+Optional local estimates fill in the fraction between percentage ticks and show
+`~`. The widget keeps the same compact layout and widens only when decimals need
+more room.
+
+## Using it
 
 - Drag it anywhere. It remembers where it was.
 - Right-click to refresh, minimize, resize, check for updates, open each service's
   usage page, or quit.
 - Untick a service under Show in the right-click menu to hide it. Tick it again to
   bring it back.
+- On macOS, the menu bar menu also hides and shows the widget.
 - Hover a red error to see the full message.
 - Hover a personal plan's countdown, or a window's percentage or label, to see when
   that window resets.
 
-Optional settings, as environment variables:
+Run `usage-widget config` to edit refresh interval, opacity, percentage precision
+and provider settings. Claude renewal lookup and local estimates are optional;
+see [settings, renewals and estimates](docs/usage-details.md).
+
+`usage-widget usage` prints subscription usage as JSON without opening a window.
+`usage-widget prices` prints the estimator's token rates per model. The
+[subscription-usage skill](skills/subscription-usage/SKILL.md) exposes both to agents.
+
+Environment variables override the matching config settings:
 
 | Variable | Does | Default |
 | --- | --- | --- |
