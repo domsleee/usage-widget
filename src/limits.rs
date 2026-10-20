@@ -46,6 +46,14 @@ impl Ratio {
         let Some(prev) = self.last.replace(now) else {
             return;
         };
+        // A window shown as full may have risen further than it shows, so a
+        // poll that ends or starts at 100% says nothing reliable about the ratio.
+        if [prev.five_hour, prev.week, now.five_hour, now.week]
+            .iter()
+            .any(|&p| p >= 100.0)
+        {
+            return;
+        }
         // A 5-hour window with no reset time had not started yet; it may just have.
         let same_five_hour = prev.five_hour_reset.is_none()
             || same_window(prev.five_hour_reset, now.five_hour_reset);
@@ -70,6 +78,10 @@ impl Ratio {
     }
 }
 
+fn spent(m: &Meter) -> bool {
+    m.percent() >= 100.0
+}
+
 fn same_window(a: Option<i64>, b: Option<i64>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => (a - b).abs() <= RESET_TOLERANCE_SECS,
@@ -82,6 +94,13 @@ fn same_window(a: Option<i64>, b: Option<i64>) -> bool {
 /// the weekly one. Until the ratio is learnt the fuller window is picked, which
 /// treats a 5-hour point and a weekly point as costing the same.
 pub fn binding(five_hour: &Meter, week: &Meter, weekly_per_five_hour: Option<f64>) -> usize {
+    // A spent week blocks use until it resets, whatever the 5-hour window shows,
+    // unless that window is spent too and is the one to reset later.
+    if spent(week) {
+        let five_hour_later = spent(five_hour)
+            && matches!((five_hour.resets_at, week.resets_at), (Some(f), Some(w)) if f > w);
+        return usize::from(!five_hour_later);
+    }
     // A week that resets before the 5-hour window does cannot end this session.
     if let (Some(f), Some(w)) = (five_hour.resets_at, week.resets_at)
         && w <= f
@@ -138,6 +157,41 @@ mod tests {
         assert_eq!(binding(&five, &week, Some(1.0)), 0);
     }
 
+    #[test]
+    fn spent_week_binds() {
+        let week = window(100.0, Some(600_000));
+        // No ratio learnt yet, as on first launch.
+        assert_eq!(binding(&window(0.0, Some(18_000)), &week, None), 1);
+        // A learnt ratio near zero cannot make the empty 5-hour window bind.
+        assert_eq!(binding(&window(0.0, Some(18_000)), &week, Some(0.0)), 1);
+        // The 5-hour window has not started, or has just reset.
+        assert_eq!(binding(&window(0.0, None), &week, Some(0.1)), 1);
+        assert_eq!(binding(&window(0.0, Some(36_000)), &week, Some(0.1)), 1);
+    }
+
+    #[test]
+    fn spent_week_binds_even_when_it_resets_first() {
+        // Two hours of the week left, and an unstarted 5-hour window that would
+        // reset after it: nothing can be used until the week resets.
+        let five = window(0.0, Some(18_000));
+        let week = window(100.0, Some(7_200));
+        assert_eq!(binding(&five, &week, None), 1);
+    }
+
+    #[test]
+    fn both_spent_follows_the_later_reset() {
+        let five = window(100.0, Some(18_000));
+        assert_eq!(binding(&five, &window(100.0, Some(600_000)), None), 1);
+        assert_eq!(binding(&five, &window(100.0, Some(7_200)), None), 0);
+    }
+
+    #[test]
+    fn selection_resumes_after_the_weekly_reset() {
+        let five = window(40.0, Some(18_000));
+        assert_eq!(binding(&five, &window(100.0, Some(600_000)), None), 1);
+        assert_eq!(binding(&five, &window(0.0, Some(1_200_000)), None), 0);
+    }
+
     fn assert_ratio(r: &Ratio, k: f64) {
         let got = r.weekly_per_five_hour().expect("ratio learnt");
         assert!((got - k).abs() < 1e-9, "{got} != {k}");
@@ -156,6 +210,20 @@ mod tests {
         r.observe(&window(5.0, Some(36_000)), &window(54.0, w));
         assert_ratio(&r, 0.1);
         r.observe(&window(15.0, Some(36_000)), &window(55.0, w));
+        assert_ratio(&r, 0.1);
+    }
+
+    #[test]
+    fn skips_polls_from_a_full_window() {
+        let mut r = Ratio::default();
+        let (f, w) = (Some(18_000), Some(600_000));
+        r.observe(&window(0.0, f), &window(70.0, w));
+        r.observe(&window(20.0, f), &window(72.0, w));
+        assert_ratio(&r, 0.1);
+        // The week fills up, then stays at 100% while extra usage keeps the
+        // 5-hour window rising: neither poll shows the real weekly cost.
+        r.observe(&window(40.0, f), &window(100.0, w));
+        r.observe(&window(90.0, f), &window(100.0, w));
         assert_ratio(&r, 0.1);
     }
 }
