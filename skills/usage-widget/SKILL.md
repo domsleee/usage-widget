@@ -1,9 +1,9 @@
 ---
-name: subscription-usage
-description: Read Claude, Codex and GitHub Copilot subscription usage, remaining quota, reset times and per-model estimation token prices from usage-widget. Use when asked how much subscription usage is left, when a limit resets, or how the estimator prices tokens and cache usage.
+name: usage-widget
+description: Read Claude, Codex and GitHub Copilot usage, remaining quota, reset times and per-model estimation token prices from the usage-widget CLI. Use when asked how much usage is left, when a limit resets, or how the estimator prices tokens and cache usage.
 ---
 
-# Subscription usage
+# Usage widget
 
 Run `usage-widget usage`. It prints JSON using the widget's existing logins and config without opening a window. Requires a version of usage-widget with the `usage` command; from its checkout, use `cargo run --quiet -- usage` if needed.
 

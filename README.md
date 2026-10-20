@@ -74,7 +74,7 @@ see [settings, renewals and estimates](docs/usage-details.md).
 
 `usage-widget usage` prints subscription usage as JSON without opening a window.
 `usage-widget prices` prints the estimator's token rates per model. The
-[subscription-usage skill](skills/subscription-usage/SKILL.md) exposes both to agents.
+[usage-widget skill](skills/usage-widget/SKILL.md) exposes both to agents.
 
 Environment variables override the matching config settings:
 

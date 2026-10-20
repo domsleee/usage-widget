@@ -1,0 +1,4 @@
+interface:
+  display_name: "Usage Widget"
+  short_description: "Read usage-widget usage and estimator token rates"
+  default_prompt: "Use $usage-widget to check my subscription usage and per-model token prices."
