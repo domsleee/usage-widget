@@ -26,5 +26,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-web-kit = "0.3"
+block2 = "0.6"
 tray-icon = "0.24.2"
 winit = "0.30"

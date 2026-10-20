@@ -1024,6 +1024,11 @@ struct ClaudeCodeState {
     plan: Option<String>,
 }
 
+/// The claude.ai organization Claude Code is logged in to, if known.
+pub(crate) fn claude_org() -> Option<String> {
+    claude_code_state().org
+}
+
 fn claude_code_state() -> ClaudeCodeState {
     let Some(v) = home()
         .ok()

@@ -1,11 +1,15 @@
-//! Runs the browser helper that looks up Claude's renewal date when asked, and
-//! stops it once it finishes or is cancelled.
+//! Looks up Claude's renewal date when asked, and stops once it finishes or
+//! is cancelled. On macOS the lookup runs in the widget's own sign-in window
+//! (see `renewal_webview`); elsewhere it runs the browser helper.
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod process;
 use crate::providers::Cycle;
 use eframe::egui;
+#[cfg(not(target_os = "macos"))]
 use process::Control;
 use std::path::PathBuf;
+#[cfg(not(target_os = "macos"))]
 use std::process::Command;
 use std::sync::{
     Arc,
@@ -13,55 +17,108 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
+enum Kind {
+    Thread {
+        rx: Receiver<Result<Cycle, String>>,
+        cancelled: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    },
+    #[cfg(target_os = "macos")]
+    Web(Box<crate::renewal_webview::WebLookup>),
+}
+
 pub struct Lookup {
-    rx: Receiver<Result<Cycle, String>>,
-    cancelled: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    kind: Kind,
 }
 
 impl Lookup {
-    pub fn try_recv(&self) -> Result<Result<Cycle, String>, TryRecvError> {
-        self.rx.try_recv()
+    /// Raises the sign-in window above other windows, if this lookup has one.
+    pub fn bring_to_front(&self) {
+        #[cfg(target_os = "macos")]
+        if let Kind::Web(web) = &self.kind {
+            web.bring_to_front();
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<Result<Cycle, String>, TryRecvError> {
+        match &mut self.kind {
+            Kind::Thread { rx, .. } => rx.try_recv(),
+            #[cfg(target_os = "macos")]
+            Kind::Web(web) => match web.try_recv() {
+                Some(result) => Ok(result),
+                None => Err(TryRecvError::Empty),
+            },
+        }
     }
 
     #[cfg(test)]
     pub fn from_receiver(rx: Receiver<Result<Cycle, String>>) -> Self {
         Self {
-            rx,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            kind: Kind::Thread {
+                rx,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                thread: None,
+            },
         }
     }
 }
 
 impl Drop for Lookup {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Kind::Thread {
+            cancelled, thread, ..
+        } = &mut self.kind
+        {
+            cancelled.store(true, Ordering::Relaxed);
+            if let Some(thread) = thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 }
 
 pub fn start(ctx: egui::Context) -> Lookup {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &ctx;
+        match crate::renewal_webview::WebLookup::new() {
+            Ok(web) => {
+                return Lookup {
+                    kind: Kind::Web(Box::new(web)),
+                };
+            }
+            Err(error) => {
+                eprintln!("renewal sign-in window failed: {error}");
+            }
+        }
+    }
     let (tx, rx) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
+    #[cfg(not(target_os = "macos"))]
     let control = Control {
         cancelled: cancelled.clone(),
     };
     let thread = thread::spawn(move || {
-        let _ = tx.send(run(&control));
+        #[cfg(not(target_os = "macos"))]
+        let result = run(&control);
+        #[cfg(target_os = "macos")]
+        let result = Err("renewal sign-in is unavailable".into());
+        let _ = tx.send(result);
         ctx.request_repaint();
     });
     Lookup {
-        rx,
-        cancelled,
-        thread: Some(thread),
+        kind: Kind::Thread {
+            rx,
+            cancelled,
+            thread: Some(thread),
+        },
     }
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn node_version(name: &str) -> Vec<u32> {
     name.trim_start_matches('v')
         .split('.')
@@ -69,6 +126,7 @@ fn node_version(name: &str) -> Vec<u32> {
         .collect()
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn node_candidates() -> Vec<PathBuf> {
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
     let mut paths: Vec<_> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -114,6 +172,7 @@ fn node_candidates() -> Vec<PathBuf> {
     paths
 }
 
+#[cfg(not(target_os = "macos"))]
 fn run(control: &Control) -> Result<Cycle, String> {
     let config_path = crate::config::ensure_exists()?;
     let folder = config_path.parent().unwrap().join("renewal-helper");

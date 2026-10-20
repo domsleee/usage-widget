@@ -15,6 +15,8 @@ mod menubar;
 mod paths;
 mod providers;
 mod renewal_lookup;
+#[cfg(target_os = "macos")]
+mod renewal_webview;
 mod timeutil;
 mod update;
 
@@ -403,7 +405,7 @@ impl App {
                 }
             }
         }
-        if let Some(rx) = &self.renewal_lookup {
+        if let Some(rx) = &mut self.renewal_lookup {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1267,11 +1269,25 @@ fn provider_block(
     }
 }
 
+#[cfg(target_os = "macos")]
+const RENEWAL_SIGN_IN: &str = "complete sign-in in the Claude window";
+#[cfg(not(target_os = "macos"))]
+const RENEWAL_SIGN_IN: &str = "complete sign-in in Chrome";
+#[cfg(target_os = "macos")]
+const RENEWAL_LOOKUP_LABEL: &str = "Look up Claude renewal";
+#[cfg(not(target_os = "macos"))]
+const RENEWAL_LOOKUP_LABEL: &str = "Look up Claude renewal in Chrome";
+#[cfg(target_os = "macos")]
+const RENEWAL_SIGN_IN_LABEL: &str = "Complete sign-in in the Claude window";
+#[cfg(not(target_os = "macos"))]
+const RENEWAL_SIGN_IN_LABEL: &str = "Complete sign-in in Chrome";
+
 struct RenewalButton<'a> {
     running: bool,
     error: Option<&'a str>,
     clicked: bool,
     cancelled: bool,
+    raise_clicked: bool,
 }
 
 impl RenewalButton<'_> {
@@ -1290,12 +1306,12 @@ impl RenewalButton<'_> {
             let response =
                 ui.interact(spinner.rect, ui.id().with("cancel-renewal"), Sense::click());
             self.context_menu(&response);
-            response.on_hover_text(
-                "Looking up renewal — complete sign-in in Chrome. Right-click to cancel.",
-            );
+            response.on_hover_text(format!(
+                "Looking up renewal — {RENEWAL_SIGN_IN}. Right-click for options."
+            ));
         } else {
             let tooltip = self.error.map_or_else(
-                || "Look up Claude renewal in Chrome".to_string(),
+                || RENEWAL_LOOKUP_LABEL.to_string(),
                 |error| format!("Renewal lookup failed: {error}\nClick to retry"),
             );
             self.clicked |= refresh_button(ui, &tooltip, self.error.is_some());
@@ -1317,7 +1333,11 @@ impl RenewalButton<'_> {
                 ui.close();
             }
             if self.running {
-                ui.label("Complete sign-in in Chrome");
+                ui.label(RENEWAL_SIGN_IN_LABEL);
+                if ui.button("Bring sign-in window to front").clicked() {
+                    self.raise_clicked = true;
+                    ui.close();
+                }
                 if ui.button("Cancel lookup").clicked() {
                     self.cancelled = true;
                     ui.close();
@@ -1840,6 +1860,7 @@ impl eframe::App for App {
             error: self.renewal_error.as_deref(),
             clicked: false,
             cancelled: false,
+            raise_clicked: false,
         };
 
         // Checked on the raw pointer so a right-click over any widget counts.
@@ -1963,12 +1984,21 @@ impl eframe::App for App {
             mac_menu(frame, self, zoom, refresh_mins, minimized);
         }
 
-        let (lookup_renewal, cancel_renewal) = (renewal.clicked, renewal.cancelled);
+        let (lookup_renewal, cancel_renewal, raise_renewal) = (
+            renewal.clicked,
+            renewal.cancelled,
+            renewal.raise_clicked,
+        );
         if let Some(action) = action {
             self.apply_action(action, &ctx);
         }
         if resized {
             self.settled = false;
+        }
+        if raise_renewal
+            && let Some(lookup) = &self.renewal_lookup
+        {
+            lookup.bring_to_front();
         }
         if cancel_renewal {
             self.renewal_lookup = None;
@@ -2595,6 +2625,7 @@ mod display_tests {
                                 error: None,
                                 clicked: false,
                                 cancelled: false,
+                                raise_clicked: false,
                             };
                             let response = ui.vertical(|ui| {
                                 ui.set_width(width - 2.0 * f32::from(MARGIN));
@@ -2657,6 +2688,7 @@ mod display_tests {
                             error: None,
                             clicked: false,
                             cancelled: false,
+                            raise_clicked: false,
                         };
                         let response = ui.vertical(|ui| {
                             ui.set_width(width - 2.0 * f32::from(MARGIN));

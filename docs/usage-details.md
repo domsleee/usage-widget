@@ -30,15 +30,24 @@ estimate = false    # as for Claude
 Update it after each renewal; the widget does not assume a monthly billing schedule.
 An invalid or past date shows a note while usage meters keep working.
 
-### Look up Claude's renewal date with Playwright
+### Look up Claude's renewal date
 
 Subscription plans only; usage-based plans with a monthly spend cap reset monthly and
 show no lookup. When Claude's renewal date is missing, click the tiny circular-arrow
 icon to the left of **Claude**. Once the date is shown, right-click **Claude** and choose
-**Look up renewal** instead. With Node.js and Chrome
-installed, it sets up the helper automatically, opens Chrome for sign-in, and
-applies the saved date without restarting the widget. The icon becomes a spinner
+**Look up renewal** instead. The icon becomes a spinner
 while a lookup is running, or turns red on failure; hover for details and click to retry.
+
+On macOS the lookup opens the widget's own **Sign in to Claude** window. Sign in
+there once; the session is kept in the widget's own website data store (it needs
+macOS 14 or later), separate from any browser profile, and later lookups reuse it
+without showing the window's sign-in again. The widget reads the subscription
+date from claude.ai and applies it without restarting. No Node.js, Chrome or
+Playwright is involved.
+
+On Windows the lookup uses the Playwright helper described below. With Node.js and Chrome
+installed, it sets up the helper automatically, opens Chrome for sign-in, and
+applies the saved date without restarting the widget.
 
 To run the helper separately from this checkout:
 

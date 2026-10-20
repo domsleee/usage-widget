@@ -5,6 +5,27 @@
 //! for the subscription details.
 
 use crate::providers::Cycle;
+use serde_json::Value;
+
+/// Builds a renewal cycle from claude.ai subscription details, as returned by
+/// the `subscription_details` endpoint.
+pub(crate) fn cycle_from_details(json: &Value) -> Result<Cycle, String> {
+    if let Some((at, date_only)) = timestamp(&json["plan_ending_at"]) {
+        return Ok(Cycle {
+            date_only,
+            verb: "ends".into(),
+            at,
+        });
+    }
+    timestamp(&json["next_charge_at"])
+        .or_else(|| timestamp(&json["next_charge_date"]))
+        .map(|(at, date_only)| Cycle {
+            date_only,
+            verb: "renews".into(),
+            at,
+        })
+        .ok_or_else(|| "no next charge date from claude.ai".into())
+}
 
 #[cfg(target_os = "macos")]
 pub use mac::cycle;
@@ -39,7 +60,7 @@ fn timestamp(v: &serde_json::Value) -> Option<(i64, bool)> {
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use super::{Cycle, timestamp};
+    use super::Cycle;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -110,22 +131,7 @@ mod mac {
             .map_err(|e| format!("read failed: {e}"))?;
         let json: Value =
             serde_json::from_str(&text).map_err(|e| format!("bad JSON from claude.ai: {e}"))?;
-
-        if let Some((at, date_only)) = timestamp(&json["plan_ending_at"]) {
-            return Ok(Cycle {
-                date_only,
-                verb: "ends".into(),
-                at,
-            });
-        }
-        timestamp(&json["next_charge_at"])
-            .or_else(|| timestamp(&json["next_charge_date"]))
-            .map(|(at, date_only)| Cycle {
-                date_only,
-                verb: "renews".into(),
-                at,
-            })
-            .ok_or_else(|| "no next charge date from claude.ai".into())
+        super::cycle_from_details(&json)
     }
 
     /// Calls `f` with the claude.ai `sessionKey` and `lastActiveOrg` cookies of each
