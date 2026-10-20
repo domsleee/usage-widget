@@ -15,9 +15,9 @@ use eframe::egui::{
 };
 use providers::{FetchError, Meter, Problem, Provider, Unit, Usage, money};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use timeutil::{ago, now_unix, until, until_next_minute};
 
@@ -93,6 +93,9 @@ struct App {
     hidden: HashSet<String>,
     /// Set once an update has been installed; the UI thread then restarts.
     restart: Arc<AtomicBool>,
+    /// Services whose token is being refreshed, so a second click does not
+    /// start another run.
+    refreshing: Arc<Mutex<HashSet<Provider>>>,
 }
 
 impl App {
@@ -143,6 +146,7 @@ impl App {
             ratios,
             hidden,
             restart,
+            refreshing: Arc::default(),
         }
     }
 
@@ -174,6 +178,37 @@ impl App {
             slot.loading = true;
         }
         let _ = self.refresh_tx.send(());
+    }
+
+    /// Has the service's CLI refresh its token in the background, then refreshes
+    /// every service, reporting a failed refresh.
+    fn refresh_token(&mut self, p: Provider) {
+        let refreshing = self.refreshing.clone();
+        if !refreshing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(p)
+        {
+            return;
+        }
+        for slot in self.slots.values_mut() {
+            slot.loading = true;
+        }
+        let refresh_tx = self.refresh_tx.clone();
+        std::thread::spawn(move || {
+            let result = p.refresh_token();
+            refreshing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&p);
+            let _ = refresh_tx.send(());
+            if let Err(e) = result {
+                message_box(
+                    &format!("Could not refresh the {} token: {e}", p.name()),
+                    true,
+                );
+            }
+        });
     }
 
     fn drain(&mut self) {
@@ -864,6 +899,7 @@ fn provider_block(
 #[derive(Clone, Copy)]
 enum MenuAction {
     Refresh,
+    RefreshToken(Provider),
     ToggleMinimized,
     Open(Provider),
     Toggle(Provider),
@@ -925,6 +961,7 @@ fn native_menu(
     const ID_UPDATE: usize = 4;
     const ID_OPEN: usize = 10;
     const ID_TOGGLE: usize = 20;
+    const ID_TOKEN: usize = 30;
     const ID_SIZE: usize = 100;
 
     let hwnd = hwnd(frame)?;
@@ -934,6 +971,16 @@ fn native_menu(
         };
         let menu = CreatePopupMenu();
         add(menu, MF_STRING, ID_REFRESH, "Refresh now");
+        if found.iter().any(|p| p.refreshes_token()) {
+            // Owned by `menu` once appended, so destroyed along with it.
+            let tokens = CreatePopupMenu();
+            for (i, p) in Provider::ALL.iter().enumerate() {
+                if found.contains(p) && p.refreshes_token() {
+                    add(tokens, MF_STRING, ID_TOKEN + i, p.name());
+                }
+            }
+            add(menu, MF_POPUP, tokens as usize, "Refresh token");
+        }
         add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
         add(menu, MF_SEPARATOR, 0, "");
         if !found.is_empty() {
@@ -1011,6 +1058,9 @@ fn native_menu(
             _ if (ID_TOGGLE..ID_TOGGLE + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Toggle(Provider::ALL[id - ID_TOGGLE]))
             }
+            _ if (ID_TOKEN..ID_TOKEN + Provider::ALL.len()).contains(&id) => {
+                Some(MenuAction::RefreshToken(Provider::ALL[id - ID_TOKEN]))
+            }
             _ if (ID_SIZE..ID_SIZE + SIZES.len()).contains(&id) => {
                 Some(MenuAction::Size(SIZES[id - ID_SIZE]))
             }
@@ -1031,6 +1081,15 @@ fn egui_menu(
     let mut action = None;
     if ui.button("Refresh now").clicked() {
         action = Some(MenuAction::Refresh);
+    }
+    if found.iter().any(|p| p.refreshes_token()) {
+        ui.menu_button("Refresh token", |ui| {
+            for &p in found.iter().filter(|p| p.refreshes_token()) {
+                if ui.button(p.name()).clicked() {
+                    action = Some(MenuAction::RefreshToken(p));
+                }
+            }
+        });
     }
     if ui.button(minimize_label(minimized)).clicked() {
         action = Some(MenuAction::ToggleMinimized);
@@ -1385,6 +1444,7 @@ impl eframe::App for App {
 
         match action {
             Some(MenuAction::Refresh) => refresh = true,
+            Some(MenuAction::RefreshToken(p)) => self.refresh_token(p),
             Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
             Some(MenuAction::Open(p)) => open_url(p.url()),
             Some(MenuAction::Toggle(p)) => self.toggle(p),
