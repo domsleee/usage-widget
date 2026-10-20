@@ -11,10 +11,24 @@ ureq = { version = "3", default-features = false, features = ["json", "native-tl
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 raw-window-handle = "0.6"
 sha2 = "0.11.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+toml = "1.1.6"
 
 [profile.release]
 lto = "thin"
 strip = true
+
+[target.'cfg(windows)'.dependencies]
+winit = "0.30"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-web-kit = "0.3"
+block2 = "0.6"
+tray-icon = "0.24.2"
+winit = "0.30"
