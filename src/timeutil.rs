@@ -1,6 +1,6 @@
 //! Time parsing, countdowns and local reset dates.
 
-use chrono::{Local, TimeZone};
+use chrono::{Local, NaiveDateTime, TimeZone};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_unix() -> i64 {
@@ -27,12 +27,16 @@ pub fn until(ts: i64) -> String {
     countdown((ts - now_unix()).max(0))
 }
 
-/// A reset date in the computer's time zone, as "Fri 16 Oct 2026, 14:30".
+/// A reset date in the computer's time zone, as "Fri 16 Oct 2026, 2:30PM".
 pub fn local_datetime(ts: i64) -> Option<String> {
     Local
         .timestamp_opt(ts, 0)
         .single()
-        .map(|date| date.format("%a %-d %b %Y, %H:%M").to_string())
+        .map(|date| format_datetime(&date.naive_local()))
+}
+
+fn format_datetime(date: &NaiveDateTime) -> String {
+    date.format("%a %-d %b %Y, %-I:%M%p").to_string()
 }
 
 /// dd:hh:mm, or hh:mm once under a day.
@@ -94,6 +98,19 @@ mod tests {
         assert_eq!(countdown(86_400), "01:00:00");
         assert_eq!(countdown(3 * 3600 + 29 * 60 + 59), "03:29");
         assert_eq!(countdown(42), "00:00");
+    }
+
+    #[test]
+    fn formats_reset_time_as_12_hour() {
+        let at = |h, m| {
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 16)
+                .unwrap()
+                .and_hms_opt(h, m, 0)
+                .unwrap()
+        };
+        assert_eq!(format_datetime(&at(21, 11)), "Fri 16 Oct 2026, 9:11PM");
+        assert_eq!(format_datetime(&at(0, 5)), "Fri 16 Oct 2026, 12:05AM");
+        assert_eq!(format_datetime(&at(12, 0)), "Fri 16 Oct 2026, 12:00PM");
     }
 
     #[test]
