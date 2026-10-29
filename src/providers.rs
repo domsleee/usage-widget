@@ -127,7 +127,7 @@ impl Provider {
 }
 
 /// What a service reported for the signed-in account.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Usage {
     pub meters: Vec<Meter>,
     /// A personal subscription (Claude Pro/Max, ChatGPT Plus/Pro, Copilot Pro).
@@ -135,7 +135,8 @@ pub struct Usage {
     pub personal: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Unit {
     /// Amount in whole currency units.
     Dollars,
@@ -143,7 +144,7 @@ pub enum Unit {
     Percent,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Meter {
     /// Optional sub-label when a provider has more than one meter (e.g. "5h", "week").
     pub label: Option<String>,
