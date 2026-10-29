@@ -1467,9 +1467,29 @@ impl eframe::App for App {
     }
 }
 
+/// Prints what each service reports as JSON, without opening a window.
+fn print_usage() {
+    let mut services = serde_json::Map::new();
+    for p in Provider::ALL {
+        let result = match p.fetch() {
+            Ok(usage) => serde_json::json!({ "usage": usage }),
+            Err(e) => serde_json::json!({ "error": e.problem.label(), "detail": e.detail }),
+        };
+        services.insert(p.name().to_lowercase(), result);
+    }
+    println!(
+        "{}",
+        serde_json::json!({ "fetched_at": now_unix(), "services": services })
+    );
+}
+
 fn main() -> eframe::Result {
     let mut wait_for_exit = Duration::ZERO;
     match std::env::args().nth(1).as_deref() {
+        Some("usage") => {
+            print_usage();
+            return Ok(());
+        }
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
         // Started by the previous version after an update; it is still closing.
@@ -1478,7 +1498,7 @@ fn main() -> eframe::Result {
             return finish(Err(format!(
                 "unknown flag {flag}
 
-usage: usage-widget [--startup | --no-startup]"
+usage: usage-widget [usage | --startup | --no-startup]"
             )));
         }
         None => {}
