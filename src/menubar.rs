@@ -16,6 +16,7 @@ pub enum Action {
     ToggleWidget,
     Refresh,
     Open(Provider),
+    EditConfig,
     Quit,
     /// A choice from the widget's right-click popup.
     Widget(MenuAction),
@@ -45,6 +46,7 @@ impl MenuBar {
                 )
             })
             .collect();
+        let edit = MenuItem::new("Edit config", true, None);
         let services: Vec<_> = providers
             .iter()
             .map(|&p| (p, CheckMenuItem::new(p.name(), false, true, None)))
@@ -68,6 +70,7 @@ impl MenuBar {
         }
         append(&PredefinedMenuItem::separator())?;
         append(&updates)?;
+        append(&edit)?;
         append(&quit)?;
 
         let mut actions = vec![
@@ -77,6 +80,7 @@ impl MenuBar {
                 updates.id().clone(),
                 Action::Widget(MenuAction::CheckForUpdates),
             ),
+            (edit.id().clone(), Action::EditConfig),
             (quit.id().clone(), Action::Quit),
         ];
         actions.extend(
@@ -172,6 +176,7 @@ impl MenuBar {
             .collect();
         let note = item(&format!("Refreshes every {refresh_mins} min"), None);
         let updates = item("Check for updates", Some(MenuAction::CheckForUpdates));
+        let edit = item("Edit config", Some(MenuAction::EditConfig));
         let quit = item("Quit", Some(MenuAction::Quit));
         let show = Submenu::new("Show", true);
         for &p in providers {
@@ -210,7 +215,15 @@ impl MenuBar {
         for open in &opens {
             let _ = menu.append(open);
         }
-        let _ = menu.append_items(&[&separator(), &sizes, &separator(), &note, &updates, &quit]);
+        let _ = menu.append_items(&[
+            &separator(),
+            &sizes,
+            &separator(),
+            &note,
+            &updates,
+            &edit,
+            &quit,
+        ]);
 
         *self.popup_actions.borrow_mut() = actions;
         // SAFETY: upheld by the caller.
