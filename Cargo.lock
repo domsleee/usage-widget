@@ -3453,6 +3453,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "eframe",
+ "objc2 0.6.4",
  "raw-window-handle",
  "serde",
  "serde_json",

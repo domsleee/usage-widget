@@ -543,7 +543,32 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS: the same whole-window opacity as on Windows, through the NSWindow's
+/// alpha.
+#[cfg(target_os = "macos")]
+fn apply_windows_chrome(frame: &eframe::Frame) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    let alpha = f64::from(opacity_percent()) / 100.0;
+    // SAFETY: `ns_view` is the live NSView eframe draws into, and `ui` runs on
+    // the main thread.
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        if !window.is_null() {
+            let _: () = msg_send![window, setAlphaValue: alpha];
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn apply_windows_chrome(_frame: &eframe::Frame) {}
 
 /// Runs when the window is first visible and after each self-resize. Pulls it
@@ -1688,11 +1713,7 @@ fn set_opacity(hwnd: isize) {
     const WS_EX_LAYERED: isize = 0x0008_0000;
     const LWA_ALPHA: u32 = 0x2;
 
-    let percent = std::env::var("USAGE_WIDGET_OPACITY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_OPACITY_PERCENT)
-        .clamp(20, 100);
+    let percent = opacity_percent();
     if percent >= 100 {
         return;
     }
@@ -1704,6 +1725,16 @@ fn set_opacity(hwnd: isize) {
             SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
         }
     }
+}
+
+/// `USAGE_WIDGET_OPACITY` (20-100), or the default.
+#[cfg(any(windows, target_os = "macos"))]
+fn opacity_percent() -> u32 {
+    std::env::var("USAGE_WIDGET_OPACITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_OPACITY_PERCENT)
+        .clamp(20, 100)
 }
 
 /// Holds a named mutex for the life of the process; returns false if another
@@ -1738,9 +1769,32 @@ fn claim_single_instance(wait: Duration) -> bool {
     }
 }
 
+/// Holds an exclusive lock on a file for the life of the process; returns false
+/// if another instance already holds it.
 #[cfg(not(windows))]
-fn claim_single_instance(_wait: Duration) -> bool {
-    true
+fn claim_single_instance(wait: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    let Ok(file) = std::fs::File::create(std::env::temp_dir().join("usage-widget.lock")) else {
+        return true;
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            // The system releases the lock when the process exits.
+            std::mem::forget(file);
+            return true;
+        }
+        if start.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -1839,6 +1893,22 @@ fn message_box(text: &str, is_err: bool) {
             );
         }
     }
-    #[cfg(not(windows))]
+    // The widget has no terminal on macOS either, so show a dialog.
+    #[cfg(target_os = "macos")]
+    {
+        let style = if is_err { "critical" } else { "informational" };
+        let _ = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                &format!("display alert \"usage-widget\" message (item 1 of argv) as {style}"),
+                "-e",
+                "end run",
+                text,
+            ])
+            .status();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     eprintln!("{text}");
 }

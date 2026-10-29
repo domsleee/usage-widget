@@ -53,6 +53,7 @@ impl MenuBar {
         for (_, item) in &services {
             show.append(item).map_err(|e| e.to_string())?;
         }
+        let updates = MenuItem::new("Check for updates", true, None);
         let quit = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
@@ -66,11 +67,16 @@ impl MenuBar {
             append(item)?;
         }
         append(&PredefinedMenuItem::separator())?;
+        append(&updates)?;
         append(&quit)?;
 
         let mut actions = vec![
             (toggle.id().clone(), Action::ToggleWidget),
             (refresh.id().clone(), Action::Refresh),
+            (
+                updates.id().clone(),
+                Action::Widget(MenuAction::CheckForUpdates),
+            ),
             (quit.id().clone(), Action::Quit),
         ];
         actions.extend(

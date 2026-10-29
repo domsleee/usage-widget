@@ -20,5 +20,6 @@ lto = "thin"
 strip = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
 tray-icon = "0.24.2"
 winit = "0.30"
