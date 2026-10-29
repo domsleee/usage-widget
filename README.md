@@ -1,6 +1,6 @@
 # usage-widget
 
-A small always-on-top Windows and macOS widget that shows how much of your GitHub Copilot,
+A small always-on-top Windows widget that shows how much of your GitHub Copilot,
 Claude and Codex allowance you have used.
 
 | Business plans | Personal subscriptions |
@@ -24,7 +24,7 @@ Or build it with [Rust](https://rustup.rs):
 cargo install --git https://github.com/pepsi-enjoyer/usage-widget
 ```
 
-On Windows it updates itself from new releases.
+It updates itself from new releases.
 
 ## Setup
 
