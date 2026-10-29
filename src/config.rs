@@ -23,6 +23,16 @@ enabled = true
 
 [claude]
 enabled = true
+# Usage comes from Claude Code's own cache (~/.claude.json). When that is over
+# 3 minutes old, ask Anthropic directly, at most every 3 minutes.
+# false = never call Anthropic, only read the cache.
+api = true
+# macOS: read your claude.ai login cookie from Chrome, Arc, Brave or Edge to
+# show the renewal day. macOS asks once for keychain access.
+browser_cookies = false
+# Optional next billing date (local calendar date), on any OS. Overrides browser
+# lookup. Update it after each renewal; it does not assume a monthly schedule.
+# renewal_date = "2026-10-12"
 
 [codex]
 enabled = true
@@ -35,7 +45,7 @@ pub struct Config {
     pub opacity: u32,
     pub precision: usize,
     pub copilot: Service,
-    pub claude: Service,
+    pub claude: Claude,
     pub codex: Service,
 }
 
@@ -45,6 +55,15 @@ pub struct Service {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Claude {
+    pub enabled: bool,
+    pub api: bool,
+    pub browser_cookies: bool,
+    pub renewal_date: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -52,7 +71,7 @@ impl Default for Config {
             opacity: 85,
             precision: 0,
             copilot: Service::default(),
-            claude: Service::default(),
+            claude: Claude::default(),
             codex: Service::default(),
         }
     }
@@ -61,6 +80,17 @@ impl Default for Config {
 impl Default for Service {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+impl Default for Claude {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api: true,
+            browser_cookies: false,
+            renewal_date: None,
+        }
     }
 }
 
@@ -185,7 +215,14 @@ mod tests {
     fn partial_and_unknown_keys() {
         let c: Config = toml::from_str("[copilot]\nenabled = false").unwrap();
         assert!(!c.enabled(Provider::Copilot));
-        assert!(c.enabled(Provider::Claude));
+        assert!(c.enabled(Provider::Claude) && c.claude.api);
         assert!(toml::from_str::<Config>("refresh_minutes = 5").is_err());
+    }
+
+    #[test]
+    fn manual_claude_renewal() {
+        let c: Config = toml::from_str("[claude]\nrenewal_date = \"2026-10-12\"").unwrap();
+        assert_eq!(c.claude.renewal_date.as_deref(), Some("2026-10-12"));
+        assert!(!c.claude.browser_cookies);
     }
 }
