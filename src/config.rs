@@ -33,9 +33,17 @@ browser_cookies = false
 # Optional next billing date (local calendar date), on any OS. Overrides browser
 # lookup. Update it after each renewal; it does not assume a monthly schedule.
 # renewal_date = "2026-10-12"
+# Claude reports whole percents. true = estimate the part of the next percent
+# from this machine's Claude Code token use (shown with "~"; it warms up over a
+# few ticks and can't see claude.ai or other devices).
+estimate = false
 
 [codex]
 enabled = true
+# Codex reports whole percents. true = estimate the part of the next percent
+# from this machine's Codex token use (shown with "~"; it can't see Codex cloud
+# or other devices, so the decimals are a guess).
+estimate = false
 "#;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -46,7 +54,7 @@ pub struct Config {
     pub precision: usize,
     pub copilot: Service,
     pub claude: Claude,
-    pub codex: Service,
+    pub codex: Codex,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -62,6 +70,23 @@ pub struct Claude {
     pub api: bool,
     pub browser_cookies: bool,
     pub renewal_date: Option<String>,
+    pub estimate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Codex {
+    pub enabled: bool,
+    pub estimate: bool,
+}
+
+impl Default for Codex {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            estimate: false,
+        }
+    }
 }
 
 impl Default for Config {
@@ -72,7 +97,7 @@ impl Default for Config {
             precision: 0,
             copilot: Service::default(),
             claude: Claude::default(),
-            codex: Service::default(),
+            codex: Codex::default(),
         }
     }
 }
@@ -90,6 +115,7 @@ impl Default for Claude {
             api: true,
             browser_cookies: false,
             renewal_date: None,
+            estimate: false,
         }
     }
 }

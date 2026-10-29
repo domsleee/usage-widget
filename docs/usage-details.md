@@ -1,4 +1,4 @@
-# Settings and renewals
+# Settings, renewals and estimates
 
 ## Config
 
@@ -19,9 +19,11 @@ enabled = true
 api = true          # false = read Claude Code's cache only
 browser_cookies = false  # macOS: read the claude.ai login cookie for the renewal date
 # renewal_date = "2026-10-12"  # optional manual next billing date, including Windows
+estimate = false    # estimate between percentage ticks from local logs; shown with ~
 
 [codex]
 enabled = true
+estimate = false    # as for Claude
 ```
 
 `claude.renewal_date` uses your local calendar date and overrides browser lookup.
@@ -57,6 +59,14 @@ case "$INPUT" in *'"five_hour"'*) printf '%s' "$INPUT" > ~/.claude/usage-widget-
 This updates usage as you use Claude Code, without extra requests. Without it,
 the widget uses cached data and polls at most every 3 minutes, subject to rate limits.
 
+Estimates only cover local logs; Claude needs a few percentage ticks to calibrate.
+Estimated usage always shows at least two decimal places so it cannot round up to
+the next reported percentage. Fractional usage reported by a service is kept as-is;
+local estimates apply only to whole-percent readings.
+With `estimate = true`, daily JSONL history retains readings, token counts,
+calibration and predictions until manually removed. It excludes conversations and
+credentials. See [estimate history](estimate-history.md) for paths, token
+totals and replay rules.
 Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,
 with a keychain access prompt on first use. If a token expires, run `claude` or
 `codex` once; the widget picks up the new token on its next refresh.

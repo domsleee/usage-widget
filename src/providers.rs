@@ -121,7 +121,7 @@ impl Provider {
         match self {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(&config.claude),
-            Provider::Codex => codex(),
+            Provider::Codex => codex(config.codex.estimate),
         }
     }
 }
@@ -145,6 +145,8 @@ pub struct Usage {
     pub cycle: Option<Cycle>,
     /// Caveat about the data, e.g. that it is old because of rate limiting.
     pub note: Option<String>,
+    /// Labels of meters whose values include a local estimate (see `estimate`).
+    pub estimated: Vec<String>,
     pub meters: Vec<Meter>,
 }
 
@@ -567,6 +569,7 @@ fn copilot() -> Result<Usage, FetchError> {
         plan: copilot_plan(&json),
         cycle,
         note: None,
+        estimated: Vec::new(),
         meters: copilot_meters(&json)?,
     })
 }
@@ -916,7 +919,8 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
         apply_statusline(&mut meters, &rate_limits);
         live_at = Some(at);
     }
-    if meters.is_empty() {
+    // When the 5h and week readings were taken.
+    let Some(data_at) = live_at.or(snap_at).filter(|_| !meters.is_empty()) else {
         return Err(if rate_limited {
             FetchError::new(
                 Problem::RateLimited,
@@ -937,6 +941,43 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
                 })
         });
     };
+
+    // Claude reports whole percents; estimate the part of the next one from local use.
+    let mut estimated = Vec::new();
+    let mut history_problem = None;
+    if config.estimate {
+        let plan = plan.clone().unwrap_or_default();
+        // Rounded: statusline figures carry float noise (55.00000000000001).
+        let readings: Vec<(String, f64, i64)> = meters
+            .iter()
+            .filter(|m| {
+                m.unit == Unit::Percent && matches!(m.label.as_deref(), Some("5h" | "week"))
+            })
+            .filter_map(|m| Some((m.label.clone()?, m.used, m.resets_at?)))
+            .collect();
+        let refs: Vec<(&str, f64, i64)> = readings
+            .iter()
+            .map(|(label, pct, window)| (label.as_str(), *pct, *window))
+            .collect();
+        let source = if live_at.is_some() {
+            "statusline"
+        } else {
+            "usage_snapshot"
+        };
+        let fractions = crate::claude_estimate::fractions(&refs, data_at, &plan, source)
+            .unwrap_or_else(|e| {
+                history_problem = Some(e);
+                vec![None; readings.len()]
+            });
+        for ((label, pct, _), fraction) in readings.iter().zip(fractions) {
+            if let Some(fraction) = fraction
+                && let Some(m) = meters.iter_mut().find(|m| m.label.as_ref() == Some(label))
+            {
+                m.used = pct.round() + fraction;
+                estimated.push(label.clone());
+            }
+        }
+    }
 
     let note = claude_note(
         now,
@@ -959,6 +1000,10 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
         Some(e) => Some(note.map_or(format!("renewal: {e}"), |n| format!("{n} · renewal: {e}"))),
         None => note,
     };
+    let note = match history_problem {
+        Some(e) => Some(note.map_or_else(|| e.clone(), |n| format!("{n} · {e}"))),
+        None => note,
+    };
     Ok(Usage {
         personal: plan
             .as_deref()
@@ -966,6 +1011,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
         plan,
         cycle,
         note,
+        estimated,
         meters,
     })
 }
@@ -1323,7 +1369,11 @@ fn claude_meters(json: &Value) -> Vec<Meter> {
 /// Like Claude Code, the Codex CLI only refreshes its ChatGPT token while it runs,
 /// so an expired token is reported until `codex` is run again, by hand or with
 /// `Provider::refresh_token`.
-fn codex() -> Result<Usage, FetchError> {
+fn codex(estimate: bool) -> Result<Usage, FetchError> {
+    codex_once(estimate)
+}
+
+fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
     let path = home()?.join(".codex").join("auth.json");
     let auth_file = read_json_file(&path, "log in with `codex`")?;
     let tokens = &auth_file["tokens"];
@@ -1349,6 +1399,7 @@ fn codex() -> Result<Usage, FetchError> {
         headers.push(("ChatGPT-Account-Id", account_id));
     }
     let (status, json) = get_json("https://chatgpt.com/backend-api/wham/usage", &headers)?;
+    let observed_at = now_unix();
     match status {
         200 => {}
         401 | 403 => {
@@ -1374,7 +1425,7 @@ fn codex() -> Result<Usage, FetchError> {
     let personal = codex_personal(&json);
     let plan = codex_plan(&json);
     let cycle = codex_cycle(&headers, account_id);
-    let meters = codex_meters(&json);
+    let mut meters = codex_meters(&json);
     if meters.is_empty() {
         if json["credits"]["unlimited"].as_bool() == Some(true) {
             return Ok(Usage {
@@ -1382,6 +1433,7 @@ fn codex() -> Result<Usage, FetchError> {
                 plan,
                 cycle,
                 note: None,
+                estimated: Vec::new(),
                 meters: vec![Meter {
                     label: Some("unlimited".into()),
                     used: 0.0,
@@ -1397,11 +1449,32 @@ fn codex() -> Result<Usage, FetchError> {
         ));
     }
 
+    // Codex reports whole percents; estimate the part of the next one from local use.
+    let mut estimated = Vec::new();
+    let mut note = None;
+    if estimate {
+        let plan_type = json["plan_type"].as_str().unwrap_or_default();
+        if let Some(week) = meters
+            .iter_mut()
+            .find(|m| m.label.as_deref() == Some("week") && m.unit == Unit::Percent)
+            && let Some(window) = week.resets_at
+        {
+            match crate::codex_estimate::fraction(week.used, window, plan_type, observed_at) {
+                Ok(Some(fraction)) => {
+                    week.used = week.used.round() + fraction.clamp(0.0, 0.99);
+                    estimated.extend(week.label.clone());
+                }
+                Ok(None) => {}
+                Err(e) => note = Some(e),
+            }
+        }
+    }
     Ok(Usage {
         personal,
         plan,
         cycle,
-        note: None,
+        note,
+        estimated,
         meters,
     })
 }
@@ -1426,6 +1499,11 @@ fn codex_cycle(headers: &[(&str, &str)], account_id: &str) -> Option<Cycle> {
         verb: verb.into(),
         at,
     })
+}
+
+// Fractional service readings are already more precise than this estimator.
+pub(crate) fn whole_percent(value: f64) -> Option<f64> {
+    (value.is_finite() && (value - value.round()).abs() < 1e-9).then(|| value.round())
 }
 
 fn codex_plan(json: &Value) -> Option<String> {
@@ -1643,6 +1721,9 @@ mod tests {
 
     #[test]
     fn formatting() {
+        assert_eq!(whole_percent(71.37), None);
+        assert_eq!(whole_percent(87.0), Some(87.0));
+        assert_eq!(whole_percent(55.00000000000001), Some(55.0));
         assert_eq!(money(62_440.0 * COPILOT_USD_PER_CREDIT), "624.40");
         assert_eq!(money(12_500.0 * CODEX_USD_PER_CREDIT), "500");
         assert_eq!(money(518.94), "518.94");

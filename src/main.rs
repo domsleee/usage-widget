@@ -3,8 +3,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod claude_estimate;
 mod claude_web;
+mod codex_estimate;
 mod config;
+mod estimate;
+mod estimate_history;
 mod limits;
 #[cfg(target_os = "macos")]
 mod menubar;
@@ -63,6 +67,7 @@ struct Slot {
     plan: Option<String>,
     cycle: Option<Cycle>,
     note: Option<String>,
+    estimated: Vec<String>,
     meters: Option<Vec<Meter>>,
     error: Option<FetchError>,
     updated: Option<i64>,
@@ -89,6 +94,12 @@ impl Slot {
             .filter(|m| m.unit == Unit::Percent && m.total > 0.0)
             .filter(|m| matches!(m.label.as_deref(), Some("5h" | "week" | "wk" | "mo")))
             .collect()
+    }
+
+    fn estimated(&self, m: &Meter) -> bool {
+        m.label
+            .as_ref()
+            .is_some_and(|label| self.estimated.contains(label))
     }
 }
 
@@ -378,16 +389,27 @@ impl App {
                             .iter()
                             .find(|m| matches!(m.label.as_deref(), Some("week" | "wk")));
                         if let (Some(five), Some(week)) = (five, week) {
+                            let mut five = five.clone();
+                            let mut week = week.clone();
+                            for m in [&mut five, &mut week] {
+                                if m.label
+                                    .as_ref()
+                                    .is_some_and(|l| usage.estimated.contains(l))
+                                {
+                                    m.used = m.used.floor();
+                                }
+                            }
                             self.ratios
                                 .entry(u.provider.name().to_string())
                                 .or_default()
-                                .observe(five, week);
+                                .observe(&five, &week);
                         }
                     }
                     slot.personal = usage.personal;
                     slot.plan = usage.plan;
                     slot.cycle = usage.cycle;
                     slot.note = usage.note;
+                    slot.estimated = usage.estimated;
                     slot.meters = Some(usage.meters);
                     slot.error = None;
                 }
@@ -497,7 +519,10 @@ impl App {
                             if i > 0 {
                                 width += 9.0 + text_width("|".into(), 12.0);
                             }
-                            width += text_width(percent_label(m.percent(), self.precision), 12.0);
+                            width += text_width(
+                                percent_label(m.percent(), self.precision, slot.estimated(m)),
+                                12.0,
+                            );
                             if let Some(label) = &m.label {
                                 width += 3.0
                                     + text_width(
@@ -513,8 +538,11 @@ impl App {
                     } else if let Some(m) = slot.meters.as_deref().and_then(spend_meter) {
                         width += 8.0 + text_width(m.summary(), 12.0);
                         if m.total > 0.0 {
-                            width +=
-                                8.0 + text_width(percent_label(m.percent(), self.precision), 12.0);
+                            width += 8.0
+                                + text_width(
+                                    percent_label(m.percent(), self.precision, false),
+                                    12.0,
+                                );
                         }
                     }
                     if let Some(e) = &slot.error {
@@ -957,24 +985,43 @@ fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
     }
 }
 
-/// The percentage, coloured by level.
-fn percent_text(m: &Meter, size: f32, precision: usize) -> RichText {
+const ESTIMATE_HOVER: &str = "Estimated from this computer's CLI token logs between reported \
+     percentage ticks. Web, cloud and other devices aren't counted.";
+
+/// The percentage, coloured by level, with "~" when it includes a local estimate.
+fn percent_text(m: &Meter, size: f32, precision: usize, estimated: bool) -> RichText {
     let pct = m.percent();
-    RichText::new(percent_label(pct, precision))
+    RichText::new(percent_label(pct, precision, estimated))
         .size(size)
         .strong()
         .color(level_color(pct))
 }
 
-fn percent_label(pct: f64, precision: usize) -> String {
-    format!("{pct:.precision$}%")
+fn percent_label(pct: f64, precision: usize, estimated: bool) -> String {
+    // Estimates always show at least two decimals, even when readings are shown
+    // as whole percents: the decimals are the estimate.
+    let precision = if estimated {
+        precision.max(2)
+    } else {
+        precision
+    };
+    let pct = if estimated {
+        pct.min(pct.floor() + 0.99)
+    } else {
+        pct
+    };
+    let mark = if estimated { "~" } else { "" };
+    format!("{mark}{pct:.precision$}%")
 }
 
 /// "$523.54 / $1,000   52%" right-aligned, coloured by level.
-fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize) {
+fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated: bool) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if m.total > 0.0 {
-            ui.label(percent_text(m, size, precision));
+            let resp = ui.label(percent_text(m, size, precision, estimated));
+            if estimated {
+                resp.on_hover_text(ESTIMATE_HOVER);
+            }
             if m.unit != Unit::Percent {
                 ui.label(RichText::new(m.summary()).size(size - 1.0).color(TEXT));
             }
@@ -1012,7 +1059,7 @@ fn usage_hover(slot: &Slot, precision: usize) -> String {
         } else if m.unit == Unit::Dollars {
             m.summary()
         } else {
-            percent_label(m.percent(), precision)
+            percent_label(m.percent(), precision, slot.estimated(m))
         };
         let reset = m
             .resets_at
@@ -1025,6 +1072,9 @@ fn usage_hover(slot: &Slot, precision: usize) -> String {
     }
     lines.extend(slot.note.iter().cloned());
     lines.extend(slot.error.iter().map(|e| e.detail.clone()));
+    if !slot.estimated.is_empty() {
+        lines.push(ESTIMATE_HOVER.into());
+    }
     lines.join("\n")
 }
 
@@ -1047,7 +1097,7 @@ fn reset_label(meter: &Meter) -> Option<String> {
 }
 
 /// Primary windows share one header, fading towards the window that binds first.
-fn windows(ui: &mut egui::Ui, meters: &[&Meter], weights: &[f32], precision: usize) {
+fn windows(ui: &mut egui::Ui, meters: &[&Meter], weights: &[f32], slot: &Slot, precision: usize) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         for (i, (m, &weight)) in meters.iter().zip(weights).rev().enumerate() {
@@ -1070,10 +1120,14 @@ fn windows(ui: &mut egui::Ui, meters: &[&Meter], weights: &[f32], precision: usi
                 }
             }
             let response = ui.label(
-                percent_text(m, 12.0, precision).color(weighted(level_color(m.percent()), weight)),
+                percent_text(m, 12.0, precision, slot.estimated(m))
+                    .color(weighted(level_color(m.percent()), weight)),
             );
             if let Some(text) = reset_tooltip(m) {
                 response.clone().on_hover_text(text);
+            }
+            if slot.estimated(m) {
+                response.on_hover_text(ESTIMATE_HOVER);
             }
         }
     });
@@ -1144,9 +1198,9 @@ fn provider_block(
             }
         }
         if !personal.is_empty() {
-            windows(ui, &personal, &weights, precision);
+            windows(ui, &personal, &weights, slot, precision);
         } else if let Some(m) = single {
-            amounts(ui, m, 12.0, precision);
+            amounts(ui, m, 12.0, precision, false);
         }
         if let Some(error) = &slot.error {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1180,7 +1234,7 @@ fn provider_block(
                 if let Some(label) = &m.label {
                     ui.label(RichText::new(label).size(11.0).color(MUTED));
                 }
-                amounts(ui, m, 12.0, precision);
+                amounts(ui, m, 12.0, precision, slot.estimated(m));
             });
             if m.total > 0.0 {
                 bar(ui, m.fraction(), level_color(m.percent()));
@@ -1587,7 +1641,9 @@ fn compact_row(
             });
         let text = match (top, &slot.error) {
             (Some(m), _) => {
-                RichText::new(percent_label(m.percent(), precision)).color(level_color(m.percent()))
+                let estimated = m.label.as_ref().is_some_and(|l| slot.estimated.contains(l));
+                RichText::new(percent_label(m.percent(), precision, estimated))
+                    .color(level_color(m.percent()))
             }
             (None, Some(e)) if e.problem == Problem::NotAvailable => {
                 RichText::new("N/A").color(MUTED)
@@ -1854,7 +1910,9 @@ impl eframe::App for App {
 
 /// Reads the same subscription data as the widget without opening a window.
 fn print_usage() {
-    let (config, config_error) = config::load();
+    let (mut config, config_error) = config::load();
+    config.claude.estimate = false;
+    config.codex.estimate = false;
     let mut providers = serde_json::Map::new();
     for provider in Provider::ALL.into_iter().filter(|p| config.enabled(*p)) {
         let result = match provider.fetch(&config) {
@@ -1883,6 +1941,17 @@ fn main() -> eframe::Result {
             print_usage();
             return Ok(());
         }
+        Some("prices") => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "per_tokens": 1_000_000,
+                    "claude": claude_estimate::pricing(),
+                    "codex": codex_estimate::pricing(),
+                })
+            );
+            return Ok(());
+        }
         Some("config") => {
             return match config::open(true) {
                 Ok(path) => {
@@ -1899,7 +1968,7 @@ fn main() -> eframe::Result {
             return finish(Err(format!(
                 "unknown argument {flag}
 
-usage: usage-widget [usage | config | --startup | --no-startup]"
+usage: usage-widget [usage | prices | config | --startup | --no-startup]"
             )));
         }
         None => {}
@@ -2242,6 +2311,17 @@ mod display_tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[test]
+    fn estimates_do_not_round_into_the_next_reported_percent() {
+        for precision in [0, 1, 2] {
+            assert_eq!(super::percent_label(87.99, precision, true), "~87.99%");
+            assert_eq!(super::percent_label(87.999, precision, true), "~87.99%");
+        }
+        assert_eq!(super::percent_label(87.0, 0, true), "~87.00%");
+        assert_eq!(super::percent_label(87.0, 0, false), "87%");
+        assert_eq!(super::percent_label(87.999, 3, true), "~87.990%");
+    }
+
     fn window(label: &str, used: f64, resets_at: i64) -> Meter {
         Meter {
             label: Some(label.into()),
@@ -2267,6 +2347,7 @@ mod display_tests {
                 window("week", 90.0, now + 4 * 86_400),
                 window("fable wk", 98.0, now + 4 * 86_400),
             ]),
+            estimated: vec!["5h".into()],
             updated: Some(now),
             ..Default::default()
         }
@@ -2324,7 +2405,7 @@ mod display_tests {
         let hover = usage_hover(&slot, 0);
         assert!(hover.contains("Max 5x"));
         assert!(hover.contains("renews 9d"));
-        assert!(hover.contains("5h: 80%"));
+        assert!(hover.contains("5h: ~80.12%"));
         assert!(hover.contains("fable wk: 98%"));
     }
 
@@ -2351,8 +2432,9 @@ mod display_tests {
                         plan: Some(plan.into()),
                         cycle: None,
                         note: None,
+                        estimated: vec!["5h".into()],
                         meters: vec![
-                            window("5h", 30.0, now + 3600),
+                            window("5h", 30.47, now + 3600),
                             window("week", 3.0, now + 4 * 86_400),
                         ],
                     }),
@@ -2433,7 +2515,7 @@ mod display_tests {
     }
 
     #[test]
-    fn windows_fit_one_header_and_one_bar_and_compact_uses_binding() {
+    fn estimates_fit_one_header_and_one_bar_and_compact_uses_binding() {
         let ctx = egui::Context::default();
         let (mut app, _, _) = App::for_test(vec![Provider::Claude]);
         app.slots.insert(Provider::Claude, personal_slot());
@@ -2485,7 +2567,7 @@ mod display_tests {
         );
         assert!(height < 45.0, "header and bar expanded to {height}");
         let text = rendered_text(&output);
-        assert!(text.iter().any(|t| t == "80%"), "{text:?}");
+        assert!(text.iter().any(|t| t == "~80.12%"), "{text:?}");
         assert!(text.iter().any(|t| t == "90%"));
         assert!(!text.iter().any(|t| t.contains("fable")));
         assert_eq!(
@@ -2515,7 +2597,7 @@ mod display_tests {
             });
         });
         let text = rendered_text(&output);
-        assert!(text.iter().any(|t| t == "80%"), "{text:?}");
+        assert!(text.iter().any(|t| t == "~80.12%"), "{text:?}");
         assert!(!text.iter().any(|t| t == "98%"));
         output.textures_delta.clear();
     }

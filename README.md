@@ -5,11 +5,11 @@ Claude and Codex allowance you have used.
 
 | Business plans | Personal subscriptions |
 | --- | --- |
-| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="250" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset countdown" src="docs/personal-plans.png" /> |
+| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="291" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset time" src="docs/personal-plans.png" /> |
 
 Minimized:
 
-<img width="272" alt="Minimized widget: one line with each service's logo and percentage" src="docs/minimized.png" />
+<img width="227" alt="Minimized widget: one line with each service's logo and estimated percentage" src="docs/minimized.png" />
 
 ## Install
 
@@ -51,6 +51,10 @@ model, which uses a little of your allowance, then refreshes.
 Bars go green, yellow and red as you use more. Hover a service name for its plan,
 renewal date, exact reset times and additional caps. Click its name to open usage.
 
+Optional local estimates fill in the fraction between percentage ticks and show
+`~`. The widget keeps the same compact layout and widens only when decimals need
+more room.
+
 ## Using it
 
 - Drag it anywhere. It remembers where it was.
@@ -66,8 +70,12 @@ renewal date, exact reset times and additional caps. Click its name to open usag
   The [usage-widget skill](skills/usage-widget/SKILL.md) lets agents read it.
 
 Run `usage-widget config` to edit refresh interval, opacity, percentage precision
-and provider settings. Claude's renewal date is optional; see
-[settings and renewals](docs/usage-details.md).
+and provider settings. Claude's renewal date and local estimates are optional;
+see [settings, renewals and estimates](docs/usage-details.md).
+
+`usage-widget usage` prints subscription usage as JSON without opening a window.
+`usage-widget prices` prints the estimator's token rates per model. The
+[usage-widget skill](skills/usage-widget/SKILL.md) exposes both to agents.
 
 Environment variables override the matching config settings:
 

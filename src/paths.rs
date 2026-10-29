@@ -13,6 +13,26 @@ pub fn config_dir() -> Option<PathBuf> {
     }
 }
 
+/// App data that should roam with the user; the same folder as settings on
+/// Windows and macOS.
+pub fn data_dir() -> Option<PathBuf> {
+    if cfg!(any(windows, target_os = "macos")) {
+        config_dir()
+    } else {
+        env_dir("XDG_DATA_HOME").or_else(|| Some(std::env::home_dir()?.join(".local/share")))
+    }
+}
+
+/// App data kept on this machine: `%LOCALAPPDATA%` on Windows, the same folder
+/// as settings on macOS.
+pub fn data_local_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        known_folder(KnownFolder::LocalAppData)
+    } else {
+        data_dir()
+    }
+}
+
 /// Files that can be rebuilt: `%LOCALAPPDATA%` on Windows, `~/Library/Caches`
 /// on macOS.
 pub fn cache_dir() -> Option<PathBuf> {
