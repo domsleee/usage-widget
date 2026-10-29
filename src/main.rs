@@ -830,7 +830,13 @@ fn provider_block(
     ui.horizontal(|ui| {
         provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-        ui.label(name);
+        // The name opens the service's usage page.
+        let name = ui
+            .add(egui::Label::new(name).sense(Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if name.clicked() {
+            open_url(p.url());
+        }
         if let Some(m) = selected
             && let Some(at) = m.resets_at
         {
