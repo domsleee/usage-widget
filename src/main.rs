@@ -5,6 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod limits;
+#[cfg(target_os = "macos")]
+mod menubar;
 mod providers;
 mod timeutil;
 mod update;
@@ -96,6 +98,11 @@ struct App {
     /// Services whose token is being refreshed, so a second click does not
     /// start another run.
     refreshing: Arc<Mutex<HashSet<Provider>>>,
+    #[cfg(target_os = "macos")]
+    menubar: Option<menubar::MenuBar>,
+    /// Whether the window is on screen; the menu bar icon can hide it.
+    #[cfg(target_os = "macos")]
+    shown: bool,
 }
 
 impl App {
@@ -135,6 +142,14 @@ impl App {
                 },
             );
         }
+        #[cfg(target_os = "macos")]
+        let menubar = match menubar::MenuBar::new(&cc.egui_ctx, &Provider::ALL) {
+            Ok(bar) => Some(bar),
+            Err(e) => {
+                eprintln!("menu bar icon: {e}");
+                None
+            }
+        };
         Self {
             slots,
             rx,
@@ -147,6 +162,53 @@ impl App {
             hidden,
             restart,
             refreshing: Arc::default(),
+            #[cfg(target_os = "macos")]
+            menubar,
+            #[cfg(target_os = "macos")]
+            shown: true,
+        }
+    }
+
+    /// Menu bar clicks. Called from `logic`, which runs before every `ui` pass
+    /// and also while the widget is hidden, when eframe runs no egui pass at
+    /// all, so handling these in `ui` would leave a hidden widget with no way
+    /// back.
+    #[cfg(target_os = "macos")]
+    fn handle_menu(&mut self, ctx: &egui::Context) {
+        let Some(actions) = self.menubar.as_ref().map(menubar::MenuBar::take_actions) else {
+            return;
+        };
+        for action in actions {
+            match action {
+                menubar::Action::ToggleWidget => {
+                    self.shown = !self.shown;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(self.shown));
+                    if self.shown {
+                        self.settled = false;
+                    }
+                    if let Some(bar) = &self.menubar {
+                        bar.set_widget_shown(self.shown);
+                    }
+                }
+                menubar::Action::Refresh => self.refresh_now(),
+                menubar::Action::Open(p) => open_url(p.url()),
+                menubar::Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+                menubar::Action::Widget(action) => self.apply_action(action, ctx),
+            }
+        }
+    }
+
+    /// A choice from the right-click menu.
+    fn apply_action(&mut self, action: MenuAction, ctx: &egui::Context) {
+        match action {
+            MenuAction::Refresh => self.refresh_now(),
+            MenuAction::RefreshToken(p) => self.refresh_token(p),
+            MenuAction::ToggleMinimized => self.minimized = !self.minimized,
+            MenuAction::Open(p) => open_url(p.url()),
+            MenuAction::Toggle(p) => self.toggle(p),
+            MenuAction::Size(z) => ctx.set_zoom_factor(z),
+            MenuAction::CheckForUpdates => self.check_for_updates(ctx),
+            MenuAction::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
         }
     }
 
@@ -1069,7 +1131,7 @@ fn native_menu(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn egui_menu(
     ui: &mut egui::Ui,
     found: &[Provider],
@@ -1303,6 +1365,11 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
 }
 
 impl eframe::App for App {
+    #[cfg(target_os = "macos")]
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_menu(ctx);
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
         eframe::set_value(storage, RATIOS_KEY, &self.ratios);
@@ -1310,7 +1377,13 @@ impl eframe::App for App {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        BG.to_normalized_gamma_f32()
+        // The macOS window is transparent so the panel's rounded corners show;
+        // elsewhere the window is opaque and painted entirely in BG.
+        if cfg!(target_os = "macos") {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            BG.to_normalized_gamma_f32()
+        }
     }
 
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -1334,9 +1407,15 @@ impl eframe::App for App {
         } else {
             Margin::same(MARGIN)
         };
-        let panel = egui::Frame::NONE.fill(BG).inner_margin(margin);
+        let panel = egui::Frame::NONE
+            .fill(BG)
+            .inner_margin(margin)
+            .corner_radius(if cfg!(target_os = "macos") { 8 } else { 0 });
 
         let mut refresh = false;
+        // On macOS the right-click choice arrives through the menu bar's
+        // clicks instead, so this stays unset there.
+        #[cfg_attr(target_os = "macos", allow(unused_mut))]
         let mut action = None;
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
@@ -1348,6 +1427,14 @@ impl eframe::App for App {
             .filter_map(|&p| Some((p, self.binding(p)?)))
             .collect();
         let (empty, empty_compact) = self.empty_text(&found);
+
+        // Checked on the raw pointer so a right-click over any widget counts.
+        #[cfg(target_os = "macos")]
+        let right_clicked = ctx.input(|i| i.pointer.button_clicked(PointerButton::Secondary));
+        #[cfg(target_os = "macos")]
+        if let Some(bar) = &self.menubar {
+            bar.set_services(&found, &providers);
+        }
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -1362,7 +1449,7 @@ impl eframe::App for App {
             if ui.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
                 action = native_menu(frame, &found, &providers, zoom, refresh_mins, minimized);
             }
-            #[cfg(not(windows))]
+            #[cfg(all(not(windows), not(target_os = "macos")))]
             bg.context_menu(|ui| {
                 action = egui_menu(ui, &found, &providers, zoom, refresh_mins, minimized);
                 if action.is_some() {
@@ -1442,16 +1529,15 @@ impl eframe::App for App {
             }
         });
 
-        match action {
-            Some(MenuAction::Refresh) => refresh = true,
-            Some(MenuAction::RefreshToken(p)) => self.refresh_token(p),
-            Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
-            Some(MenuAction::Open(p)) => open_url(p.url()),
-            Some(MenuAction::Toggle(p)) => self.toggle(p),
-            Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
-            Some(MenuAction::CheckForUpdates) => self.check_for_updates(&ctx),
-            Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
-            None => {}
+        // A native popup menu on macOS, since an egui menu is clipped to this
+        // small window. The choice arrives later through the menu bar's clicks.
+        #[cfg(target_os = "macos")]
+        if right_clicked && self.menubar.is_some() && !egui::Popup::is_any_open(&ctx) {
+            mac_menu(frame, self, zoom, refresh_mins, minimized);
+        }
+
+        if let Some(action) = action {
+            self.apply_action(action, &ctx);
         }
         if refresh {
             self.refresh_now();
@@ -1464,6 +1550,33 @@ impl eframe::App for App {
                 Err(e) => message_box(&format!("Updated, but {e}"), true),
             }
         }
+    }
+}
+
+/// Shows the right-click menu as a native popup at the cursor and blocks until
+/// it is dismissed. Unlike an egui menu it is not clipped to the window. The
+/// choice arrives later through `MenuBar::take_actions`.
+#[cfg(target_os = "macos")]
+fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, minimized: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Some(bar) = &app.menubar else { return };
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: `ns_view` is the live NSView eframe draws into, and `ui` runs on
+    // the main thread.
+    unsafe {
+        bar.popup(
+            appkit.ns_view.as_ptr(),
+            &app.found(),
+            &app.shown(),
+            zoom,
+            refresh_mins,
+            minimized,
+        )
     }
 }
 
@@ -1484,6 +1597,11 @@ usage: usage-widget [--startup | --no-startup]"
         None => {}
     }
 
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    if detach_from_terminal() {
+        return Ok(());
+    }
+
     if !claim_single_instance(wait_for_exit) {
         return Ok(());
     }
@@ -1496,9 +1614,17 @@ usage: usage-widget [--startup | --no-startup]"
             .with_title("Usage")
             .with_inner_size([WIDTH, 180.0])
             .with_decorations(false)
+            .with_transparent(cfg!(target_os = "macos"))
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false),
+        // An accessory app on macOS: no Dock icon or Cmd+Tab entry; the menu
+        // bar icon stands in for them.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
     eframe::run_native(
@@ -1506,6 +1632,45 @@ usage: usage-widget [--startup | --no-startup]"
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+/// Release builds on Windows have no console; this is the macOS equivalent.
+/// Started from a terminal, the widget relaunches itself with no terminal and
+/// returns the prompt. The relaunched copy has no terminal, so it runs the
+/// widget. If the relaunch fails, the widget runs in the foreground instead.
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn detach_from_terminal() -> bool {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    unsafe extern "C" {
+        fn setsid() -> i32;
+    }
+
+    let from_terminal = std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal();
+    if !from_terminal {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // A new session, so Ctrl+C or closing the terminal does not reach the widget.
+    unsafe {
+        cmd.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().is_ok()
 }
 
 /// Whole-window opacity through a layered window. Per-pixel transparency is not
