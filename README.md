@@ -24,9 +24,7 @@ Or build it with [Rust](https://rustup.rs):
 cargo install --git https://github.com/pepsi-enjoyer/usage-widget
 ```
 
-On Windows it updates itself from new releases. On macOS it lives in the menu
-bar, without a Dock icon, and returns the terminal prompt when started from a
-terminal; update it by running `cargo install` again.
+On Windows it updates itself from new releases.
 
 ## Setup
 
