@@ -1855,6 +1855,7 @@ fn finish(result: Result<String, String>) -> eframe::Result {
         Ok(msg) => (msg.clone(), false),
         Err(msg) => (msg.clone(), true),
     };
+    #[cfg(windows)]
     message_box(&text, is_err);
     if is_err {
         eprintln!("{text}");
