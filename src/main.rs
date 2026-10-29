@@ -1578,6 +1578,7 @@ fn claim_single_instance(_wait: Duration) -> bool {
     true
 }
 
+#[cfg(windows)]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Registers (or removes) this exe in the per-user Run key so it starts at login.
@@ -1625,9 +1626,58 @@ fn set_run_at_login(enable: bool) -> Result<String, String> {
     })
 }
 
-#[cfg(not(windows))]
+/// Adds (or removes) a launch agent that starts this binary at login.
+#[cfg(target_os = "macos")]
+fn set_run_at_login(enable: bool) -> Result<String, String> {
+    const LABEL: &str = "io.github.pepsi-enjoyer.usage-widget";
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let plist = std::path::Path::new(&home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist"));
+    if !enable {
+        return match std::fs::remove_file(&plist) {
+            Ok(()) => Ok("usage-widget will no longer start at login.".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok("usage-widget was not registered to run at login.".into())
+            }
+            Err(e) => Err(format!("could not remove {}: {e}", plist.display())),
+        };
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe
+        .display()
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#
+    );
+    let write = || {
+        std::fs::create_dir_all(plist.parent().unwrap())?;
+        std::fs::write(&plist, xml)
+    };
+    write().map_err(|e| format!("could not write {}: {e}", plist.display()))?;
+    Ok("usage-widget will start at login.\n\nRun `usage-widget --no-startup` to undo.".into())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn set_run_at_login(_enable: bool) -> Result<String, String> {
-    Err("--startup is only supported on Windows".into())
+    Err("--startup is only supported on Windows and macOS".into())
 }
 
 /// Reports a flag's outcome. Release builds have no console, so use a message box on Windows.
