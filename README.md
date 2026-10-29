@@ -70,7 +70,7 @@ more room.
   The [usage-widget skill](skills/usage-widget/SKILL.md) lets agents read it.
 
 Run `usage-widget config` to edit refresh interval, opacity, percentage precision
-and provider settings. Claude's renewal date and local estimates are optional;
+and provider settings. Claude renewal lookup and local estimates are optional;
 see [settings, renewals and estimates](docs/usage-details.md).
 
 `usage-widget usage` prints subscription usage as JSON without opening a window.

@@ -14,6 +14,9 @@ mod limits;
 mod menubar;
 mod paths;
 mod providers;
+mod renewal_lookup;
+#[cfg(target_os = "macos")]
+mod renewal_webview;
 mod timeutil;
 mod update;
 
@@ -59,6 +62,7 @@ struct Update {
     provider: Provider,
     result: Result<Usage, FetchError>,
     at: i64,
+    started: std::time::Instant,
 }
 
 #[derive(Clone, Default)]
@@ -124,6 +128,9 @@ struct App {
     /// Decimal places for percentages.
     precision: usize,
     config_error: Option<String>,
+    renewal_lookup: Option<renewal_lookup::Lookup>,
+    renewal_error: Option<String>,
+    renewal_applied_at: Option<std::time::Instant>,
     #[cfg(target_os = "macos")]
     menubar: Option<menubar::MenuBar>,
     #[cfg(target_os = "macos")]
@@ -214,6 +221,9 @@ impl App {
             opacity,
             precision,
             config_error,
+            renewal_lookup: None,
+            renewal_error: None,
+            renewal_applied_at: None,
             #[cfg(target_os = "macos")]
             menubar,
             #[cfg(target_os = "macos")]
@@ -240,6 +250,9 @@ impl App {
             opacity: 100,
             precision: 0,
             config_error: None,
+            renewal_lookup: None,
+            renewal_error: None,
+            renewal_applied_at: None,
             settled: true,
             minimized: false,
             logos: HashMap::new(),
@@ -407,7 +420,20 @@ impl App {
                     }
                     slot.personal = usage.personal;
                     slot.plan = usage.plan;
-                    slot.cycle = usage.cycle;
+                    let monthly_claude =
+                        u.provider == Provider::Claude && spend_meter(&usage.meters).is_some();
+                    if monthly_claude {
+                        self.renewal_lookup = None;
+                        self.renewal_error = None;
+                        self.renewal_applied_at = None;
+                    }
+                    if u.provider != Provider::Claude
+                        || self
+                            .renewal_applied_at
+                            .is_none_or(|applied| u.started > applied)
+                    {
+                        slot.cycle = usage.cycle;
+                    }
                     slot.note = usage.note;
                     slot.estimated = usage.estimated;
                     slot.meters = Some(usage.meters);
@@ -416,6 +442,28 @@ impl App {
                 Err(e) => {
                     slot.meters = None;
                     slot.error = Some(e);
+                }
+            }
+        }
+        if let Some(rx) = &mut self.renewal_lookup {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Renewal lookup stopped unexpectedly. Try again.".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                self.renewal_lookup = None;
+                match result {
+                    Ok(cycle) => {
+                        self.renewal_applied_at = Some(std::time::Instant::now());
+                        if let Some(slot) = self.slots.get_mut(&Provider::Claude) {
+                            slot.cycle = Some(cycle);
+                        }
+                        self.refresh_now();
+                    }
+                    Err(error) => self.renewal_error = Some(error),
                 }
             }
         }
@@ -594,7 +642,14 @@ fn spawn_worker(
 ) {
     let interval = config.refresh_interval();
     std::thread::spawn(move || {
+        let mut config = config;
         loop {
+            let started = std::time::Instant::now();
+            // The browser helper updates this setting while the widget is open.
+            let (latest, error) = config::load();
+            if error.is_none() {
+                config.claude.renewal_date = latest.claude.renewal_date;
+            }
             std::thread::scope(|s| {
                 for &p in &providers {
                     let tx = tx.clone();
@@ -606,6 +661,7 @@ fn spawn_worker(
                             provider: p,
                             result,
                             at: now_unix(),
+                            started,
                         });
                         ctx.request_repaint();
                     });
@@ -1172,6 +1228,7 @@ fn provider_block(
     p: Provider,
     slot: &Slot,
     precision: usize,
+    renewal: &mut RenewalButton<'_>,
     logos: &HashMap<Provider, egui::TextureHandle>,
     binding: Option<usize>,
 ) {
@@ -1183,12 +1240,18 @@ fn provider_block(
     let weights = position.map_or_else(|| vec![1.0; personal.len()], |t| vec![1.0 - t, t]);
 
     ui.horizontal(|ui| {
-        if slot.loading {
+        if renewal.available(p, slot) {
+            renewal.show(ui, p, slot);
+        } else if slot.loading {
             ui.add(egui::Spinner::new().size(13.0).color(MUTED));
         } else {
             provider_logo(ui, p, logos);
         }
-        name_link(ui, p).on_hover_text(usage_hover(slot, precision));
+        let response = name_link(ui, p);
+        if p == Provider::Claude {
+            renewal.context_menu(&response);
+        }
+        response.on_hover_text(usage_hover(slot, precision));
         if let Some(meter) = selected
             && let Some(reset) = reset_label(meter)
         {
@@ -1243,6 +1306,87 @@ fn provider_block(
     }
     if let Some(note) = &slot.note {
         ui.label(RichText::new(note).size(10.0).color(META));
+    }
+}
+
+#[cfg(target_os = "macos")]
+const RENEWAL_SIGN_IN: &str = "complete sign-in in the Claude window";
+#[cfg(not(target_os = "macos"))]
+const RENEWAL_SIGN_IN: &str = "complete sign-in in Chrome";
+#[cfg(target_os = "macos")]
+const RENEWAL_LOOKUP_LABEL: &str = "Look up Claude renewal";
+#[cfg(not(target_os = "macos"))]
+const RENEWAL_LOOKUP_LABEL: &str = "Look up Claude renewal in Chrome";
+#[cfg(target_os = "macos")]
+const RENEWAL_SIGN_IN_LABEL: &str = "Complete sign-in in the Claude window";
+#[cfg(not(target_os = "macos"))]
+const RENEWAL_SIGN_IN_LABEL: &str = "Complete sign-in in Chrome";
+
+struct RenewalButton<'a> {
+    running: bool,
+    error: Option<&'a str>,
+    clicked: bool,
+    cancelled: bool,
+    raise_clicked: bool,
+}
+
+impl RenewalButton<'_> {
+    fn available(&self, provider: Provider, slot: &Slot) -> bool {
+        provider == Provider::Claude
+            && slot.cycle.is_none()
+            && slot.meters.as_deref().and_then(spend_meter).is_none()
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui, provider: Provider, slot: &Slot) {
+        if !self.available(provider, slot) {
+            return;
+        }
+        if self.running {
+            let spinner = ui.add(egui::Spinner::new().size(13.0).color(MUTED));
+            let response =
+                ui.interact(spinner.rect, ui.id().with("cancel-renewal"), Sense::click());
+            self.context_menu(&response);
+            response.on_hover_text(format!(
+                "Looking up renewal — {RENEWAL_SIGN_IN}. Right-click for options."
+            ));
+        } else {
+            let tooltip = self.error.map_or_else(
+                || RENEWAL_LOOKUP_LABEL.to_string(),
+                |error| format!("Renewal lookup failed: {error}\nClick to retry"),
+            );
+            self.clicked |= refresh_button(ui, &tooltip, self.error.is_some());
+        }
+    }
+
+    fn context_menu(&mut self, response: &egui::Response) {
+        response.context_menu(|ui| {
+            let label = if self.running {
+                "Looking up…"
+            } else {
+                "Look up renewal"
+            };
+            if ui
+                .add_enabled(!self.running, egui::Button::new(label))
+                .clicked()
+            {
+                self.clicked = true;
+                ui.close();
+            }
+            if self.running {
+                ui.label(RENEWAL_SIGN_IN_LABEL);
+                if ui.button("Bring sign-in window to front").clicked() {
+                    self.raise_clicked = true;
+                    ui.close();
+                }
+                if ui.button("Cancel lookup").clicked() {
+                    self.cancelled = true;
+                    ui.close();
+                }
+            }
+            if let Some(error) = self.error {
+                ui.label(RichText::new(error).color(ERR));
+            }
+        });
     }
 }
 
@@ -1664,10 +1808,16 @@ fn compact_row(
 }
 
 /// A small circular-arrow refresh button drawn with the painter (no icon font needed).
-fn refresh_button(ui: &mut egui::Ui) -> bool {
+fn refresh_button(ui: &mut egui::Ui, tooltip: &str, error: bool) -> bool {
     let size = 11.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size + 2.0), Sense::click());
-    let color = if resp.hovered() { TEXT } else { MUTED };
+    let color = if error {
+        ERR
+    } else if resp.hovered() {
+        TEXT
+    } else {
+        MUTED
+    };
     let c = rect.center();
     let r = size * 0.38;
     let stroke = Stroke::new(1.4, color);
@@ -1698,7 +1848,7 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
     ui.painter()
         .add(Shape::convex_polygon(tri, color, Stroke::NONE));
 
-    resp.on_hover_text("Refresh now")
+    resp.on_hover_text(tooltip)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
 }
@@ -1769,6 +1919,13 @@ impl eframe::App for App {
         let (empty, empty_compact) = self.empty_text(&found);
         let full_width = self.card_width(&ctx, &providers);
         let mut resized = false;
+        let mut renewal = RenewalButton {
+            running: self.renewal_lookup.is_some(),
+            error: self.renewal_error.as_deref(),
+            clicked: false,
+            cancelled: false,
+            raise_clicked: false,
+        };
 
         // Checked on the raw pointer so a right-click over any widget counts.
         let right_clicked = ctx.input(|i| i.pointer.button_clicked(PointerButton::Secondary));
@@ -1825,6 +1982,7 @@ impl eframe::App for App {
                                 *p,
                                 slot,
                                 self.precision,
+                                &mut renewal,
                                 &self.logos,
                                 bindings.get(p).copied(),
                             );
@@ -1836,7 +1994,7 @@ impl eframe::App for App {
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if refresh_button(ui) {
+                        if refresh_button(ui, "Refresh now", false) {
                             refresh = true;
                         }
                         let updated = self
@@ -1879,8 +2037,8 @@ impl eframe::App for App {
             }
         });
 
-        // Shown after the content, so a widget with its own context menu can take
-        // the click.
+        // Shown after the content, so a widget with its own context menu (the
+        // Claude renewal lookup) can take the click.
         if native_menu_available && right_clicked && !egui::Popup::is_any_open(&ctx) {
             #[cfg(windows)]
             {
@@ -1890,14 +2048,26 @@ impl eframe::App for App {
             mac_menu(frame, self, zoom, refresh_mins, minimized);
         }
 
+        let (lookup_renewal, cancel_renewal, raise_renewal) =
+            (renewal.clicked, renewal.cancelled, renewal.raise_clicked);
         if let Some(action) = action {
             self.apply_action(action, &ctx);
         }
         if resized {
             self.settled = false;
         }
+        if raise_renewal && let Some(lookup) = &self.renewal_lookup {
+            lookup.bring_to_front();
+        }
+        if cancel_renewal {
+            self.renewal_lookup = None;
+        }
         if refresh {
             self.refresh_now();
+        }
+        if lookup_renewal {
+            self.renewal_error = None;
+            self.renewal_lookup = Some(renewal_lookup::start(ctx.clone()));
         }
         if self.restart.swap(false, Ordering::SeqCst) {
             match update::restart() {
@@ -1905,6 +2075,108 @@ impl eframe::App for App {
                 Err(e) => message_box(&format!("Updated, but {e}"), true),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    #[test]
+    fn monthly_spend_cancels_pending_renewal() {
+        for total in [0.0, 100.0] {
+            let (mut app, updates, _) = App::for_test(vec![Provider::Claude]);
+            let (_lookup_tx, lookup_rx) = mpsc::channel();
+            app.renewal_lookup = Some(renewal_lookup::Lookup::from_receiver(lookup_rx));
+            app.renewal_error = Some("previous failure".into());
+            app.renewal_applied_at = Some(std::time::Instant::now());
+            app.slots.get_mut(&Provider::Claude).unwrap().cycle = Some(Cycle {
+                verb: "renews".into(),
+                at: 1,
+                date_only: true,
+            });
+            updates
+                .send(Update {
+                    provider: Provider::Claude,
+                    result: Ok(Usage {
+                        personal: false,
+                        plan: None,
+                        cycle: None,
+                        note: None,
+                        estimated: Vec::new(),
+                        meters: vec![Meter {
+                            label: None,
+                            used: 10.0,
+                            total,
+                            unit: Unit::Dollars,
+                            resets_at: None,
+                        }],
+                    }),
+                    at: now_unix(),
+                    started: std::time::Instant::now(),
+                })
+                .unwrap();
+            app.drain();
+            assert!(app.renewal_lookup.is_none());
+            assert!(app.renewal_error.is_none());
+            assert!(app.renewal_applied_at.is_none());
+            assert!(app.slots[&Provider::Claude].cycle.is_none());
+        }
+    }
+
+    #[test]
+    fn completion_applies_date_and_refreshes_without_restart() {
+        let stale_started = std::time::Instant::now();
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        let (mut app, updates, refresh_rx) = App::for_test(vec![Provider::Claude]);
+        app.renewal_lookup = Some(renewal_lookup::Lookup::from_receiver(lookup_rx));
+        lookup_tx
+            .send(Ok(Cycle {
+                date_only: false,
+                verb: "renews".into(),
+                at: 1_790_000_000,
+            }))
+            .unwrap();
+        app.drain();
+        assert!(app.renewal_lookup.is_none());
+        assert_eq!(
+            app.slots[&Provider::Claude].cycle.as_ref().unwrap().at,
+            1_790_000_000
+        );
+        assert!(refresh_rx.try_recv().is_ok());
+
+        updates
+            .send(Update {
+                provider: Provider::Claude,
+                result: Ok(Usage {
+                    personal: false,
+                    plan: None,
+                    cycle: None,
+                    note: None,
+                    estimated: vec![],
+                    meters: vec![],
+                }),
+                at: now_unix(),
+                started: stale_started,
+            })
+            .unwrap();
+        app.drain();
+        assert_eq!(
+            app.slots[&Provider::Claude].cycle.as_ref().unwrap().at,
+            1_790_000_000
+        );
+
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        app.renewal_lookup = Some(renewal_lookup::Lookup::from_receiver(lookup_rx));
+        lookup_tx.send(Err("Sign-in cancelled".into())).unwrap();
+        app.drain();
+        assert!(app.renewal_lookup.is_none());
+        assert_eq!(app.renewal_error.as_deref(), Some("Sign-in cancelled"));
+        assert!(refresh_rx.try_recv().is_err());
+        assert_eq!(
+            app.slots[&Provider::Claude].cycle.as_ref().unwrap().at,
+            1_790_000_000
+        );
     }
 }
 
@@ -2439,6 +2711,7 @@ mod display_tests {
                         ],
                     }),
                     at: now,
+                    started: std::time::Instant::now(),
                 })
                 .unwrap();
             app.drain();
@@ -2458,7 +2731,7 @@ mod display_tests {
     }
 
     #[test]
-    fn loading_spinner_keeps_header_width_and_weekly_reset_visible() {
+    fn refresh_and_renewal_icons_keep_header_width_and_weekly_reset_visible() {
         let ctx = egui::Context::default();
         let (mut app, _, _) = App::for_test(vec![Provider::Claude]);
         app.slots.insert(Provider::Claude, personal_slot());
@@ -2468,9 +2741,14 @@ mod display_tests {
         let date = chrono::Local.timestamp_opt(at, 0).single().unwrap();
         let expected = format!("({})", date.format("%-d %b %-I:%M%P"));
         let mut idle_width = None;
-        for (loading, missing_renewal) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (loading, missing_renewal, lookup_running) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
             let slot = app.slots.get_mut(&Provider::Claude).unwrap();
             slot.loading = loading;
             if missing_renewal {
@@ -2490,6 +2768,13 @@ mod display_tests {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE.inner_margin(MARGIN))
                         .show(root, |ui| {
+                            let mut renewal = RenewalButton {
+                                running: lookup_running,
+                                error: None,
+                                clicked: false,
+                                cancelled: false,
+                                raise_clicked: false,
+                            };
                             let response = ui.vertical(|ui| {
                                 ui.set_width(width - 2.0 * f32::from(MARGIN));
                                 provider_block(
@@ -2497,6 +2782,7 @@ mod display_tests {
                                     Provider::Claude,
                                     &app.slots[&Provider::Claude],
                                     0,
+                                    &mut renewal,
                                     &HashMap::new(),
                                     Some(1),
                                 );
@@ -2545,6 +2831,13 @@ mod display_tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.inner_margin(MARGIN))
                     .show(root, |ui| {
+                        let mut renewal = RenewalButton {
+                            running: false,
+                            error: None,
+                            clicked: false,
+                            cancelled: false,
+                            raise_clicked: false,
+                        };
                         let response = ui.vertical(|ui| {
                             ui.set_width(width - 2.0 * f32::from(MARGIN));
                             provider_block(
@@ -2552,6 +2845,7 @@ mod display_tests {
                                 Provider::Claude,
                                 &app.slots[&Provider::Claude],
                                 0,
+                                &mut renewal,
                                 &HashMap::new(),
                                 Some(0),
                             )

@@ -1105,7 +1105,7 @@ fn claude_renewal(
 }
 
 /// A manually supplied next billing date, without guessing the billing cadence.
-fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Result<Cycle, String> {
+pub(crate) fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Result<Cycle, String> {
     use chrono::{Local, NaiveDate, TimeZone};
 
     let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d")
@@ -1113,7 +1113,7 @@ fn manual_claude_cycle(date: &str, today: chrono::NaiveDate) -> Result<Cycle, St
         .filter(|d| d.format("%Y-%m-%d").to_string() == date)
         .ok_or("set claude.renewal_date to a valid YYYY-MM-DD date")?;
     if parsed < today {
-        return Err("the renewal date has passed; update claude.renewal_date".into());
+        return Err("the renewal date has passed; use the refresh icon beside Claude to look it up again, or update claude.renewal_date".into());
     }
     let at = Local
         .from_local_datetime(&parsed.and_hms_opt(0, 0, 0).unwrap())
@@ -1139,6 +1139,12 @@ struct ClaudeCodeState {
     org: Option<String>,
     /// The plan per Claude Code's profile, which it refreshes as it runs.
     plan: Option<String>,
+}
+
+/// The claude.ai organization Claude Code is logged in to, if known.
+#[cfg(target_os = "macos")]
+pub(crate) fn claude_org() -> Option<String> {
+    claude_code_state().org
 }
 
 fn claude_code_state() -> ClaudeCodeState {
