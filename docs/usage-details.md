@@ -39,15 +39,17 @@ icon to the left of **Claude**. Once the date is shown, right-click **Claude** a
 while a lookup is running, or turns red on failure; hover for details and click to retry.
 
 On macOS the lookup opens the widget's own **Sign in to Claude** window. Sign in
-there once; the session is kept in the widget's own website data store (it needs
-macOS 14 or later), separate from any browser profile, and later lookups reuse it
-without showing the window's sign-in again. The widget reads the subscription
-date from claude.ai and applies it without restarting. No Node.js, Chrome or
-Playwright is involved.
+there once; the session is kept in the widget's own website data store (on
+macOS 13 and earlier, the widget's default store), separate from any browser
+profile, and later lookups reuse it without showing the window's sign-in again.
+The widget reads the subscription date from claude.ai, saves it as
+`claude.renewal_date` in your config and applies it without restarting. No
+Node.js, Chrome or Playwright is involved.
 
-On Windows the lookup uses the Playwright helper described below. With Node.js and Chrome
-installed, it sets up the helper automatically, opens Chrome for sign-in, and
-applies the saved date without restarting the widget.
+On Windows the lookup uses the Playwright helper described below. With Node.js and
+Chrome (or Edge, when Chrome is not installed), it sets up the helper
+automatically in `%LOCALAPPDATA%\usage-widget\renewal-helper`, opens the browser
+for sign-in, and applies the saved date without restarting the widget.
 
 To run the helper separately from this checkout:
 
@@ -56,19 +58,23 @@ npm ci --prefix scripts
 npm --prefix scripts run claude-renewal
 ```
 
-The helper opens regular Chrome with a separate profile. Complete any verification
+The helper opens regular Chrome, or Edge when Chrome is not installed, with a
+separate profile. Complete any verification
 and sign in to Claude there on the first run. Playwright attaches only after the
 Claude app opens; it does not run during verification or sign-in. The profile
 remembers that session for future lookups. The helper checks the workspace
 against Claude Code's account, reads the subscription date, and saves
 `claude.renewal_date` in your config. Run it again
 after each renewal; this is an on-demand lookup, with no extension or background
-browser polling. Cancelled subscriptions leave the config unchanged.
+browser polling. Cancelled subscriptions, and a renewal date that has already
+passed (for example while a payment is retried), leave the config unchanged.
 
 The helper preserves existing settings, formatting and comments, and keeps the
 first backup as `config.toml.before-renewal`. Unsupported TOML layouts are left
-unchanged with an error. The browser profile is
-stored in `claude-browser` beside the config. Use `-- --browser msedge` for Edge;
+unchanged with an error. The browser profile, which holds the claude.ai session,
+is stored in `claude-browser` in the local (not roaming) app data folder,
+`%LOCALAPPDATA%\usage-widget\` on Windows; delete it to sign out. Use
+`-- --browser msedge` to choose Edge;
 `-- --config <path> --profile <directory>` allows separate test settings and login.
 
 While the helper is open, its dedicated browser exposes a debugging endpoint to

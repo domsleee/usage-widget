@@ -636,8 +636,10 @@ fn spawn_worker(
         loop {
             let started = std::time::Instant::now();
             // The browser helper updates this setting while the widget is open.
+            // A broken file loads as defaults, without a date; a warning such as
+            // an unknown key still has the real one.
             let (latest, error) = config::load();
-            if error.is_none() {
+            if error.is_none() || latest.claude.renewal_date.is_some() {
                 config.claude.renewal_date = latest.claude.renewal_date;
             }
             std::thread::scope(|s| {

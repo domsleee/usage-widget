@@ -6,7 +6,15 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { renewalDate, selectOrganization, updateConfig, subscriptionDetails, readyForLookup, openBrowser, closeBrowser } from './claude-renewal.mjs';
+import { renewalDate, selectOrganization, updateConfig, subscriptionDetails, readyForLookup, openBrowser, closeBrowser, firstBrowser, localToday } from './claude-renewal.mjs';
+
+test('local today is a zero-padded local date', () => {
+  assert.equal(localToday(new Date(2026, 0, 5, 23, 59)), '2026-01-05');
+});
+
+test('a missing browser is reported, not launched', async () => {
+  await assert.rejects(firstBrowser([]), /installed/);
+});
 
 test('lookup waits for the Claude app, not verification or login pages', () => {
   const tab = { type: 'page', title: 'Claude', url: 'https://claude.ai/settings/billing' };

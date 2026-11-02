@@ -75,6 +75,11 @@ export function updateConfig(text, date) {
   throw new Error('Cannot safely edit this Claude TOML layout. Add a [claude] table with renewal_date and retry. Config was not changed.');
 }
 
+function localDirectory() {
+  if (process.platform === 'win32') return join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'usage-widget');
+  return configDirectory();
+}
+
 function configDirectory() {
   if (process.platform === 'win32') return join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'usage-widget');
   if (process.platform === 'darwin') return join(homedir(), 'Library', 'Application Support', 'usage-widget');
@@ -135,6 +140,14 @@ async function browserExecutable(channel) {
     try { await access(path); return path; } catch { /* Try the next installation. */ }
   }
   throw new Error(`${edge ? 'Edge' : 'Chrome'} is not installed.`);
+}
+
+/** The first installed browser of `channels`, in order. */
+export async function firstBrowser(channels) {
+  for (const channel of channels) {
+    try { await browserExecutable(channel); return channel; } catch { /* Try the next browser. */ }
+  }
+  throw new Error(channels.length > 1 ? 'Neither Chrome nor Edge is installed.' : `${channels[0] === 'msedge' ? 'Edge' : 'Chrome'} is not installed.`);
 }
 
 export async function openBrowser(profile, channel, initialUrl = 'https://claude.ai/settings/billing') {
@@ -201,9 +214,11 @@ export function watchParent(input, onClose) {
 async function main() {
   const { values } = parseArgs({ options: {
     config: { type: 'string' }, profile: { type: 'string' },
-    browser: { type: 'string', default: 'chrome' },
+    browser: { type: 'string' },
   } });
-  if (!['chrome', 'msedge'].includes(values.browser)) throw new Error('Use --browser chrome or --browser msedge.');
+  if (values.browser && !['chrome', 'msedge'].includes(values.browser)) throw new Error('Use --browser chrome or --browser msedge.');
+  // Without --browser, Chrome, or Edge where Chrome is not installed.
+  const channel = await firstBrowser(values.browser ? [values.browser] : ['chrome', 'msedge']);
   const configPath = resolve(values.config || join(configDirectory(), 'config.toml'));
   // Parse before opening the browser; malformed config is never overwritten.
   parse(await optionalText(configPath));
@@ -211,15 +226,16 @@ async function main() {
   let expected;
   try { expected = claudeText ? JSON.parse(claudeText).oauthAccount?.organizationUuid : undefined; }
   catch { throw new Error('Cannot read the account from ~/.claude.json: invalid JSON. Repair it before retrying.'); }
-  const profile = resolve(values.profile || join(dirname(configPath), 'claude-browser'));
-  const chrome = await openBrowser(profile, values.browser);
+  // The profile holds a claude.ai session, so it stays out of a roaming profile.
+  const profile = resolve(values.profile || join(localDirectory(), 'claude-browser'));
+  const chrome = await openBrowser(profile, channel);
   let browser;
   // The widget owns the write end of stdin. EOF also detects abrupt parent
   // exit on Unix, where a Windows job object is unavailable.
   const parentClosed = () => { closeBrowser(browser, chrome).finally(() => process.exit(1)); };
   const stopWatching = process.env.USAGE_WIDGET_HELPER === '1' ? watchParent(process.stdin, parentClosed) : () => {};
   try {
-    console.log('Complete verification and sign in to Claude in Chrome. Waiting up to 5 minutes…');
+    console.log(`Complete verification and sign in to Claude in ${channel === 'msedge' ? 'Edge' : 'Chrome'}. Waiting up to 5 minutes…`);
     const signInDeadline = phaseDeadline(300_000);
     // Read only Chrome's tab metadata until sign-in is complete. Attaching a
     // browser automation framework during a production challenge is unsupported.
@@ -257,6 +273,9 @@ async function main() {
     });
     const org = selectOrganization(organizations, expected, active);
     const date = renewalDate(await subscriptionDetails(page, org));
+    // A past date (for example while a payment is retried) would be rejected
+    // by the widget, so it is not saved.
+    if (date < localToday()) throw new Error(`Claude reports a renewal date that has passed (${date}); a payment may be pending. Config was not changed.`);
     await closeBrowser(browser, chrome);
     browser = undefined;
     // Re-read after sign-in so settings edited while waiting are retained.
@@ -267,6 +286,10 @@ async function main() {
     stopWatching();
     await closeBrowser(browser, chrome);
   }
+}
+
+export function localToday(now = new Date()) {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
 
 export function phaseDeadline(budget, now = Date.now()) {

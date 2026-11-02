@@ -48,7 +48,7 @@ impl Lookup {
             Kind::Thread { rx, .. } => rx.try_recv(),
             #[cfg(target_os = "macos")]
             Kind::Web(web) => match web.try_recv() {
-                Some(result) => Ok(result),
+                Some(result) => Ok(result.and_then(save_web_cycle)),
                 None => Err(TryRecvError::Empty),
             },
         }
@@ -80,6 +80,26 @@ impl Drop for Lookup {
             }
         }
     }
+}
+
+/// The sign-in window only reads the date. Saving it to the config, as the
+/// browser helper does, keeps it after the next refresh reloads the config.
+#[cfg(target_os = "macos")]
+fn save_web_cycle(cycle: Cycle) -> Result<Cycle, String> {
+    if cycle.verb == "ends" {
+        return Err(
+            "Claude reports that this subscription is ending, not renewing. Config was not changed."
+                .into(),
+        );
+    }
+    let date = chrono::DateTime::from_timestamp(cycle.at, 0)
+        .ok_or("Claude returned an invalid renewal date")?
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    let saved = crate::providers::manual_claude_cycle(&date, chrono::Local::now().date_naive())?;
+    crate::config::set_renewal_date(&date)?;
+    Ok(saved)
 }
 
 pub fn start(ctx: egui::Context) -> Lookup {
@@ -131,7 +151,10 @@ fn node_version(name: &str) -> Vec<u32> {
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn node_candidates() -> Vec<PathBuf> {
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
+    // An empty or relative PATH entry would resolve against the current folder,
+    // which could run a planted node.exe.
     let mut paths: Vec<_> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|p| p.is_absolute())
         .map(|p| p.join(exe))
         .collect();
     paths.extend([
@@ -177,7 +200,13 @@ fn node_candidates() -> Vec<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn run(control: &Control) -> Result<Cycle, String> {
     let config_path = crate::config::ensure_exists()?;
-    let folder = config_path.parent().unwrap().join("renewal-helper");
+    // The helper's packages and its browser profile, which holds a claude.ai
+    // session, stay on this machine rather than in a roaming profile.
+    let local = crate::paths::data_local_dir()
+        .ok_or("cannot find the local data directory")?
+        .join("usage-widget");
+    let folder = local.join("renewal-helper");
+    let profile = local.join("claude-browser");
     std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -240,9 +269,12 @@ fn run(control: &Control) -> Result<Cycle, String> {
             std::env::join_paths(paths).map_err(|e| e.to_string())?,
         );
         control.output(
-            command
-                .current_dir(&folder)
-                .args(["ci", "--no-audit", "--no-fund"]),
+            command.current_dir(&folder).args([
+                "ci",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ]),
             Duration::from_secs(120),
         )?;
         std::fs::write(folder.join("installed-lock.json"), lock).map_err(|e| e.to_string())?;
@@ -252,18 +284,18 @@ fn run(control: &Control) -> Result<Cycle, String> {
             .env("USAGE_WIDGET_HELPER", "1")
             .arg(folder.join("claude-renewal.mjs"))
             .arg("--config")
-            .arg(&config_path),
+            .arg(&config_path)
+            .arg("--profile")
+            .arg(&profile),
         Duration::from_secs(450),
     )?;
+    // A warning such as an unknown key still leaves the saved date readable.
     let (config, error) = crate::config::load();
-    if let Some(error) = error {
-        return Err(error);
-    }
     let date = config
         .claude
         .renewal_date
         .as_deref()
-        .ok_or("Lookup did not save a renewal date")?;
+        .ok_or_else(|| error.unwrap_or_else(|| "Lookup did not save a renewal date".into()))?;
     crate::providers::manual_claude_cycle(date, chrono::Local::now().date_naive())
 }
 

@@ -142,7 +142,20 @@ impl WebLookup {
         let config = unsafe { WKWebViewConfiguration::new(mtm) };
         let uuid = NSUUID::initWithUUIDString(NSUUID::alloc(), &NSString::from_str(STORE_ID))
             .ok_or("invalid renewal data store identifier")?;
-        let store = unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm) };
+        // Identifier-keyed stores need macOS 14; older versions use the
+        // widget's default store, which also persists between lookups.
+        let sonoma = objc2_foundation::NSOperatingSystemVersion {
+            majorVersion: 14,
+            minorVersion: 0,
+            patchVersion: 0,
+        };
+        let store = if objc2_foundation::NSProcessInfo::processInfo()
+            .isOperatingSystemAtLeastVersion(sonoma)
+        {
+            unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm) }
+        } else {
+            unsafe { WKWebsiteDataStore::defaultDataStore(mtm) }
+        };
         unsafe { config.setWebsiteDataStore(&store) };
 
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 680.0));
@@ -207,7 +220,8 @@ impl WebLookup {
         if let Some(result) = self.result.take() {
             return Some(result);
         }
-        if self.phase != Phase::Done && !self.window.isVisible() {
+        // A minimized window is not visible either, but is still open.
+        if self.phase != Phase::Done && !self.window.isVisible() && !self.window.isMiniaturized() {
             return Some(Err(
                 "Claude sign-in window closed before the lookup finished".into(),
             ));
