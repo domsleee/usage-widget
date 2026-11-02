@@ -11,7 +11,7 @@ use crate::estimate::Tracker;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -20,12 +20,13 @@ const HISTORY: Duration = Duration::from_secs(15 * 86_400);
 const WEEK_MINUTES: i64 = 7 * 24 * 60;
 
 /// Credits per million tokens (input, cached input, output) from the Codex rate
-/// card. Models not on it use GPT-5.6 Sol's rates.
+/// card. A dated or suffixed name ("gpt-5.6-luna-2026-08") uses its model's
+/// rates; models not on the card use GPT-5.6 Sol's.
 fn rate_card(model: &str) -> (f64, f64, f64) {
     match model {
-        "gpt-6-astra" => (250.0, 25.0, 1250.0),
-        "gpt-5.6-terra" => (50.0, 5.0, 300.0),
-        "gpt-5.6-luna" => (5.0, 0.5, 30.0),
+        m if m.starts_with("gpt-6-astra") => (250.0, 25.0, 1250.0),
+        m if m.starts_with("gpt-5.6-terra") => (50.0, 5.0, 300.0),
+        m if m.starts_with("gpt-5.6-luna") => (5.0, 0.5, 30.0),
         _ => (100.0, 10.0, 500.0),
     }
 }
@@ -78,9 +79,14 @@ pub fn fraction(
         estimate: None,
     };
     let (week, result) = batch.replay();
+    // A refresh with no new use and no change in calibration adds nothing to
+    // replay, so it is not recorded.
+    let changed = !batch.events.is_empty() || week != batch.before;
     state.week = week;
     batch.estimate = result.map(|fraction| pct.round() + fraction);
-    crate::estimate_history::append("codex", &received_at, &batch)?;
+    if changed {
+        let _ = crate::estimate_history::append("codex", &received_at, &batch);
+    }
     state.save();
     Ok(result)
 }
@@ -108,8 +114,10 @@ impl Batch {
     fn replay(&self) -> (Tracker, Option<f64>) {
         let mut tracker = self.before.clone();
         for e in &self.events {
-            if let (Some(pct), Some(window)) = (e.pct, e.window) {
-                tracker.apply(pct, window, &e.plan, e.credits);
+            match (e.pct, e.window) {
+                (Some(pct), Some(window)) => tracker.apply(pct, window, &e.plan, e.credits),
+                // Use logged without a weekly reading still counts.
+                _ => tracker.spend(e.credits),
             }
         }
         let result = crate::providers::whole_percent(self.pct).and_then(|pct| {
@@ -171,11 +179,8 @@ impl State {
 
     fn save(&self) {
         let Some(path) = Self::path() else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(bytes) = serde_json::to_vec(self) {
-            let _ = std::fs::write(path, bytes);
+            let _ = crate::paths::write_atomic(&path, &bytes);
         }
     }
 
@@ -241,21 +246,30 @@ pub(crate) fn logs_under(root: &Path) -> Vec<PathBuf> {
     logs
 }
 
-/// Feeds the complete lines after `offset` to `each`, leaving a half-written last
-/// line for the next scan. Returns the new offset (unchanged if the read fails).
+/// Feeds the complete lines after `offset` to `each`, one at a time so a large
+/// log is never held in memory whole, leaving a half-written last line for the
+/// next scan. Returns the offset after the last complete line fed.
 pub(crate) fn read_lines(path: &Path, offset: u64, mut each: impl FnMut(&str)) -> u64 {
     let Ok(mut file) = std::fs::File::open(path) else {
         return offset;
     };
-    let mut bytes = Vec::new();
-    if file.seek(SeekFrom::Start(offset)).is_err() || file.read_to_end(&mut bytes).is_err() {
+    if file.seek(SeekFrom::Start(offset)).is_err() {
         return offset;
     }
-    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    for line in String::from_utf8_lossy(&bytes[..complete]).lines() {
-        each(line);
+    let mut reader = std::io::BufReader::new(file);
+    let mut pos = offset;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(_) if line.last() == Some(&b'\n') => {
+                pos += line.len() as u64;
+                each(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']));
+            }
+            // End of file, a half-written line, or a read error: stop here.
+            _ => return pos,
+        }
     }
-    offset + complete as u64
 }
 
 /// Raises each running total in `to` to at least the one in `from`.
@@ -299,12 +313,20 @@ fn parse_line(
         }
         _ => {}
     }
-    let totals = &payload["info"]["total_token_usage"];
-    if payload["type"] != "token_count" || !totals.is_object() {
+    if payload["type"] != "token_count" {
         return;
     }
-    let now = ["input_tokens", "cached_input_tokens", "output_tokens"]
-        .map(|k| totals[k].as_u64().unwrap_or(0));
+    // A rate-limit-only update has no token totals but still carries a reading.
+    let totals = &payload["info"]["total_token_usage"];
+    if !totals.is_object() && !payload["rate_limits"].is_object() {
+        return;
+    }
+    let now = if totals.is_object() {
+        ["input_tokens", "cached_input_tokens", "output_tokens"]
+            .map(|k| totals[k].as_u64().unwrap_or(0))
+    } else {
+        cursor.totals
+    };
     let [input, cached, output] = [0, 1, 2].map(|i| now[i].saturating_sub(cursor.totals[i]));
     raise(&mut cursor.totals, &now);
     if !cursor.session.is_empty() {

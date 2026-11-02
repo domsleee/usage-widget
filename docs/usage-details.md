@@ -64,7 +64,7 @@ Estimated usage always shows at least two decimal places so it cannot round up t
 the next reported percentage. Fractional usage reported by a service is kept as-is;
 local estimates apply only to whole-percent readings.
 With `estimate = true`, daily JSONL history retains readings, token counts,
-calibration and predictions until manually removed. It excludes conversations and
+calibration and predictions for 30 days. It excludes conversations and
 credentials. See [estimate history](estimate-history.md) for paths, token
 totals and replay rules.
 Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,

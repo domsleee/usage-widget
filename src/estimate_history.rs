@@ -6,7 +6,10 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-pub const ESTIMATOR_VERSION: &str = "cumulative-v1";
+pub const ESTIMATOR_VERSION: &str = "cumulative-v2";
+
+/// Daily files older than this are deleted when a new record is written.
+const KEEP_DAYS: i64 = 30;
 
 #[derive(Serialize)]
 struct Record<'a, T> {
@@ -19,8 +22,8 @@ struct Record<'a, T> {
     batch: &'a T,
 }
 
-/// Call this before saving how far the logs have been read, so that if it fails
-/// the same inputs are read again next time.
+/// Best effort: callers ignore a failure, so a full disk or a file another
+/// process holds never stops the estimate itself.
 pub fn append(provider: &str, received_at: &str, batch: &impl Serialize) -> Result<(), String> {
     let record = Record {
         schema_version: 1,
@@ -36,10 +39,28 @@ pub fn append(provider: &str, received_at: &str, batch: &impl Serialize) -> Resu
             .join("usage-widget")
             .join("history");
         std::fs::create_dir_all(&root)?;
-        let day = chrono::Utc::now().format("%Y-%m-%d");
+        let today = chrono::Utc::now().date_naive();
+        prune(&root, today);
+        let day = today.format("%Y-%m-%d");
         append_to(&root.join(format!("{provider}-{day}.jsonl")), &record)
     };
     write().map_err(|e| format!("estimate history: {e}"))
+}
+
+/// Deletes daily files (`<provider>-YYYY-MM-DD.jsonl`) older than `KEEP_DAYS`.
+fn prune(root: &Path, today: chrono::NaiveDate) {
+    let cutoff = today - chrono::Duration::days(KEEP_DAYS);
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let day = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.get(s.len().saturating_sub(10)..))
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        if path.extension().is_some_and(|e| e == "jsonl") && day.is_some_and(|d| d < cutoff) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn append_to(path: &Path, record: &impl Serialize) -> io::Result<()> {
@@ -50,7 +71,11 @@ fn append_to(path: &Path, record: &impl Serialize) -> io::Result<()> {
         .read(true)
         .append(true)
         .open(path)?;
-    file.lock()?;
+    // Never wait: another process holding the file would stall every refresh.
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => io::Error::other("history file is in use"),
+        std::fs::TryLockError::Error(e) => e,
+    })?;
     // A crash can leave a half-written last line. Keep it, but start this record
     // on a new line so the two don't run together; readers skip lines that don't parse.
     if file.metadata()?.len() > 0 {
@@ -97,6 +122,33 @@ mod tests {
             json!({"batch": 3})
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prunes_old_daily_files_only() {
+        let root = std::env::temp_dir().join(format!(
+            "usage-widget-prune-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        for name in [
+            "codex-2026-09-01.jsonl",
+            "claude-2026-10-03.jsonl",
+            "claude-2026-10-02.jsonl",
+            "notes.jsonl",
+        ] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        prune(&root, today);
+        let mut left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["claude-2026-10-03.jsonl", "notes.jsonl"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

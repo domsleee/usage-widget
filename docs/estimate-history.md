@@ -8,8 +8,9 @@ History lives separately from the estimator cache:
 - macOS: `~/Library/Application Support/usage-widget/history/`
 - Linux: `$XDG_DATA_HOME/usage-widget/history/`, defaulting under `~/.local/share/`
 
-Daily UTC files such as `codex-2026-09-12.jsonl` are append-only and kept until
-manually removed. Disabling `estimate` stops recording but keeps history.
+Daily UTC files such as `codex-2026-09-12.jsonl` are append-only and deleted after
+30 days. A refresh with no new log events and no change in calibration is not
+recorded. Disabling `estimate` stops recording but keeps history.
 Recording adds no network requests and excludes conversations, prompts, tool
 results, credentials and project paths.
 
@@ -19,7 +20,7 @@ older log entries first became available.
 
 ## Record format (schema 1)
 
-Each JSON line contains `schema_version`, `estimator_version` (`cumulative-v1`),
+Each JSON line contains `schema_version`, `estimator_version` (`cumulative-v2`),
 `app_version`, `provider`, `received_at` and `batch`. `received_at` is RFC 3339 UTC,
 taken after scanning and before evaluation—even for older events discovered now.
 
@@ -41,8 +42,9 @@ predictions precede UI decimal formatting.
 
 - Codex: `ts` (original timestamp), `session`, `model`, `tokens` (deltas), `totals`
   (running counters), `credits`, `pct`, `window`, `plan`. Session, timestamp and
-  counters identify repeats. Missing weekly readings are null; the current
-  estimator ignores those events, but history retains them.
+  counters identify repeats. Missing weekly readings are null; the estimator
+  still counts those events' credits. Rate-limit-only updates appear with zero
+  tokens.
 - Claude: `source_at` (original timestamp), `ts` (Unix seconds used for evaluation),
   `response_id`, `model`, `tokens`, `cost`. Only the first occurrence of each
   response ID is counted, matching the existing streaming deduplication.
@@ -68,9 +70,9 @@ algorithms must carry their own state between batches. Bump `estimator_version`
 when calibration, pricing or event processing changes, and `schema_version` for
 incompatible format changes.
 
-History is flushed before saving scan cursors. Write failures show an
-`estimate history:` note and the service reading, leaving inputs retryable.
-A crash before cursor saving can repeat inputs; use IDs and checkpoints to detect
+History is best effort: a failed write, or a file another process holds, is
+skipped so the estimate still shows, which leaves a gap in the history. A crash
+before cursor saving can repeat inputs; use IDs and checkpoints to detect
 retries or gaps. File locks prevent interleaved writes. Interrupted lines are
 preserved and newline-separated from later records; readers should report and
 skip malformed lines as gaps.

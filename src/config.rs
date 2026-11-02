@@ -74,7 +74,7 @@ pub struct Claude {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Codex {
     pub enabled: bool,
     pub estimate: bool,
