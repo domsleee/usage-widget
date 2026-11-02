@@ -18,6 +18,10 @@ opacity = 85
 # percents, so extra places show as zeros.
 precision = 0
 
+# true = show when the weekly window resets as a date and time ("17 Oct 2:30pm")
+# instead of a countdown.
+weekly_reset_date = false
+
 [copilot]
 enabled = true
 
@@ -52,6 +56,7 @@ pub struct Config {
     pub refresh_mins: u64,
     pub opacity: u32,
     pub precision: usize,
+    pub weekly_reset_date: bool,
     pub copilot: Service,
     pub claude: Claude,
     pub codex: Codex,
@@ -95,6 +100,7 @@ impl Default for Config {
             refresh_mins: 5,
             opacity: 85,
             precision: 0,
+            weekly_reset_date: false,
             copilot: Service::default(),
             claude: Claude::default(),
             codex: Codex::default(),
