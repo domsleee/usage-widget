@@ -13,9 +13,22 @@ pub fn config_dir() -> Option<PathBuf> {
     }
 }
 
+/// Files that can be rebuilt: `%LOCALAPPDATA%` on Windows, `~/Library/Caches`
+/// on macOS.
+pub fn cache_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        known_folder(KnownFolder::LocalAppData)
+    } else if cfg!(target_os = "macos") {
+        Some(std::env::home_dir()?.join("Library/Caches"))
+    } else {
+        env_dir("XDG_CACHE_HOME").or_else(|| Some(std::env::home_dir()?.join(".cache")))
+    }
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 enum KnownFolder {
     RoamingAppData,
+    LocalAppData,
 }
 
 /// Asks Windows where the folder is, rather than trusting `%APPDATA%` and
@@ -25,10 +38,11 @@ fn known_folder(folder: KnownFolder) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
-        FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        FOLDERID_LocalAppData, FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
     };
     let id = match folder {
         KnownFolder::RoamingAppData => FOLDERID_RoamingAppData,
+        KnownFolder::LocalAppData => FOLDERID_LocalAppData,
     };
     let mut path = std::ptr::null_mut();
     // SAFETY: on success Windows hands back a NUL-terminated string, which is
