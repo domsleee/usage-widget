@@ -163,7 +163,7 @@ impl Cycle {
     pub fn countdown(&self, today: chrono::NaiveDate) -> String {
         if self.date_only {
             let date = chrono::DateTime::from_timestamp(self.at, 0)
-                .unwrap()
+                .unwrap_or_default()
                 .with_timezone(&chrono::Local)
                 .date_naive();
             let days = (date - today).num_days();
@@ -182,7 +182,7 @@ impl Cycle {
     pub fn when(&self) -> String {
         if self.date_only {
             chrono::DateTime::from_timestamp(self.at, 0)
-                .unwrap()
+                .unwrap_or_default()
                 .with_timezone(&chrono::Local)
                 .format("%a %d %b %Y")
                 .to_string()
@@ -733,8 +733,13 @@ impl ClaudeState {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        // Written beside it and renamed over it, so the widget and `usage-widget
+        // usage` saving at once never leave a half-written file.
         if let Ok(bytes) = serde_json::to_vec(self) {
-            let _ = std::fs::write(path, bytes);
+            let tmp = path.with_extension(format!("json.{}", std::process::id()));
+            if std::fs::write(&tmp, bytes).is_err() || std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 }
@@ -779,7 +784,9 @@ fn note_account(state: &mut ClaudeState, account: Option<&str>, now: i64) -> boo
 }
 
 /// Overwrites (or adds) the 5h and weekly meters from statusline `rate_limits`.
-fn apply_statusline(meters: &mut Vec<Meter>, rate_limits: &Value) {
+/// A window that has reset since the file was written is skipped, since its
+/// percentage belongs to the previous window.
+fn apply_statusline(meters: &mut Vec<Meter>, rate_limits: &Value, now: i64) {
     for (i, (key, label)) in [("five_hour", "5h"), ("seven_day", "week")]
         .into_iter()
         .enumerate()
@@ -791,6 +798,9 @@ fn apply_statusline(meters: &mut Vec<Meter>, rate_limits: &Value) {
         // Seconds per the docs; tolerate milliseconds.
         let resets_at =
             i64_of(&w["resets_at"]).map(|t| if t > 100_000_000_000 { t / 1000 } else { t });
+        if resets_at.is_some_and(|t| t <= now) {
+            continue;
+        }
         match meters
             .iter_mut()
             .find(|m| m.label.as_deref() == Some(label))
@@ -879,6 +889,9 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
         .flatten()
         .map(|s| s.at)
         .max();
+    // The last API failure, so a refresh that skips the call still explains why
+    // there is no reading (for example an expired token).
+    static LAST_PROBLEM: std::sync::Mutex<Option<FetchError>> = std::sync::Mutex::new(None);
     let mut problem = None;
     if claude_should_call(api, now, newest, &state) {
         state.last_attempt = now;
@@ -898,8 +911,15 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
             }
             Err(ClaudeError::Fetch(e)) => problem = Some(e),
         }
+        *LAST_PROBLEM.lock().unwrap_or_else(|e| e.into_inner()) = problem.clone();
         state.save();
     }
+    let problem = problem.or_else(|| {
+        LAST_PROBLEM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    });
 
     let rate_limited = now < state.blocked_until;
     let snap = [cache.as_ref(), state.last.as_ref()]
@@ -916,7 +936,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
     if let Some((at, rate_limits)) = statusline
         && snap_at.is_none_or(|d| at > d)
     {
-        apply_statusline(&mut meters, &rate_limits);
+        apply_statusline(&mut meters, &rate_limits, now);
         live_at = Some(at);
     }
     // When the 5h and week readings were taken.
@@ -1424,7 +1444,7 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
     }
     let personal = codex_personal(&json);
     let plan = codex_plan(&json);
-    let cycle = codex_cycle(&headers, account_id);
+    let cycle = codex_cycle_cached(&headers, account_id);
     let mut meters = codex_meters(&json);
     if meters.is_empty() {
         if json["credits"]["unlimited"].as_bool() == Some(true) {
@@ -1477,6 +1497,27 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
         estimated,
         meters,
     })
+}
+
+/// The subscription record changes about once a month, so it is fetched at most
+/// daily (hourly after a failure, and again once the saved date passes) instead
+/// of with every usage refresh.
+fn codex_cycle_cached(headers: &[(&str, &str)], account_id: &str) -> Option<Cycle> {
+    type Cached = Option<(String, i64, Option<Cycle>)>;
+    static CACHE: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
+    let now = now_unix();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((account, fetched, cycle)) = cache.as_ref()
+        && account == account_id
+    {
+        let ttl = if cycle.is_some() { 86_400 } else { 3600 };
+        if now - fetched < ttl && cycle.as_ref().is_none_or(|c| c.at > now) {
+            return cycle.clone();
+        }
+    }
+    let cycle = codex_cycle(headers, account_id);
+    *cache = Some((account_id.to_string(), now, cycle.clone()));
+    cycle
 }
 
 /// When the ChatGPT plan renews, or ends once cancelled, from the subscription record.
@@ -1538,6 +1579,7 @@ fn codex_meters(json: &Value) -> Vec<Meter> {
                 total: 100.0,
                 unit: Unit::Percent,
                 resets_at: i64_of(&w["reset_at"])
+                    .or_else(|| w["reset_at"].as_str().and_then(parse_rfc3339))
                     .or_else(|| i64_of(&w["reset_after_seconds"]).map(|s| now_unix() + s)),
             });
         }
@@ -1804,6 +1846,7 @@ mod tests {
         apply_statusline(
             &mut claude,
             &json!({ "five_hour": { "used_percentage": 12.34 } }),
+            0,
         );
         assert_eq!(claude[0].used, 12.34);
     }
@@ -1826,6 +1869,7 @@ mod tests {
                 "five_hour": { "used_percentage": 41.5, "resets_at": 1_789_134_000 },
                 "seven_day": { "used_percentage": 60, "resets_at": 1_789_502_400_000_i64 }
             }),
+            0,
         );
         assert_eq!(
             labels(&meters),
@@ -1837,8 +1881,21 @@ mod tests {
         );
 
         let mut only = Vec::new();
-        apply_statusline(&mut only, &json!({ "seven_day": { "used_percentage": 7 } }));
+        apply_statusline(
+            &mut only,
+            &json!({ "seven_day": { "used_percentage": 7 } }),
+            0,
+        );
         assert_eq!(labels(&only), [("week", 7.0, None)]);
+
+        // A window that has since reset keeps the older reading instead.
+        let mut reset = claude_meters(&json!({ "five_hour": { "utilization": 3.0 } }));
+        apply_statusline(
+            &mut reset,
+            &json!({ "five_hour": { "used_percentage": 90, "resets_at": 1_000 } }),
+            2_000,
+        );
+        assert_eq!(reset[0].used, 3.0);
     }
 
     #[test]
