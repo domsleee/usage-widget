@@ -3,6 +3,22 @@
 use std::path::PathBuf;
 
 /// Settings: `%APPDATA%` on Windows, `~/Library/Application Support` on macOS.
+/// Writes `bytes` beside `path` and renames it into place, so a crash or a
+/// second process saving at the same time never leaves a half-written file.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+}
+
 pub fn config_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         known_folder(KnownFolder::RoamingAppData)
@@ -10,6 +26,26 @@ pub fn config_dir() -> Option<PathBuf> {
         Some(std::env::home_dir()?.join("Library/Application Support"))
     } else {
         env_dir("XDG_CONFIG_HOME").or_else(|| Some(std::env::home_dir()?.join(".config")))
+    }
+}
+
+/// App data that should roam with the user; the same folder as settings on
+/// Windows and macOS.
+pub fn data_dir() -> Option<PathBuf> {
+    if cfg!(any(windows, target_os = "macos")) {
+        config_dir()
+    } else {
+        env_dir("XDG_DATA_HOME").or_else(|| Some(std::env::home_dir()?.join(".local/share")))
+    }
+}
+
+/// App data kept on this machine: `%LOCALAPPDATA%` on Windows, the same folder
+/// as settings on macOS.
+pub fn data_local_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        known_folder(KnownFolder::LocalAppData)
+    } else {
+        data_dir()
     }
 }
 
