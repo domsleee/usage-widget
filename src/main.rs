@@ -1545,9 +1545,13 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
 }
 
 impl eframe::App for App {
+    // While the widget is hidden from the menu bar eframe runs only `logic`, so
+    // results and a pending restart after an update are handled here as well.
     #[cfg(target_os = "macos")]
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_menu(ctx);
+        self.drain();
+        self.restart_if_updated(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1735,8 +1739,14 @@ impl eframe::App for App {
         if refresh {
             self.refresh_now();
         }
-        // Closing normally lets eframe save position and size before the new
-        // version, which waits for this process to exit, starts up.
+        self.restart_if_updated(&ctx);
+    }
+}
+
+impl App {
+    /// Closing normally lets eframe save position and size before the new
+    /// version, which waits for this process to exit, starts up.
+    fn restart_if_updated(&self, ctx: &egui::Context) {
         if self.restart.swap(false, Ordering::SeqCst) {
             match update::restart() {
                 Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -1776,7 +1786,7 @@ fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, mini
 /// Reads the same subscription data as the widget without opening a window.
 fn print_usage() {
     let (config, config_error) = config::load();
-    let mut providers = serde_json::Map::new();
+    let mut services = serde_json::Map::new();
     for provider in Provider::ALL.into_iter().filter(|p| config.enabled(*p)) {
         let result = match provider.fetch() {
             Ok(usage) => serde_json::json!({ "usage": usage }),
@@ -1785,14 +1795,14 @@ fn print_usage() {
                 "detail": error.detail,
             }),
         };
-        providers.insert(provider.name().to_lowercase(), result);
+        services.insert(provider.name().to_lowercase(), result);
     }
     println!(
         "{}",
         serde_json::json!({
             "fetched_at": now_unix(),
             "config_error": config_error,
-            "providers": providers,
+            "services": services,
         })
     );
 }
@@ -1889,7 +1899,9 @@ fn detach_from_terminal() -> bool {
         return false;
     };
     let mut cmd = Command::new(exe);
-    cmd.stdin(Stdio::null())
+    // Keeps `--updated`, so the copy waits for the old version to exit.
+    cmd.args(std::env::args_os().skip(1))
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // A new session, so Ctrl+C or closing the terminal does not reach the widget.
@@ -1975,7 +1987,14 @@ fn claim_single_instance(wait: Duration) -> bool {
     const LOCK_EX: i32 = 2;
     const LOCK_NB: i32 = 4;
 
-    let Ok(file) = std::fs::File::create(std::env::temp_dir().join("usage-widget.lock")) else {
+    // Opened without truncating, so a link planted at this path cannot be used
+    // to empty another file.
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(std::env::temp_dir().join("usage-widget.lock"))
+    else {
         return true;
     };
     let start = std::time::Instant::now();
