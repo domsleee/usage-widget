@@ -5,15 +5,11 @@ Claude and Codex allowance you have used.
 
 | Business plans | Personal subscriptions |
 | --- | --- |
-| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="291" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset time" src="docs/personal-plans.png" /> |
+| <img width="250" alt="Copilot, Claude and Codex business plans, each showing dollars spent against its limit, with a total" src="docs/business-plans.png" /> | <img width="250" alt="Claude and Codex personal plans, each showing 5-hour and weekly usage, with the window that will run out first highlighted and its reset countdown" src="docs/personal-plans.png" /> |
 
 Minimized:
 
-<img width="227" alt="Minimized widget: one line with each service's logo and estimated percentage" src="docs/minimized.png" />
-
-The personal plan and minimized screenshots have local estimates turned on
-(`estimate = true`), which shows the `~` fractions; by default the services'
-whole percentages are shown.
+<img width="182" alt="Minimized widget: one line with each service's logo and percentage" src="docs/minimized.png" />
 
 ## Install
 
