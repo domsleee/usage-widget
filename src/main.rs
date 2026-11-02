@@ -114,16 +114,6 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, config: Config, config_error: Option<String>) -> Self {
-        #[cfg(windows)]
-        {
-            use winit::platform::windows::WindowExtWindows;
-            // egui enables this for frameless windows; winit reserves a visible
-            // 1px strip at the top to draw it, even with the DWM border disabled.
-            if let Some(window) = cc.winit_window() {
-                window.set_undecorated_shadow(false);
-            }
-        }
-
         let providers: Vec<Provider> = Provider::ALL
             .into_iter()
             .filter(|p| config.enabled(*p))
