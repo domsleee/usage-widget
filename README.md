@@ -59,6 +59,8 @@ Bars go green, yellow and red as you use more.
 - Hover a red error to see the full message.
 - Hover a personal plan's countdown, or a window's percentage or label, to see when
   that window resets.
+- `usage-widget usage` prints the same numbers as JSON without opening a window.
+  The [usage-widget skill](skills/usage-widget/SKILL.md) lets agents read it.
 
 Optional settings, as environment variables:
 
