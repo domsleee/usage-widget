@@ -1411,7 +1411,7 @@ fn egui_menu(
             }
         }
     });
-    if cfg!(windows) && ui.button("Check for updates").clicked() {
+    if ui.button("Check for updates").clicked() {
         action = Some(MenuAction::CheckForUpdates);
     }
     ui.separator();

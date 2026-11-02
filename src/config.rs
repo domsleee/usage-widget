@@ -134,14 +134,16 @@ pub fn load() -> (Config, Option<String>) {
 /// reported but do not throw away the rest of the file.
 fn parse(text: &str) -> (Config, Option<String>) {
     let mut unknown = Vec::new();
-    let parsed = toml::de::Deserializer::parse(text).and_then(|de| {
-        serde_ignored::deserialize(de, |path| unknown.push(format!("`{path}`")))
-    });
+    let parsed = toml::de::Deserializer::parse(text)
+        .and_then(|de| serde_ignored::deserialize(de, |path| unknown.push(format!("`{path}`"))));
     match parsed {
         Ok(c) if unknown.is_empty() => (c, None),
         Ok(c) => (
             c,
-            Some(format!("config: unknown setting {} ignored", unknown.join(", "))),
+            Some(format!(
+                "config: unknown setting {} ignored",
+                unknown.join(", ")
+            )),
         ),
         Err(e) => (
             Config::default(),
@@ -241,10 +243,7 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_reported_and_the_rest_kept() {
-        let (c, error) = parse("refresh_minutes = 1
-opacity = 50
-[claude]
-enabld = false");
+        let (c, error) = parse("refresh_minutes = 1\nopacity = 50\n[claude]\nenabld = false");
         assert_eq!(c.opacity, 50);
         assert!(c.enabled(Provider::Claude));
         let error = error.unwrap();
