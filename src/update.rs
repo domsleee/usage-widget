@@ -1,6 +1,7 @@
 //! Self-update from GitHub releases. Each release has a prebuilt
-//! `usage-widget.exe` attached by `.github/workflows/release.yml`; a newer one
-//! is downloaded and swapped in for the running exe, then the widget restarts.
+//! `usage-widget.exe` and `usage-widget-macos` attached by
+//! `.github/workflows/release.yml`; a newer one is downloaded and swapped in for
+//! the running exe, then the widget restarts.
 
 use crate::providers::agent;
 use serde_json::Value;
@@ -10,7 +11,17 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const LATEST_URL: &str = "https://api.github.com/repos/pepsi-enjoyer/usage-widget/releases/latest";
+#[cfg(not(target_os = "macos"))]
 const ASSET_NAME: &str = "usage-widget.exe";
+/// A universal binary, for Apple silicon and Intel Macs.
+#[cfg(target_os = "macos")]
+const ASSET_NAME: &str = "usage-widget-macos";
+/// How a download for this platform starts: an exe, or a universal or 64-bit
+/// Mach-O binary.
+#[cfg(not(target_os = "macos"))]
+const MAGIC: &[&[u8]] = &[b"MZ"];
+#[cfg(target_os = "macos")]
+const MAGIC: &[&[u8]] = &[&[0xca, 0xfe, 0xba, 0xbe], &[0xcf, 0xfa, 0xed, 0xfe]];
 const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// Wait before the first automatic check so it does not compete with startup.
@@ -42,9 +53,15 @@ struct Asset {
 /// The mutex also stops the automatic and menu checks running at once.
 static INSTALLED: Mutex<bool> = Mutex::new(false);
 
+/// Platforms with a prebuilt release binary.
+const SUPPORTED: bool = cfg!(any(windows, target_os = "macos"));
+
 /// Checks GitHub for a newer release and, if there is one, installs it over the
 /// running exe.
 pub fn check_and_install() -> Result<Outcome, String> {
+    if !SUPPORTED {
+        return Err("Automatic updates are only supported on Windows and macOS".into());
+    }
     let mut installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
     if *installed {
         return Ok(Outcome::Installed);
@@ -84,7 +101,8 @@ pub fn cleanup() {
 
 /// Automatic updates are on for release builds unless `USAGE_WIDGET_AUTO_UPDATE=0`.
 pub fn auto_enabled() -> bool {
-    !cfg!(debug_assertions)
+    SUPPORTED
+        && !cfg!(debug_assertions)
         && std::env::var("USAGE_WIDGET_AUTO_UPDATE").map_or(true, |v| v.trim() != "0")
 }
 
@@ -202,14 +220,15 @@ fn verify(bytes: &[u8], asset: &Asset) -> Result<(), String> {
             return Err("download did not match its checksum".into());
         }
     }
-    if !bytes.starts_with(b"MZ") {
-        return Err("download is not a Windows program".into());
+    if !MAGIC.iter().any(|m| bytes.starts_with(m)) {
+        return Err("download is not a program for this platform".into());
     }
     Ok(())
 }
 
 /// Windows lets a running exe be renamed but not overwritten, so the current exe
 /// moves aside to `.old` and the download takes its place.
+#[cfg(windows)]
 fn install(bytes: &[u8]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let new = sibling(&exe, "new");
@@ -226,6 +245,22 @@ fn install(bytes: &[u8]) -> Result<(), String> {
         return Err(format!("could not replace {}: {e}", exe.display()));
     }
     Ok(())
+}
+
+/// A running binary can be replaced by renaming over it; the process keeps the
+/// old file open until it exits.
+#[cfg(not(windows))]
+fn install(bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let new = sibling(&exe, "new");
+    std::fs::write(&new, bytes)
+        .and_then(|()| std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::rename(&new, &exe))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&new);
+            format!("could not replace {}: {e}", exe.display())
+        })
 }
 
 /// `usage-widget.exe` -> `usage-widget.exe.<suffix>`.
@@ -261,7 +296,7 @@ mod tests {
             "assets": [
                 {"name": "notes.txt", "browser_download_url": "https://x/notes.txt", "size": 3},
                 {
-                    "name": "usage-widget.exe",
+                    "name": ASSET_NAME,
                     "browser_download_url": "https://x/usage-widget.exe",
                     "size": 42,
                     "digest": "sha256:ABCDEF"
@@ -285,7 +320,7 @@ mod tests {
 
     #[test]
     fn verifies_downloads() {
-        let bytes = b"MZ rest of exe";
+        let bytes = &[MAGIC[0], b" rest of exe"].concat();
         let sha: String = Sha256::digest(bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -301,6 +336,7 @@ mod tests {
         assert!(verify(bytes, &asset(len + 1, Some(&sha))).is_err());
         assert!(verify(bytes, &asset(len, Some("00"))).is_err());
         assert!(verify(b"PK zip", &asset(6, None)).is_err());
+        assert!(verify(b"MZ", &asset(2, None)).is_ok() == cfg!(not(target_os = "macos")));
     }
 
     #[test]

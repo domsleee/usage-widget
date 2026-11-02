@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build and attach the exe to (e.g. v1.0.3)
+        description: Release tag to build and attach the binaries to (e.g. v1.0.3)
         required: true
 
 permissions:
@@ -39,3 +39,36 @@ jobs:
       - name: Attach exe to release
         shell: pwsh
         run: gh release upload $env:TAG target/release/usage-widget.exe --clobber --repo ${{ github.repository }}
+
+  build-macos:
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v$version" = "$TAG" || { echo "Tag $TAG does not match Cargo.toml version $version"; exit 1; }
+
+      # One universal binary for Apple silicon and Intel, ad-hoc signed since
+      # Apple silicon will not run an unsigned one.
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create -output usage-widget-macos \
+            target/aarch64-apple-darwin/release/usage-widget \
+            target/x86_64-apple-darwin/release/usage-widget
+          codesign --force --sign - usage-widget-macos
+
+      - name: Attach binary to release
+        run: gh release upload "$TAG" usage-widget-macos --clobber --repo ${{ github.repository }}
