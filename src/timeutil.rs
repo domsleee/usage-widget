@@ -50,11 +50,7 @@ pub fn age(ts: i64) -> String {
 
 /// Local wall-clock time of a timestamp: "today 11:40pm", "Wednesday 6am".
 pub fn local_when(ts: i64) -> String {
-    // Round to the minute so a reset at 19:59:59 reads as 8pm, not 7:59pm.
-    match Local
-        .timestamp_opt((ts + 30).div_euclid(60) * 60, 0)
-        .single()
-    {
+    match Local.timestamp_opt(to_minute(ts), 0).single() {
         Some(t) => when(&t, Local::now().date_naive()),
         None => String::new(),
     }
@@ -107,10 +103,15 @@ pub fn window_until(ts: i64) -> String {
     window_countdown((ts - now_unix()).max(0))
 }
 
+/// Rounds to the nearest minute, so a reset at 19:59:59 reads as 8pm, not 7:59pm.
+fn to_minute(ts: i64) -> i64 {
+    (ts + 30).div_euclid(60) * 60
+}
+
 /// A reset date in the computer's time zone, as "Fri 16 Oct 2026, 2:30PM".
 pub fn local_datetime(ts: i64) -> Option<String> {
     Local
-        .timestamp_opt(ts, 0)
+        .timestamp_opt(to_minute(ts), 0)
         .single()
         .map(|date| format_datetime(&date.naive_local()))
 }
@@ -122,7 +123,7 @@ fn format_datetime(date: &NaiveDateTime) -> String {
 /// Local reset date and time for a weekly window, for example "17 Oct 2:30pm".
 pub fn reset_date_time(ts: i64) -> String {
     Local
-        .timestamp_opt(ts, 0)
+        .timestamp_opt(to_minute(ts), 0)
         .single()
         .map(|t| t.format("%-d %b %-I:%M%P").to_string())
         .unwrap_or_default()

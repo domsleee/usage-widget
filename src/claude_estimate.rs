@@ -19,15 +19,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// How far back transcripts are read, and response ids remembered.
 const HISTORY: Duration = Duration::from_secs(8 * 86_400);
 
-/// Relative price per million tokens: input, cache write, cache read, output.
-/// Only the ratios matter; each window learns its own cost per point.
+/// Relative price per million tokens: input, cache write (5 minutes), cache
+/// read, output. A 1-hour cache write costs twice the input price. Only the
+/// ratios matter; each window learns its own cost per point.
 fn prices(model: &str) -> [f64; 4] {
     if model.contains("haiku") {
         [1.0, 1.25, 0.1, 5.0]
     } else if model.contains("sonnet") {
         [3.0, 3.75, 0.3, 15.0]
+    } else if ["3-opus", "opus-4-0", "opus-4-1", "opus-4-2025"]
+        .iter()
+        .any(|old| model.contains(old))
+    {
+        [15.0, 18.75, 1.5, 75.0] // Claude 3 Opus, Opus 4 and 4.1
     } else {
-        [5.0, 6.25, 0.5, 25.0] // Opus, Fable and newer
+        [5.0, 6.25, 0.5, 25.0] // Opus 4.5, Fable and newer
     }
 }
 
@@ -78,13 +84,18 @@ pub fn fractions(
         estimates: Vec::new(),
     };
     let (windows, result) = batch.replay();
+    // A refresh with no new use and no change in calibration adds nothing to
+    // replay, so it is not recorded.
+    let changed = !batch.events.is_empty() || windows != batch.before;
     state.windows = windows;
     batch.estimates = readings
         .iter()
         .zip(&result)
         .map(|((_, pct, _), fraction)| fraction.map(|f| pct.round() + f))
         .collect();
-    crate::estimate_history::append("claude", &received_at, &batch)?;
+    if changed {
+        let _ = crate::estimate_history::append("claude", &received_at, &batch);
+    }
     state.save();
     Ok(result)
 }
@@ -165,11 +176,8 @@ impl State {
 
     fn save(&self) {
         let Some(path) = Self::path() else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(bytes) = serde_json::to_vec(self) {
-            let _ = std::fs::write(path, bytes);
+            let _ = crate::paths::write_atomic(&path, &bytes);
         }
     }
 
@@ -240,8 +248,14 @@ fn parse_line(line: &str, seen: &mut HashMap<String, i64>, events: &mut Vec<Even
     ]
     .map(|k| usage[k].as_u64().unwrap_or(0));
     let p = prices(message["model"].as_str().unwrap_or_default());
+    // Part of the cache write may be 1-hour cache, which costs twice the input.
+    let hour_writes = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(tokens[1]);
     let cost = (tokens[0] as f64 * p[0]
-        + tokens[1] as f64 * p[1]
+        + (tokens[1] - hour_writes) as f64 * p[1]
+        + hour_writes as f64 * p[0] * 2.0
         + tokens[2] as f64 * p[2]
         + tokens[3] as f64 * p[3])
         / 1e6;
@@ -272,6 +286,14 @@ mod tests {
         parse_line(&line("b", "claude-haiku-4-5"), &mut seen, &mut events);
         let costs: Vec<f64> = events.iter().map(|e| e.cost).collect();
         assert_eq!(costs, [5.0 + 6.25 + 0.5 + 25.0, 1.0 + 1.25 + 0.1 + 5.0]);
+        assert_eq!(prices("claude-opus-4-1-20250805")[3], 75.0);
+        assert_eq!(prices("claude-opus-4-20250514")[3], 75.0);
+        assert_eq!(prices("claude-opus-4-6")[3], 25.0);
+
+        // Half of the cache write is 1-hour cache, at twice the input price.
+        let hour = r#"{"type":"assistant","timestamp":"2026-09-11T08:50:19Z","message":{"id":"c","model":"claude-sonnet-4-5","usage":{"cache_creation_input_tokens":2000000,"cache_creation":{"ephemeral_1h_input_tokens":1000000}}}}"#;
+        parse_line(hour, &mut seen, &mut events);
+        assert_eq!(events[2].cost, 3.75 + 6.0);
         // 2026-09-11T13:40:00Z is 1_789_134_000; 08:50:19 is 4h 49m 41s earlier.
         assert_eq!(events[0].ts, 1_789_116_619);
         assert_eq!(events[0].source_at, "2026-09-11T08:50:19Z");

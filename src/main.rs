@@ -139,16 +139,6 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, config: Config, config_error: Option<String>) -> Self {
-        #[cfg(windows)]
-        {
-            use winit::platform::windows::WindowExtWindows;
-            // egui enables this for frameless windows; winit reserves a visible
-            // 1px strip at the top to draw it, even with the DWM border disabled.
-            if let Some(window) = cc.winit_window() {
-                window.set_undecorated_shadow(false);
-            }
-        }
-
         let providers: Vec<Provider> = Provider::ALL
             .into_iter()
             .filter(|p| config.enabled(*p))
@@ -1619,7 +1609,7 @@ fn egui_menu(
             }
         }
     });
-    if cfg!(windows) && ui.button("Check for updates").clicked() {
+    if ui.button("Check for updates").clicked() {
         action = Some(MenuAction::CheckForUpdates);
     }
     ui.separator();
@@ -1863,11 +1853,12 @@ impl eframe::App for App {
     /// Runs before every `ui` pass, and is all that runs while the widget is
     /// hidden: eframe leaves the egui state untouched then, so this is the only
     /// chance to act on "Show widget".
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
+        self.restart_if_updated(ctx);
         #[cfg(target_os = "macos")]
         {
-            self.handle_menu(_ctx);
+            self.handle_menu(ctx);
             if let Some(bar) = &self.menubar {
                 bar.set_services(&self.found(), &self.shown());
             }
@@ -2069,6 +2060,13 @@ impl eframe::App for App {
             self.renewal_error = None;
             self.renewal_lookup = Some(renewal_lookup::start(ctx.clone()));
         }
+    }
+}
+
+impl App {
+    /// Closing normally lets eframe save position and size before the new
+    /// version, which waits for this process to exit, starts up.
+    fn restart_if_updated(&self, ctx: &egui::Context) {
         if self.restart.swap(false, Ordering::SeqCst) {
             match update::restart() {
                 Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -2185,7 +2183,7 @@ fn print_usage() {
     let (mut config, config_error) = config::load();
     config.claude.estimate = false;
     config.codex.estimate = false;
-    let mut providers = serde_json::Map::new();
+    let mut services = serde_json::Map::new();
     for provider in Provider::ALL.into_iter().filter(|p| config.enabled(*p)) {
         let result = match provider.fetch(&config) {
             Ok(usage) => serde_json::json!({ "usage": usage }),
@@ -2194,14 +2192,14 @@ fn print_usage() {
                 "detail": error.detail,
             }),
         };
-        providers.insert(provider.name().to_lowercase(), result);
+        services.insert(provider.name().to_lowercase(), result);
     }
     println!(
         "{}",
         serde_json::json!({
             "fetched_at": now_unix(),
             "config_error": config_error,
-            "providers": providers,
+            "services": services,
         })
     );
 }
@@ -2308,7 +2306,9 @@ fn detach_from_terminal() -> bool {
         return false;
     };
     let mut cmd = Command::new(exe);
-    cmd.stdin(Stdio::null())
+    // Keeps `--updated`, so the copy waits for the old version to exit.
+    cmd.args(std::env::args_os().skip(1))
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // A new session, so Ctrl+C or closing the terminal does not reach the widget.
@@ -2394,7 +2394,14 @@ fn claim_single_instance(wait: Duration) -> bool {
     const LOCK_EX: i32 = 2;
     const LOCK_NB: i32 = 4;
 
-    let Ok(file) = std::fs::File::create(std::env::temp_dir().join("usage-widget.lock")) else {
+    // Opened without truncating, so a link planted at this path cannot be used
+    // to empty another file.
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(std::env::temp_dir().join("usage-widget.lock"))
+    else {
         return true;
     };
     let start = std::time::Instant::now();

@@ -47,7 +47,7 @@ estimate = false
 "#;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub refresh_mins: u64,
     pub opacity: u32,
@@ -58,13 +58,13 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Service {
     pub enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Claude {
     pub enabled: bool,
     pub api: bool,
@@ -74,7 +74,7 @@ pub struct Claude {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Codex {
     pub enabled: bool,
     pub estimate: bool,
@@ -152,13 +152,29 @@ pub fn load() -> (Config, Option<String>) {
     match std::fs::read_to_string(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Config::default(), None),
         Err(e) => (Config::default(), Some(format!("cannot read config: {e}"))),
-        Ok(text) => match toml::from_str(&text) {
-            Ok(c) => (c, None),
-            Err(e) => (
-                Config::default(),
-                Some(format!("config error: {}", e.message())),
-            ),
-        },
+        Ok(text) => parse(&text),
+    }
+}
+
+/// Parses the config text. Unknown keys, such as a misspelt setting, are
+/// reported but do not throw away the rest of the file.
+fn parse(text: &str) -> (Config, Option<String>) {
+    let mut unknown = Vec::new();
+    let parsed = toml::de::Deserializer::parse(text)
+        .and_then(|de| serde_ignored::deserialize(de, |path| unknown.push(format!("`{path}`"))));
+    match parsed {
+        Ok(c) if unknown.is_empty() => (c, None),
+        Ok(c) => (
+            c,
+            Some(format!(
+                "config: unknown setting {} ignored",
+                unknown.join(", ")
+            )),
+        ),
+        Err(e) => (
+            Config::default(),
+            Some(format!("config error: {}", e.message())),
+        ),
     }
 }
 
@@ -200,12 +216,19 @@ pub fn open(from_terminal: bool) -> Result<PathBuf, String> {
         .filter(|e| !e.trim().is_empty());
     let result = match editor {
         // Terminal editors take over the console, so wait for them to exit.
-        Some(editor) => {
-            let mut parts = editor.split_whitespace();
-            let bin = parts.next().unwrap_or_default();
-            Command::new(bin).args(parts).arg(&path).status().map(drop)
-        }
-        None => system_editor(&path).spawn().map(drop),
+        // Run through the shell like git does, so the editor can be a path with
+        // spaces or carry its own arguments.
+        Some(editor) => Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} \"$@\""))
+            .arg("editor")
+            .arg(&path)
+            .status()
+            .map(drop),
+        // Waited for on another thread so it does not linger as a zombie.
+        None => system_editor(&path).spawn().map(|mut child| {
+            std::thread::spawn(move || child.wait());
+        }),
     };
     result.map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     Ok(path)
@@ -242,7 +265,23 @@ mod tests {
         let c: Config = toml::from_str("[copilot]\nenabled = false").unwrap();
         assert!(!c.enabled(Provider::Copilot));
         assert!(c.enabled(Provider::Claude) && c.claude.api);
-        assert!(toml::from_str::<Config>("refresh_minutes = 5").is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_and_the_rest_kept() {
+        let (c, error) = parse("refresh_minutes = 1\nopacity = 50\n[claude]\nenabld = false");
+        assert_eq!(c.opacity, 50);
+        assert!(c.enabled(Provider::Claude));
+        let error = error.unwrap();
+        assert!(error.contains("`refresh_minutes`"), "{error}");
+        assert!(error.contains("`claude.enabld`"), "{error}");
+    }
+
+    #[test]
+    fn invalid_toml_falls_back_to_defaults() {
+        let (c, error) = parse("opacity = \"high\"");
+        assert_eq!(c, Config::default());
+        assert!(error.unwrap().starts_with("config error"));
     }
 
     #[test]

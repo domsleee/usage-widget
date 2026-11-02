@@ -112,7 +112,7 @@ the widget uses cached data and polls at most every 3 minutes, subject to rate l
 
 Estimates only cover local logs; Claude needs a few percentage ticks to calibrate.
 With `estimate = true`, daily JSONL history retains readings, token counts,
-calibration and predictions until manually removed. It excludes conversations and
+calibration and predictions for 30 days. It excludes conversations and
 credentials. See [estimate history](estimate-history.md) for paths, token
 totals and replay rules.
 Optional Claude renewal cookies come from Chrome, Arc, Brave or Edge on macOS,

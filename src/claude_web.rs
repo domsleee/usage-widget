@@ -66,7 +66,11 @@ mod mac {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    /// How long a lookup may take, including an unanswered keychain prompt.
+    const DEADLINE: Duration = Duration::from_secs(90);
 
     /// Chromium browsers: profile root under ~/Library/Application Support, and the
     /// keychain item holding the key their cookies are encrypted with.
@@ -89,7 +93,29 @@ mod mac {
     /// Code's organization; each signed-in browser profile is tried until one can
     /// see it, so a browser logged in to another account is never used. Without
     /// it, the first profile's last active organization is used.
+    ///
+    /// Runs on its own thread with a deadline: the keychain prompt and `sqlite3`
+    /// can block, and a refresh waits for every service, so a prompt left open
+    /// must not stop the others refreshing. Only one lookup runs at a time, so an
+    /// open prompt is not asked again.
     pub fn cycle(org: Option<&str>) -> Result<Cycle, String> {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        if BUSY.swap(true, Ordering::SeqCst) {
+            return Err("still waiting for keychain access from the last lookup".into());
+        }
+        let org = org.map(String::from);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = lookup(org.as_deref());
+            BUSY.store(false, Ordering::SeqCst);
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(DEADLINE).unwrap_or_else(|_| {
+            Err("browser lookup timed out; allow keychain access when macOS asks".into())
+        })
+    }
+
+    fn lookup(org: Option<&str>) -> Result<Cycle, String> {
         let mut result = None;
         each_session(|session, active_org| {
             let r = subscription(&session, org.unwrap_or(&active_org));
@@ -137,12 +163,16 @@ mod mac {
 
     /// Calls `f` with the claude.ai `sessionKey` and `lastActiveOrg` cookies of each
     /// browser profile that has them, until it returns true. Each browser's key is
-    /// read from the keychain only when one of its profiles is reached.
+    /// read from the keychain only when one of its profiles is reached. A browser
+    /// whose key is refused, or a cookie that cannot be decrypted, is skipped; the
+    /// first such error is returned only if no profile reached `f`.
     fn each_session(mut f: impl FnMut(String, String) -> bool) -> Result<(), String> {
         let base = std::env::home_dir()
             .ok_or("cannot resolve home directory")?
             .join("Library/Application Support");
-        for (dir, service) in BROWSERS {
+        let mut reached = false;
+        let mut first_error = None;
+        'browsers: for (dir, service) in BROWSERS {
             let Ok(entries) = std::fs::read_dir(base.join(dir)) else {
                 continue;
             };
@@ -163,17 +193,31 @@ mod mac {
                     continue;
                 };
                 if key.is_none() {
-                    key = Some(browser_key(service)?);
+                    match browser_key(service) {
+                        Ok(k) => key = Some(k),
+                        Err(e) => {
+                            first_error.get_or_insert(e);
+                            continue 'browsers;
+                        }
+                    }
                 }
                 let key = key.as_ref().expect("set above");
-                let decrypt =
-                    |v| decrypt(v, key, version).ok_or("cannot decrypt the claude.ai cookie");
-                if f(decrypt(session)?, decrypt(org)?) {
+                let (Some(session), Some(org)) =
+                    (decrypt(session, key, version), decrypt(org, key, version))
+                else {
+                    first_error.get_or_insert_with(|| "cannot decrypt the claude.ai cookie".into());
+                    continue;
+                };
+                reached = true;
+                if f(session, org) {
                     return Ok(());
                 }
             }
         }
-        Ok(())
+        match first_error {
+            Some(e) if !reached => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Reads the encrypted claude.ai cookies with the system `sqlite3`, from a copy
@@ -215,20 +259,55 @@ mod mac {
     }
 
     /// The AES key Chromium derives from its "Safe Storage" keychain password.
-    /// macOS asks the user once whether `security` may read it.
+    /// Read through the Security framework rather than the `security` tool, so
+    /// macOS asks whether usage-widget itself may read it. Allowing the `security`
+    /// tool instead would let any program read the browser's key the same way.
     fn browser_key(service: &str) -> Result<[u8; 16], String> {
-        let out = Command::new("security")
-            .args(["find-generic-password", "-w", "-s", service])
-            .output()
-            .map_err(|e| format!("cannot run `security` ({e})"))?;
-        if !out.status.success() {
+        let mut len = 0u32;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the service name is passed with its length, no account name is
+        // given, and the returned buffer is freed below with its own API.
+        let status = unsafe {
+            SecKeychainFindGenericPassword(
+                std::ptr::null(),
+                service.len() as u32,
+                service.as_ptr(),
+                0,
+                std::ptr::null(),
+                &mut len,
+                &mut data,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 || data.is_null() {
             return Err(format!(
                 "no keychain access to \"{service}\"; allow it when macOS asks"
             ));
         }
-        let password = String::from_utf8_lossy(&out.stdout);
-        pbkdf2_sha1(password.trim().as_bytes(), b"saltysalt", 1003)
+        // SAFETY: on success `data` holds `len` bytes until it is freed.
+        let password =
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len as usize) }.to_vec();
+        unsafe { SecKeychainItemFreeContent(std::ptr::null_mut(), data) };
+        pbkdf2_sha1(password.trim_ascii(), b"saltysalt", 1003)
             .ok_or_else(|| "cannot derive the browser's cookie key".into())
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainFindGenericPassword(
+            keychain_or_array: *const std::ffi::c_void,
+            service_name_length: u32,
+            service_name: *const u8,
+            account_name_length: u32,
+            account_name: *const u8,
+            password_length: *mut u32,
+            password_data: *mut *mut std::ffi::c_void,
+            item_ref: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn SecKeychainItemFreeContent(
+            attr_list: *mut std::ffi::c_void,
+            data: *mut std::ffi::c_void,
+        ) -> i32;
     }
 
     /// Chromium's macOS cookie format: "v10" + AES-128-CBC with a blank IV. Since

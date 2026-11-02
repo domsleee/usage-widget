@@ -11,6 +11,10 @@ Minimized:
 
 <img width="227" alt="Minimized widget: one line with each service's logo and estimated percentage" src="docs/minimized.png" />
 
+The personal plan and minimized screenshots have local estimates turned on
+(`estimate = true`), which shows the `~` fractions; by default the services'
+whole percentages are shown.
+
 ## Install
 
 Download `usage-widget.exe` from the
