@@ -917,7 +917,13 @@ fn provider_block(
     ui.horizontal(|ui| {
         provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-        ui.label(name);
+        // The name opens the service's usage page.
+        let name = ui
+            .add(egui::Label::new(name).sense(Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if name.clicked() {
+            open_url(p.url());
+        }
         if let Some(m) = selected
             && let Some(at) = m.resets_at
         {
@@ -1605,9 +1611,29 @@ fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, mini
     }
 }
 
+/// Prints what each service reports as JSON, without opening a window.
+fn print_usage() {
+    let mut services = serde_json::Map::new();
+    for p in Provider::ALL {
+        let result = match p.fetch() {
+            Ok(usage) => serde_json::json!({ "usage": usage }),
+            Err(e) => serde_json::json!({ "error": e.problem.label(), "detail": e.detail }),
+        };
+        services.insert(p.name().to_lowercase(), result);
+    }
+    println!(
+        "{}",
+        serde_json::json!({ "fetched_at": now_unix(), "services": services })
+    );
+}
+
 fn main() -> eframe::Result {
     let mut wait_for_exit = Duration::ZERO;
     match std::env::args().nth(1).as_deref() {
+        Some("usage") => {
+            print_usage();
+            return Ok(());
+        }
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
         // Started by the previous version after an update; it is still closing.
@@ -1616,7 +1642,7 @@ fn main() -> eframe::Result {
             return finish(Err(format!(
                 "unknown flag {flag}
 
-usage: usage-widget [--startup | --no-startup]"
+usage: usage-widget [usage | --startup | --no-startup]"
             )));
         }
         None => {}
@@ -1797,6 +1823,7 @@ fn claim_single_instance(wait: Duration) -> bool {
     }
 }
 
+#[cfg(windows)]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Registers (or removes) this exe in the per-user Run key so it starts at login.
@@ -1844,9 +1871,58 @@ fn set_run_at_login(enable: bool) -> Result<String, String> {
     })
 }
 
-#[cfg(not(windows))]
+/// Adds (or removes) a launch agent that starts this binary at login.
+#[cfg(target_os = "macos")]
+fn set_run_at_login(enable: bool) -> Result<String, String> {
+    const LABEL: &str = "io.github.pepsi-enjoyer.usage-widget";
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let plist = std::path::Path::new(&home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist"));
+    if !enable {
+        return match std::fs::remove_file(&plist) {
+            Ok(()) => Ok("usage-widget will no longer start at login.".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok("usage-widget was not registered to run at login.".into())
+            }
+            Err(e) => Err(format!("could not remove {}: {e}", plist.display())),
+        };
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe
+        .display()
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#
+    );
+    let write = || {
+        std::fs::create_dir_all(plist.parent().unwrap())?;
+        std::fs::write(&plist, xml)
+    };
+    write().map_err(|e| format!("could not write {}: {e}", plist.display()))?;
+    Ok("usage-widget will start at login.\n\nRun `usage-widget --no-startup` to undo.".into())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn set_run_at_login(_enable: bool) -> Result<String, String> {
-    Err("--startup is only supported on Windows".into())
+    Err("--startup is only supported on Windows and macOS".into())
 }
 
 /// Reports a flag's outcome. Release builds have no console, so use a message box on Windows.

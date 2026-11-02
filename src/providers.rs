@@ -50,8 +50,8 @@ impl Provider {
     pub fn url(self) -> &'static str {
         match self {
             Provider::Copilot => "https://github.com/settings/copilot/features",
-            Provider::Claude => "https://claude.ai/new#settings/usage",
-            Provider::Codex => "https://chatgpt.com/#settings/Usage",
+            Provider::Claude => "https://claude.ai/settings/usage",
+            Provider::Codex => "https://chatgpt.com/settings/usage?tab=overview",
         }
     }
 
@@ -127,7 +127,7 @@ impl Provider {
 }
 
 /// What a service reported for the signed-in account.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Usage {
     pub meters: Vec<Meter>,
     /// A personal subscription (Claude Pro/Max, ChatGPT Plus/Pro, Copilot Pro).
@@ -135,7 +135,8 @@ pub struct Usage {
     pub personal: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Unit {
     /// Amount in whole currency units.
     Dollars,
@@ -143,7 +144,7 @@ pub enum Unit {
     Percent,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Meter {
     /// Optional sub-label when a provider has more than one meter (e.g. "5h", "week").
     pub label: Option<String>,
@@ -558,6 +559,29 @@ fn copilot_usage(json: &Value) -> Result<Usage, FetchError> {
 // Claude (Claude Code OAuth token)
 // ---------------------------------------------------------------------------
 
+/// Claude Code on macOS keeps its credentials in the login keychain, not on
+/// disk, under the item its own tooling writes.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials() -> Result<Value, FetchError> {
+    let out = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output()
+        .map_err(|e| format!("cannot run `security` ({e})"))?;
+    if !out.status.success() {
+        return Err(FetchError::new(
+            Problem::NotAvailable,
+            "no Claude Code credentials in keychain; log in with `claude`",
+        ));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| FetchError::from(format!("bad JSON in keychain entry: {e}")))
+}
+
 /// Claude Code only refreshes its OAuth token while it runs, so on an idle machine
 /// the token expires. The widget never refreshes it itself, since that would
 /// rotate the refresh token under Claude Code. It asks for Claude Code to be run,
@@ -565,7 +589,21 @@ fn copilot_usage(json: &Value) -> Result<Usage, FetchError> {
 /// next refresh.
 fn claude() -> Result<Usage, FetchError> {
     let path = home()?.join(".claude").join(".credentials.json");
-    let creds = read_json_file(&path, "log in with `claude`")?;
+    let creds = match read_json_file(&path, "log in with `claude`") {
+        Ok(creds) => creds,
+        Err(e) => {
+            // Claude Code on macOS keeps its credentials in the login keychain,
+            // not on disk.
+            #[cfg(target_os = "macos")]
+            if let Ok(creds) = claude_keychain_credentials() {
+                creds
+            } else {
+                return Err(e);
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(e);
+        }
+    };
     let oauth = &creds["claudeAiOauth"];
     // Signed in with an API key rather than a Claude plan.
     let token = oauth["accessToken"].as_str().ok_or_else(|| {
