@@ -10,6 +10,7 @@ macOS. Restart the widget after editing.
 refresh_mins = 5    # minutes between refreshes, minimum 1
 opacity = 85        # window opacity, 20-100
 precision = 0       # decimal places for percentages, 0-3
+weekly_reset_date = false  # true = weekly reset as a date and time, not a countdown
 
 [copilot]
 enabled = true      # false hides a service; same key under each

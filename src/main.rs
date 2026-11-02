@@ -127,6 +127,8 @@ struct App {
     opacity: u32,
     /// Decimal places for percentages.
     precision: usize,
+    /// Show the weekly window's reset as a date and time, not a countdown.
+    weekly_reset_date: bool,
     config_error: Option<String>,
     renewal_lookup: Option<renewal_lookup::Lookup>,
     renewal_error: Option<String>,
@@ -149,6 +151,7 @@ impl App {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(config.opacity);
         let precision = config.precision.min(3);
+        let weekly_reset_date = config.weekly_reset_date;
         let restart = Arc::new(AtomicBool::new(false));
         if update::auto_enabled() {
             spawn_auto_update(cc.egui_ctx.clone(), restart.clone());
@@ -210,6 +213,7 @@ impl App {
             refreshing: Arc::default(),
             opacity,
             precision,
+            weekly_reset_date,
             config_error,
             renewal_lookup: None,
             renewal_error: None,
@@ -239,6 +243,7 @@ impl App {
             refreshing: Arc::default(),
             opacity: 100,
             precision: 0,
+            weekly_reset_date: false,
             config_error: None,
             renewal_lookup: None,
             renewal_error: None,
@@ -547,7 +552,7 @@ impl App {
                     let mut width = 13.0 + 8.0 + text_width(p.name().into(), 13.0);
                     if let Some(reset) = windows
                         .get(self.binding(*p).unwrap_or(0))
-                        .and_then(|m| reset_label(m))
+                        .and_then(|m| reset_label(m, self.weekly_reset_date))
                     {
                         width += 8.0 + text_width(format!("({reset})"), 11.0);
                     }
@@ -1134,9 +1139,11 @@ fn reset_tooltip(m: &Meter) -> Option<String> {
     Some(format!("Resets on {}", local_datetime(at)?))
 }
 
-fn reset_label(meter: &Meter) -> Option<String> {
+/// A countdown to the window's reset, or for the weekly window with
+/// `weekly_reset_date`, the date and time it resets.
+fn reset_label(meter: &Meter, weekly_date: bool) -> Option<String> {
     meter.resets_at.map(|at| {
-        if matches!(meter.label.as_deref(), Some("week" | "wk")) {
+        if weekly_date && matches!(meter.label.as_deref(), Some("week" | "wk")) {
             reset_date_time(at)
         } else {
             window_until(at)
@@ -1215,15 +1222,25 @@ fn ease<const N: usize>(ui: &egui::Ui, id: egui::Id, target: [f32; N]) -> [f32; 
     at(&tw, now)
 }
 
+/// How readings are written out.
+#[derive(Clone, Copy)]
+struct TextFormat {
+    /// Decimal places for percentages.
+    precision: usize,
+    /// Show the weekly window's reset as a date and time, not a countdown.
+    weekly_reset_date: bool,
+}
+
 fn provider_block(
     ui: &mut egui::Ui,
     p: Provider,
     slot: &Slot,
-    precision: usize,
+    format: TextFormat,
     renewal: &mut RenewalButton<'_>,
     logos: &HashMap<Provider, egui::TextureHandle>,
     binding: Option<usize>,
 ) {
+    let precision = format.precision;
     let meters = slot.meters.as_deref().unwrap_or_default();
     let personal = slot.windows();
     let single = (!slot.personal).then(|| spend_meter(meters)).flatten();
@@ -1245,7 +1262,7 @@ fn provider_block(
         }
         response.on_hover_text(usage_hover(slot, precision));
         if let Some(meter) = selected
-            && let Some(reset) = reset_label(meter)
+            && let Some(reset) = reset_label(meter, format.weekly_reset_date)
         {
             let countdown = ui.label(RichText::new(format!("({reset})")).size(11.0).color(LIGHT));
             if let Some(text) = reset_tooltip(meter) {
@@ -1974,7 +1991,10 @@ impl eframe::App for App {
                                 ui,
                                 *p,
                                 slot,
-                                self.precision,
+                                TextFormat {
+                                    precision: self.precision,
+                                    weekly_reset_date: self.weekly_reset_date,
+                                },
                                 &mut renewal,
                                 &self.logos,
                                 bindings.get(p).copied(),
@@ -2593,6 +2613,22 @@ mod display_tests {
     use chrono::TimeZone;
 
     #[test]
+    fn weekly_reset_is_a_countdown_unless_the_date_is_asked_for() {
+        let at = now_unix() + 3 * 86_400 + 2 * 3600;
+        let meter = |label: &str| Meter {
+            label: Some(label.into()),
+            used: 18.0,
+            total: 100.0,
+            unit: Unit::Percent,
+            resets_at: Some(at),
+        };
+        assert_eq!(reset_label(&meter("week"), false), Some(window_until(at)));
+        assert_eq!(reset_label(&meter("week"), true), Some(reset_date_time(at)));
+        assert_eq!(reset_label(&meter("5h"), true), Some(window_until(at)));
+        assert!(!config::Config::default().weekly_reset_date);
+    }
+
+    #[test]
     fn estimates_do_not_round_into_the_next_reported_percent() {
         for precision in [0, 1, 2] {
             assert_eq!(super::percent_label(87.99, precision, true), "~87.99%");
@@ -2790,7 +2826,10 @@ mod display_tests {
                                     ui,
                                     Provider::Claude,
                                     &app.slots[&Provider::Claude],
-                                    0,
+                                    TextFormat {
+                                        precision: 0,
+                                        weekly_reset_date: true,
+                                    },
                                     &mut renewal,
                                     &HashMap::new(),
                                     Some(1),
@@ -2853,7 +2892,10 @@ mod display_tests {
                                 ui,
                                 Provider::Claude,
                                 &app.slots[&Provider::Claude],
-                                0,
+                                TextFormat {
+                                    precision: 0,
+                                    weekly_reset_date: true,
+                                },
                                 &mut renewal,
                                 &HashMap::new(),
                                 Some(0),
