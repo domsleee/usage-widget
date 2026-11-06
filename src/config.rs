@@ -18,7 +18,7 @@ opacity = 85
 # percents, so extra places show as zeros.
 precision = 0
 
-# true = show when the weekly window resets as a date and time ("17 Oct 2:30pm")
+# true = show when the weekly window resets as a date and time ("Wed 2:30pm")
 # instead of a countdown.
 weekly_reset_date = false
 

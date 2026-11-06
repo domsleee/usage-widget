@@ -2650,7 +2650,7 @@ mod display_tests {
     }
 
     fn personal_slot() -> Slot {
-        let now = now_unix();
+        let now = now_unix().div_euclid(60) * 60;
         Slot {
             personal: true,
             plan: Some("Max 5x".into()),
@@ -2784,7 +2784,7 @@ mod display_tests {
         let slot = &app.slots[&Provider::Claude];
         let at = slot.windows()[1].resets_at.unwrap();
         let date = chrono::Local.timestamp_opt(at, 0).single().unwrap();
-        let expected = format!("({})", date.format("%-d %b %-I:%M%P"));
+        let expected = format!("({})", date.format("%a %-I:%M%P"));
         let mut idle_width = None;
         for (loading, missing_renewal, lookup_running) in [
             (false, false, false),
