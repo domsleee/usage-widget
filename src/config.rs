@@ -89,7 +89,6 @@ struct HeaderSettings {
     clock_24h: bool,
     reset_parentheses: Option<bool>,
     spacing_size: Option<f32>,
-    // Older configs used this toggle. An explicit spacing_size takes precedence.
     compact_spacing: bool,
 }
 

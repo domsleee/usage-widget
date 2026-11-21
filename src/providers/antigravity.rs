@@ -13,13 +13,11 @@ fn executable() -> Option<PathBuf> {
     let on_path = std::env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name));
-    // A GUI launched at login may not inherit the user's shell PATH.
     let standard = if cfg!(windows) {
         crate::paths::data_local_dir().map(|dir| dir.join("agy/bin/agy.exe"))
     } else {
         std::env::home_dir().map(|dir| dir.join(".local/bin/agy"))
     };
-    // Homebrew installations can also be outside launchd's PATH.
     let homebrew = ["/opt/homebrew/bin/agy", "/usr/local/bin/agy"];
     on_path
         .chain(standard)
@@ -174,7 +172,6 @@ fn parse(value: &Value) -> Result<Usage, FetchError> {
     if meters.is_empty()
         && let Some(response) = value["response"].as_str()
     {
-        // Earlier agy versions include tab-separated quota rows in the JSON response.
         meters.extend(response.lines().filter_map(|line| {
             let mut columns = line.split('\t').map(str::trim);
             let group = columns.next()?;

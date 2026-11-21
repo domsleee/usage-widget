@@ -102,7 +102,6 @@ impl Slot {
             .flatten()
             .filter(|m| m.unit == Unit::Percent && m.total > 0.0);
         if provider == Provider::Antigravity {
-            // Model groups have independent quotas. Keep the fullest window in the header.
             return meters
                 .max_by(|a, b| a.percent().total_cmp(&b.percent()))
                 .into_iter()
@@ -1230,8 +1229,6 @@ fn usage_hover(slot: &Slot, precision: usize) -> HoverCard {
     }
 }
 
-/// Only the period belongs beside a percentage. Antigravity includes the model
-/// group in the full meter label used by the quota tooltip and JSON output.
 fn header_period(m: &Meter) -> Option<&'static str> {
     let label = m.label.as_deref()?;
     let label = label.strip_suffix(" Limit").unwrap_or(label);
@@ -1853,8 +1850,6 @@ fn wide(s: &str) -> Vec<u16> {
 /// Side of the square logo masks in assets/*.alpha.
 const LOGO_PX: usize = 64;
 
-/// Uploads the provider logos as white textures so they can be tinted. The marks
-/// are stored as 64x64 8-bit alpha masks so no image decoder is needed at runtime.
 fn load_logos(ctx: &egui::Context) -> HashMap<Provider, egui::TextureHandle> {
     let options = egui::TextureOptions {
         mipmap_mode: Some(egui::TextureFilter::Linear),
