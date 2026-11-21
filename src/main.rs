@@ -2918,62 +2918,123 @@ mod display_tests {
     fn antigravity_weekly_row_fits_the_standard_card() {
         let provider = Provider::Antigravity;
         let at = now_unix() + 6 * 86_400;
-        let slot = Slot {
-            personal: true,
-            meters: Some(vec![
-                window("Gemini Models weekly", 0.44, at),
-                window("Claude and GPT models Weekly Limit", 0.0, at),
-            ]),
-            ..Slot::default()
-        };
-        let (mut app, _, _) = App::for_test(vec![provider]);
-        app.weekly_reset_date = true;
-        app.precision = 2;
-        app.slots.insert(provider, slot);
-        let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(Default::default(), |root| {
-            let width = app.card_width(&ctx, &[provider]);
-            assert_eq!(width, WIDTH);
-            egui::CentralPanel::default().show(root, |ui| {
-                ui.set_width(width - 2.0 * f32::from(MARGIN));
-                provider_block(
-                    ui,
-                    provider,
-                    &app.slots[&provider],
-                    TextFormat {
-                        precision: 2,
-                        weekly_reset_date: true,
-                    },
-                    &mut RenewalButton {
-                        running: false,
-                        error: None,
-                        clicked: false,
-                        cancelled: false,
-                        raise_clicked: false,
-                    },
-                    &HashMap::new(),
-                    None,
-                );
-            });
-        });
-        let text = rendered_text(&output);
-        output.textures_delta.clear();
-        for expected in [
-            "Antigravity",
-            &format!("({})", reset_date_time(at)),
-            "0.44%",
-            "wk",
+        let soon = now_unix() + 3600;
+        for (weekly_date, session_used, expected_pct, period, reset) in [
+            (true, 0.0, "0.44%", "wk", reset_date_time(at)),
+            (false, 0.0, "0.44%", "wk", window_until(at)),
+            (true, 75.0, "75.00%", "5h", window_until(soon)),
         ] {
-            assert!(text.iter().any(|t| t == expected), "{text:?}");
+            let (mut app, _, _) = App::for_test(vec![provider]);
+            app.weekly_reset_date = weekly_date;
+            app.precision = 2;
+            app.slots.insert(
+                provider,
+                Slot {
+                    personal: true,
+                    meters: Some(vec![
+                        window("Gemini Models weekly", 0.44, at),
+                        window("Claude and GPT models Weekly Limit", 0.0, at),
+                        window("Gemini Models Five Hour Limit", session_used, soon),
+                    ]),
+                    ..Slot::default()
+                },
+            );
+            let ctx = egui::Context::default();
+            let viewport = egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(WIDTH, 60.0));
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |root| {
+                    assert_eq!(app.card_width(&ctx, &[provider]), WIDTH);
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.inner_margin(MARGIN))
+                        .show(root, |ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(WIDTH - 2.0 * f32::from(MARGIN));
+                                provider_block(
+                                    ui,
+                                    provider,
+                                    &app.slots[&provider],
+                                    TextFormat {
+                                        precision: 2,
+                                        weekly_reset_date: weekly_date,
+                                    },
+                                    &mut RenewalButton {
+                                        running: false,
+                                        error: None,
+                                        clicked: false,
+                                        cancelled: false,
+                                        raise_clicked: false,
+                                    },
+                                    &HashMap::new(),
+                                    app.binding(provider),
+                                );
+                            });
+                        });
+                },
+            );
+            output.textures_delta.clear();
+            let mut labels = Vec::new();
+            let mut tracks = Vec::new();
+            for shape in &output.shapes {
+                match &shape.shape {
+                    Shape::Text(t) => {
+                        let bounds = t.galley.rect.translate(t.pos.to_vec2());
+                        assert!(
+                            shape.clip_rect.intersect(viewport).contains_rect(bounds),
+                            "{} {bounds:?} clip {:?} view {viewport:?}",
+                            t.galley.job.text,
+                            shape.clip_rect
+                        );
+                        labels.push((t.galley.job.text.as_str(), bounds));
+                    }
+                    Shape::Rect(r) if r.fill == TRACK => tracks.push(r.rect),
+                    _ => {}
+                }
+            }
+            labels.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
+            assert_eq!(
+                labels.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                ["Antigravity", &format!("({reset})"), expected_pct, period]
+            );
+            let [track] = tracks.as_slice() else {
+                panic!("expected one progress bar")
+            };
+            for pair in labels.windows(2) {
+                let (left, right) = (pair[0].1, pair[1].1);
+                assert!(
+                    left.right() <= right.left()
+                        && left.bottom() > right.top()
+                        && right.bottom() > left.top()
+                );
+            }
+            assert!(labels.iter().all(|(_, rect)| rect.bottom() <= track.top()));
+            assert!(viewport.contains_rect(*track));
+
+            let mut compact = ctx.run_ui(Default::default(), |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    ui.horizontal(|ui| {
+                        compact_row(
+                            ui,
+                            &[provider],
+                            &app.slots,
+                            &HashMap::new(),
+                            2,
+                            &HashMap::new(),
+                            "",
+                        )
+                    });
+                });
+            });
+            compact.textures_delta.clear();
+            assert_eq!(rendered_text(&compact), ["AGY", expected_pct]);
+            assert_eq!(
+                usage_hover(&app.slots[&provider], 2).rows[0].label,
+                "Gemini Models weekly"
+            );
         }
-        assert!(!text.iter().any(|t| t.contains("Gemini")));
-        let slot = &app.slots[&provider];
-        assert_eq!(usage_hover(slot, 2).rows[0].label, "Gemini Models weekly");
-        assert_eq!(header_period(&slot.meters.as_ref().unwrap()[1]), Some("wk"));
-        assert_eq!(
-            header_period(&window("Gemini Models Five Hour Limit", 0.0, at)),
-            Some("5h")
-        );
     }
 
     #[test]
