@@ -53,7 +53,7 @@ model, which uses a little of your allowance, then refreshes.
   `usage-widget usage` for the same readings as JSON.
 
 Bars go green, yellow and red as you use more. Hover a service name for its plan,
-renewal date, exact reset times and additional caps. Click its name to open usage.
+renewal date, exact reset times and additional caps. Click Copilot, Claude, or Codex to open its usage page.
 
 Optional local estimates fill in the fraction between percentage ticks and show
 `~`. The widget keeps the same compact layout and widens only when decimals need
@@ -63,7 +63,7 @@ more room.
 
 - Drag it anywhere. It remembers where it was.
 - Right-click to refresh, refresh a service's token, minimize, resize, check for
-  updates, open each service's usage page, or quit.
+  updates, open available usage pages, or quit.
 - Untick a service under Show in the right-click menu to hide it. Tick it again to
   bring it back.
 - On macOS, the menu bar menu also hides and shows the widget.

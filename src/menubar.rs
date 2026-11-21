@@ -15,7 +15,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 pub enum Action {
     ToggleWidget,
     Refresh,
-    Open(Provider),
+    Open(&'static str),
     EditConfig,
     Quit,
     /// A choice from the widget's right-click popup.
@@ -37,13 +37,14 @@ impl MenuBar {
     pub fn new(ctx: &egui::Context, providers: &[Provider]) -> Result<Self, String> {
         let toggle = MenuItem::new("Hide widget", true, None);
         let refresh = MenuItem::new("Refresh now", true, None);
-        let opens: Vec<(MenuItem, Provider)> = providers
+        let opens: Vec<(MenuItem, &str)> = providers
             .iter()
-            .map(|&p| {
-                (
+            .filter_map(|&p| {
+                let url = p.usage_url()?;
+                Some((
                     MenuItem::new(format!("Open {} usage", p.name()), true, None),
-                    p,
-                )
+                    url,
+                ))
             })
             .collect();
         let edit = MenuItem::new("Edit config", true, None);
@@ -68,7 +69,9 @@ impl MenuBar {
         for (item, _) in &opens {
             append(item)?;
         }
-        append(&PredefinedMenuItem::separator())?;
+        if !opens.is_empty() {
+            append(&PredefinedMenuItem::separator())?;
+        }
         append(&updates)?;
         append(&edit)?;
         append(&quit)?;
@@ -86,7 +89,7 @@ impl MenuBar {
         actions.extend(
             opens
                 .iter()
-                .map(|(item, p)| (item.id().clone(), Action::Open(*p))),
+                .map(|(item, url)| (item.id().clone(), Action::Open(url))),
         );
         actions.extend(
             services
@@ -167,11 +170,12 @@ impl MenuBar {
         );
         let opens: Vec<MenuItem> = providers
             .iter()
-            .map(|&p| {
-                item(
+            .filter_map(|&p| {
+                let url = p.usage_url()?;
+                Some(item(
                     &format!("Open {} usage", p.name()),
-                    Some(MenuAction::Open(p)),
-                )
+                    Some(MenuAction::Open(url)),
+                ))
             })
             .collect();
         let note = item(&format!("Refreshes every {refresh_mins} min"), None);
@@ -215,15 +219,10 @@ impl MenuBar {
         for open in &opens {
             let _ = menu.append(open);
         }
-        let _ = menu.append_items(&[
-            &separator(),
-            &sizes,
-            &separator(),
-            &note,
-            &updates,
-            &edit,
-            &quit,
-        ]);
+        if !opens.is_empty() {
+            let _ = menu.append(&separator());
+        }
+        let _ = menu.append_items(&[&sizes, &separator(), &note, &updates, &edit, &quit]);
 
         *self.popup_actions.borrow_mut() = actions;
         // SAFETY: upheld by the caller.

@@ -355,7 +355,7 @@ impl App {
                 }
             }
             menubar::Action::Refresh => self.refresh_now(),
-            menubar::Action::Open(p) => open_url(p.url()),
+            menubar::Action::Open(url) => open_url(url),
             menubar::Action::EditConfig => {
                 if let Err(e) = config::open(false) {
                     self.config_error = Some(e);
@@ -372,7 +372,7 @@ impl App {
             MenuAction::Refresh => self.refresh_now(),
             MenuAction::RefreshToken(p) => self.refresh_token(p),
             MenuAction::ToggleMinimized => self.minimized = !self.minimized,
-            MenuAction::Open(p) => open_url(p.url()),
+            MenuAction::Open(url) => open_url(url),
             MenuAction::Toggle(p) => self.toggle(p),
             MenuAction::CheckForUpdates => self.check_for_updates(ctx),
             MenuAction::Size(z) => ctx.set_zoom_factor(z),
@@ -1096,11 +1096,14 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated:
 /// The service name opens its usage page; plan and renewal details stay on hover.
 fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
     let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
+    let Some(url) = p.usage_url() else {
+        return ui.label(name);
+    };
     let response = ui
         .add(egui::Label::new(name).sense(Sense::click()))
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
-        open_url(p.url());
+        open_url(url);
     }
     response
 }
@@ -1531,7 +1534,7 @@ enum MenuAction {
     Refresh,
     RefreshToken(Provider),
     ToggleMinimized,
-    Open(Provider),
+    Open(&'static str),
     Toggle(Provider),
     Size(f32),
     CheckForUpdates,
@@ -1626,7 +1629,7 @@ fn native_menu(
             add(menu, MF_SEPARATOR, 0, "");
         }
         for (i, p) in Provider::ALL.iter().enumerate() {
-            if found.contains(p) {
+            if found.contains(p) && p.usage_url().is_some() {
                 add(
                     menu,
                     MF_STRING,
@@ -1635,7 +1638,7 @@ fn native_menu(
                 );
             }
         }
-        if !found.is_empty() {
+        if found.iter().any(|p| p.usage_url().is_some()) {
             add(menu, MF_SEPARATOR, 0, "");
         }
         // Owned by `menu` once appended, so destroyed along with it.
@@ -1686,9 +1689,10 @@ fn native_menu(
             ID_UPDATE => Some(MenuAction::CheckForUpdates),
             ID_EDIT_CONFIG => Some(MenuAction::EditConfig),
             ID_QUIT => Some(MenuAction::Quit),
-            _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
-                Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
-            }
+            _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => Provider::ALL
+                [id - ID_OPEN]
+                .usage_url()
+                .map(MenuAction::Open),
             _ if (ID_TOGGLE..ID_TOGGLE + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Toggle(Provider::ALL[id - ID_TOGGLE]))
             }
@@ -1739,12 +1743,12 @@ fn egui_menu(
         }
         ui.separator();
     }
-    for &p in found {
+    for (p, url) in found.iter().filter_map(|p| Some((p, p.usage_url()?))) {
         if ui.button(format!("Open {} usage", p.name())).clicked() {
-            action = Some(MenuAction::Open(p));
+            action = Some(MenuAction::Open(url));
         }
     }
-    if !found.is_empty() {
+    if found.iter().any(|p| p.usage_url().is_some()) {
         ui.separator();
     }
     ui.menu_button("Size", |ui| {

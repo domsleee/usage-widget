@@ -55,12 +55,12 @@ impl Provider {
         }
     }
 
-    pub fn url(self) -> &'static str {
+    pub fn usage_url(self) -> Option<&'static str> {
         match self {
-            Provider::Copilot => "https://github.com/settings/copilot/features",
-            Provider::Claude => "https://claude.ai/settings/usage",
-            Provider::Codex => "https://chatgpt.com/settings/usage?tab=overview",
-            Provider::Antigravity => "https://antigravity.google/docs/cli/commands/usage",
+            Provider::Copilot => Some("https://github.com/settings/copilot/features"),
+            Provider::Claude => Some("https://claude.ai/settings/usage"),
+            Provider::Codex => Some("https://chatgpt.com/settings/usage?tab=overview"),
+            Provider::Antigravity => None,
         }
     }
 
