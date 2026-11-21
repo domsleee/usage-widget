@@ -92,14 +92,23 @@ impl Slot {
     }
 
     /// Primary windows share the header; scoped caps and spend stay in the tooltip.
-    fn windows(&self) -> Vec<&Meter> {
+    fn windows(&self, provider: Provider) -> Vec<&Meter> {
         if !self.personal {
             return Vec::new();
         }
-        self.meters
+        let meters = self
+            .meters
             .iter()
             .flatten()
-            .filter(|m| m.unit == Unit::Percent && m.total > 0.0)
+            .filter(|m| m.unit == Unit::Percent && m.total > 0.0);
+        if provider == Provider::Antigravity {
+            // Model groups have independent quotas. Keep the fullest window in the header.
+            return meters
+                .max_by(|a, b| a.percent().total_cmp(&b.percent()))
+                .into_iter()
+                .collect();
+        }
+        meters
             .filter(|m| matches!(m.label.as_deref(), Some("5h" | "week" | "wk" | "mo")))
             .collect()
     }
@@ -475,7 +484,7 @@ impl App {
     /// first this session (0 or 1).
     fn binding(&self, p: Provider) -> Option<usize> {
         let slot = self.slots.get(&p)?;
-        let windows = slot.windows();
+        let windows = slot.windows(p);
         let [five_hour, week] = windows.as_slice() else {
             return None;
         };
@@ -520,7 +529,7 @@ impl App {
             )
         } else if self.all_fetched() {
             (
-                "No paid Copilot, Claude or Codex plan found. Sign in with gh, claude or codex and it shows up at the next refresh.",
+                "No usage found. Sign in with gh, claude, codex or agy and refresh.",
                 "No plans found",
             )
         } else {
@@ -555,7 +564,7 @@ impl App {
                 .iter()
                 .filter_map(|p| {
                     let slot = self.slots.get(p)?;
-                    let windows = slot.windows();
+                    let windows = slot.windows(*p);
                     let mut width = 13.0 + 8.0 + text_width(p.name().into(), 13.0);
                     if let Some(reset) = windows
                         .get(self.binding(*p).unwrap_or(0))
@@ -1341,7 +1350,7 @@ fn provider_block(
 ) {
     let precision = format.precision;
     let meters = slot.meters.as_deref().unwrap_or_default();
-    let personal = slot.windows();
+    let personal = slot.windows(p);
     let single = (!slot.personal).then(|| spend_meter(meters)).flatten();
     let selected = personal.get(binding.unwrap_or(0)).copied();
     let position = binding.map(|b| ease(ui, egui::Id::new(("binding", p.name())), [b as f32])[0]);
@@ -1359,7 +1368,11 @@ fn provider_block(
         if p == Provider::Claude {
             renewal.context_menu(&response);
         }
-        response.on_hover_text(plan_summary(p, slot));
+        if p == Provider::Antigravity {
+            response.on_hover_ui(|ui| usage_hover(slot, precision).show(ui, p.name()));
+        } else {
+            response.on_hover_text(plan_summary(p, slot));
+        }
         if let Some(meter) = selected
             && let Some(reset) = reset_label(meter, format.weekly_reset_date)
         {
@@ -1823,8 +1836,7 @@ fn wide(s: &str) -> Vec<u16> {
 const LOGO_PX: usize = 64;
 
 /// Uploads the provider logos as white textures so they can be tinted. The marks
-/// are the Simple Icons SVGs (CC0) in assets/, rasterized once with resvg to
-/// 64x64 8-bit alpha masks so no SVG renderer is needed at runtime.
+/// are stored as 64x64 8-bit alpha masks so no image decoder is needed at runtime.
 fn load_logos(ctx: &egui::Context) -> HashMap<Provider, egui::TextureHandle> {
     let options = egui::TextureOptions {
         mipmap_mode: Some(egui::TextureFilter::Linear),
@@ -1837,6 +1849,7 @@ fn load_logos(ctx: &egui::Context) -> HashMap<Provider, egui::TextureHandle> {
                 Provider::Copilot => include_bytes!("../assets/copilot.alpha"),
                 Provider::Claude => include_bytes!("../assets/claude.alpha"),
                 Provider::Codex => include_bytes!("../assets/codex.alpha"),
+                Provider::Antigravity => include_bytes!("../assets/antigravity.alpha"),
             };
             let rgba: Vec<u8> = alpha.iter().flat_map(|&a| [255, 255, 255, a]).collect();
             let image = egui::ColorImage::from_rgba_unmultiplied([LOGO_PX, LOGO_PX], &rgba);
@@ -1848,7 +1861,7 @@ fn load_logos(ctx: &egui::Context) -> HashMap<Provider, egui::TextureHandle> {
 fn logo_color(p: Provider) -> Color32 {
     match p {
         Provider::Claude => Color32::from_rgb(217, 119, 87),
-        Provider::Copilot | Provider::Codex => TEXT,
+        Provider::Copilot | Provider::Codex | Provider::Antigravity => TEXT,
     }
 }
 
@@ -1883,7 +1896,7 @@ fn compact_row(
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
         let top = bindings
             .get(p)
-            .and_then(|&b| slot.windows().get(b).copied())
+            .and_then(|&b| slot.windows(*p).get(b).copied())
             .or_else(|| {
                 slot.meters
                     .iter()
@@ -2814,7 +2827,7 @@ mod display_tests {
     fn primary_windows_keep_scoped_caps_and_renewals_in_hover_text() {
         let slot = personal_slot();
         assert_eq!(
-            slot.windows()
+            slot.windows(Provider::Claude)
                 .iter()
                 .map(|m| m.label.as_deref().unwrap())
                 .collect::<Vec<_>>(),
@@ -2905,7 +2918,7 @@ mod display_tests {
         app.slots.insert(Provider::Claude, personal_slot());
         assert_eq!(app.binding(Provider::Claude), Some(1));
         let slot = &app.slots[&Provider::Claude];
-        let at = slot.windows()[1].resets_at.unwrap();
+        let at = slot.windows(Provider::Claude)[1].resets_at.unwrap();
         let date = chrono::Local.timestamp_opt(at, 0).single().unwrap();
         let expected = format!("({})", date.format("%a %-I:%M%P"));
         let mut idle_width = None;

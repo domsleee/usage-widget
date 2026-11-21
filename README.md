@@ -1,7 +1,7 @@
 # usage-widget
 
 A small always-on-top Windows and macOS widget that shows how much of your GitHub Copilot,
-Claude and Codex allowance you have used.
+Claude, Codex and Google Antigravity allowance you have used.
 
 | Business plans | Personal subscriptions |
 | --- | --- |
@@ -33,8 +33,10 @@ There is nothing to log in to. The widget uses the logins your CLIs already have
 - **Copilot:** the GitHub CLI (`gh auth login`)
 - **Claude:** Claude Code (`claude`)
 - **Codex:** the Codex CLI (`codex`)
+- **Antigravity** uses the Google Antigravity CLI (`agy`). Sign in once and check
+  that `/usage` shows your model quotas.
 
-Only services you have a paid plan with are shown. If a token expires, the widget
+Services appear when the widget finds a supported plan or quota. If a token expires, the widget
 says so; run that CLI once and it picks the new token up. Right-click > Refresh
 token does that for Claude or Codex: it runs a one-line prompt on the cheapest
 model, which uses a little of your allowance, then refreshes.
@@ -46,6 +48,9 @@ model, which uses a little of your allowance, then refreshes.
 - **Personal plans** (Claude Pro/Max, ChatGPT Plus/Pro): your 5-hour and weekly usage.
   The one you will run out of first is highlighted, the bar shows it, and the timer
   counts down to when it resets. Copilot Pro shows its monthly allowance.
+- **Antigravity** shows the model group and window with the highest percentage
+  used. Hover its name to see every reported window and reset time, or run
+  `usage-widget usage` for the same readings as JSON.
 
 Bars go green, yellow and red as you use more. Hover a service name for its plan,
 renewal date, exact reset times and additional caps. Click its name to open usage.
@@ -87,5 +92,6 @@ Environment variables override the matching config settings:
 ## Notes
 
 The usage numbers come from the same endpoints the CLIs and web settings pages use.
-They are not officially documented and may change. Logos are from
-[Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
+Antigravity quota comes from its CLI's built-in `/usage` command. The Antigravity
+mark is from [Google](https://antigravity.google/). Other logos are from
+[Simple Icons](https://simpleicons.org) (CC0). The marks belong to their owners.

@@ -2,7 +2,7 @@
 name = "usage-widget"
 version = "1.0.11"
 edition = "2024"
-description = "Tiny always-on-top desktop widget showing Copilot, Claude and Codex usage"
+description = "Tiny always-on-top desktop widget showing Copilot, Claude, Codex and Antigravity usage"
 publish = false
 
 [dependencies]

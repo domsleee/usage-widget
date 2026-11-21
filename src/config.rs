@@ -48,6 +48,9 @@ enabled = true
 # from this machine's Codex token use (shown with "~"; it can't see Codex cloud
 # or other devices, so the decimals are a guess).
 estimate = false
+
+[antigravity]
+enabled = true
 "#;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -60,6 +63,7 @@ pub struct Config {
     pub copilot: Service,
     pub claude: Claude,
     pub codex: Codex,
+    pub antigravity: Service,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -104,6 +108,7 @@ impl Default for Config {
             copilot: Service::default(),
             claude: Claude::default(),
             codex: Codex::default(),
+            antigravity: Service::default(),
         }
     }
 }
@@ -132,6 +137,7 @@ impl Config {
             Provider::Copilot => self.copilot.enabled,
             Provider::Claude => self.claude.enabled,
             Provider::Codex => self.codex.enabled,
+            Provider::Antigravity => self.antigravity.enabled,
         }
     }
 

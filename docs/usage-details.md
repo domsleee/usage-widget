@@ -25,6 +25,9 @@ estimate = false    # estimate between percentage ticks from local logs; shown w
 [codex]
 enabled = true
 estimate = false    # as for Claude
+
+[antigravity]
+enabled = true      # read quota from agy /usage
 ```
 
 `claude.renewal_date` uses your local calendar date and overrides browser lookup.
