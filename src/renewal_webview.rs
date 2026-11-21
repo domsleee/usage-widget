@@ -330,8 +330,6 @@ impl WebLookup {
         Some(crate::claude_web::cycle_from_details(&json))
     }
 
-    // Only reads of the page marker produce lookup data. A fetch kickoff's
-    // immediate JavaScript return value says nothing about its HTTP response.
     fn start_fetch(&self, js: &str) {
         unsafe {
             self.webview
@@ -357,8 +355,6 @@ impl WebLookup {
     }
 }
 
-/// Keep one marker read in flight, including when WebKit takes several polls
-/// to deliver its callback during a navigation.
 fn poll_read(pending: &mut Option<JsSlot>, submit: impl FnOnce(JsSlot)) -> Option<String> {
     if let Some(slot) = pending {
         let result = slot.borrow_mut().take()?;
