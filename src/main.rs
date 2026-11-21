@@ -138,10 +138,7 @@ struct App {
     /// start another run.
     refreshing: Arc<Mutex<HashSet<Provider>>>,
     opacity: u32,
-    /// Decimal places for percentages.
-    precision: usize,
-    /// Show the weekly window's reset as a date and time, not a countdown.
-    weekly_reset_date: bool,
+    format: TextFormat,
     config_error: Option<String>,
     renewal_lookup: Option<renewal_lookup::Lookup>,
     renewal_error: Option<String>,
@@ -163,8 +160,7 @@ impl App {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(config.opacity);
-        let precision = config.precision.min(3);
-        let weekly_reset_date = config.weekly_reset_date;
+        let format = TextFormat::from(&config);
         let restart = Arc::new(AtomicBool::new(false));
         if update::auto_enabled() {
             spawn_auto_update(cc.egui_ctx.clone(), restart.clone());
@@ -227,8 +223,7 @@ impl App {
             restart,
             refreshing: Arc::default(),
             opacity,
-            precision,
-            weekly_reset_date,
+            format,
             config_error,
             renewal_lookup: None,
             renewal_error: None,
@@ -257,8 +252,7 @@ impl App {
             restart: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::default(),
             opacity: 100,
-            precision: 0,
-            weekly_reset_date: false,
+            format: TextFormat::default(),
             config_error: None,
             renewal_lookup: None,
             renewal_error: None,
@@ -553,6 +547,7 @@ impl App {
 
     /// Fit the readings and reset label; status icons use the existing logo space.
     fn card_width(&self, ctx: &egui::Context, shown: &[Provider]) -> f32 {
+        let gap = self.format.header.gap();
         ctx.fonts_mut(|fonts| {
             let mut text_width = |text: String, size| {
                 fonts
@@ -565,21 +560,25 @@ impl App {
                 .filter_map(|p| {
                     let slot = self.slots.get(p)?;
                     let windows = slot.windows(*p);
-                    let mut width = 13.0 + 8.0 + text_width(p.name().into(), 13.0);
+                    let mut width = 13.0 + gap + text_width(p.name().into(), 13.0);
                     if let Some(reset) = windows
                         .get(self.binding(*p).unwrap_or(0))
-                        .and_then(|m| reset_label(m, self.weekly_reset_date))
+                        .and_then(|m| self.format.reset_label(m))
                     {
-                        width += 8.0 + text_width(format!("({reset})"), 11.0);
+                        width += gap + text_width(reset, 11.0);
                     }
                     if !windows.is_empty() {
-                        width += 8.0;
+                        width += gap;
                         for (i, m) in windows.iter().enumerate() {
                             if i > 0 {
                                 width += 9.0 + text_width("|".into(), 12.0);
                             }
                             width += text_width(
-                                percent_label(m.percent(), self.precision, slot.estimated(m)),
+                                percent_label(
+                                    m.percent(),
+                                    self.format.precision,
+                                    slot.estimated(m),
+                                ),
                                 12.0,
                             );
                             if let Some(period) = header_period(m) {
@@ -587,17 +586,17 @@ impl App {
                             }
                         }
                     } else if let Some(m) = slot.meters.as_deref().and_then(spend_meter) {
-                        width += 8.0 + text_width(m.summary(), 12.0);
+                        width += gap + text_width(m.summary(), 12.0);
                         if m.total > 0.0 {
-                            width += 8.0
+                            width += gap
                                 + text_width(
-                                    percent_label(m.percent(), self.precision, false),
+                                    percent_label(m.percent(), self.format.precision, false),
                                     12.0,
                                 );
                         }
                     }
                     if let Some(e) = &slot.error {
-                        width += 8.0 + text_width(e.problem.label().into(), 12.0);
+                        width += gap + text_width(e.problem.label().into(), 12.0);
                     }
                     Some(width + 2.0 * f32::from(MARGIN) + 4.0)
                 })
@@ -1255,18 +1254,6 @@ fn reset_tooltip(m: &Meter) -> Option<String> {
     Some(format!("Resets on {}", local_datetime(at)?))
 }
 
-/// A countdown to the window's reset, or for the weekly window with
-/// `weekly_reset_date`, the date and time it resets.
-fn reset_label(meter: &Meter, weekly_date: bool) -> Option<String> {
-    meter.resets_at.map(|at| {
-        if weekly_date && header_period(meter) == Some("wk") {
-            reset_date_time(at)
-        } else {
-            window_until(at)
-        }
-    })
-}
-
 /// Primary windows share one header, fading towards the window that binds first.
 fn windows(ui: &mut egui::Ui, meters: &[&Meter], weights: &[f32], slot: &Slot, precision: usize) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1334,12 +1321,39 @@ fn ease<const N: usize>(ui: &egui::Ui, id: egui::Id, target: [f32; N]) -> [f32; 
 }
 
 /// How readings are written out.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct TextFormat {
     /// Decimal places for percentages.
     precision: usize,
     /// Show the weekly window's reset as a date and time, not a countdown.
     weekly_reset_date: bool,
+    header: config::Header,
+}
+
+impl From<&Config> for TextFormat {
+    fn from(config: &Config) -> Self {
+        Self {
+            precision: config.precision.min(3),
+            weekly_reset_date: config.weekly_reset_date,
+            header: config.header,
+        }
+    }
+}
+
+impl TextFormat {
+    fn reset_label(self, meter: &Meter) -> Option<String> {
+        let at = meter.resets_at?;
+        let reset = if self.weekly_reset_date && header_period(meter) == Some("wk") {
+            reset_date_time(at, self.header.clock_24h)
+        } else {
+            window_until(at)
+        };
+        Some(if self.header.reset_parentheses {
+            format!("({reset})")
+        } else {
+            reset
+        })
+    }
 }
 
 fn provider_block(
@@ -1360,6 +1374,7 @@ fn provider_block(
     let weights = position.map_or_else(|| vec![1.0; personal.len()], |t| vec![1.0 - t, t]);
 
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = format.header.gap();
         if renewal.available(p, slot) {
             renewal.show(ui, p, slot);
         } else if slot.loading {
@@ -1377,9 +1392,9 @@ fn provider_block(
             response.on_hover_text(plan_summary(p, slot));
         }
         if let Some(meter) = selected
-            && let Some(reset) = reset_label(meter, format.weekly_reset_date)
+            && let Some(reset) = format.reset_label(meter)
         {
-            let countdown = ui.label(RichText::new(format!("({reset})")).size(11.0).color(LIGHT));
+            let countdown = ui.label(RichText::new(reset).size(11.0).color(LIGHT));
             if let Some(text) = reset_tooltip(meter) {
                 countdown.on_hover_text(text);
             }
@@ -2084,7 +2099,7 @@ impl eframe::App for App {
                         &providers,
                         &self.slots,
                         &self.logos,
-                        self.precision,
+                        self.format.precision,
                         &bindings,
                         empty_compact,
                     )
@@ -2104,10 +2119,7 @@ impl eframe::App for App {
                                 ui,
                                 *p,
                                 slot,
-                                TextFormat {
-                                    precision: self.precision,
-                                    weekly_reset_date: self.weekly_reset_date,
-                                },
+                                self.format,
                                 &mut renewal,
                                 &self.logos,
                                 bindings.get(p).copied(),
@@ -2739,10 +2751,62 @@ mod display_tests {
             unit: Unit::Percent,
             resets_at: Some(at),
         };
-        assert_eq!(reset_label(&meter("week"), false), Some(window_until(at)));
-        assert_eq!(reset_label(&meter("week"), true), Some(reset_date_time(at)));
-        assert_eq!(reset_label(&meter("5h"), true), Some(window_until(at)));
+        let default = TextFormat::default();
+        let date = TextFormat {
+            weekly_reset_date: true,
+            ..default
+        };
+        assert_eq!(
+            default.reset_label(&meter("week")),
+            Some(format!("({})", window_until(at)))
+        );
+        assert_eq!(
+            date.reset_label(&meter("week")),
+            Some(format!("({})", reset_date_time(at, false)))
+        );
+        assert_eq!(
+            date.reset_label(&meter("5h")),
+            Some(format!("({})", window_until(at)))
+        );
         assert!(!config::Config::default().weekly_reset_date);
+    }
+
+    #[test]
+    fn compact_header_config_formats_and_fits_a_full_weekly_quota() {
+        let config: Config = toml::from_str(
+            "weekly_reset_date = true\nprecision = 3\n[header]\nclock_24h = true\nreset_parentheses = false\ncompact_spacing = true",
+        ).unwrap();
+        let provider = Provider::Antigravity;
+        let (mut app, _, _) = App::for_test(vec![provider]);
+        app.format = TextFormat::from(&config);
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 11, 25, 22, 58, 0)
+            .unwrap()
+            .timestamp();
+        let meter = window("Gemini Models weekly", 100.0, at);
+        assert_eq!(app.format.reset_label(&meter).as_deref(), Some("Wed 22:58"));
+        app.format.header.reset_parentheses = true;
+        assert_eq!(
+            app.format.reset_label(&meter).as_deref(),
+            Some("(Wed 22:58)")
+        );
+        app.format.header.reset_parentheses = false;
+        app.slots.insert(
+            provider,
+            Slot {
+                personal: true,
+                meters: Some(vec![meter]),
+                ..Default::default()
+            },
+        );
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |_| {
+            assert_eq!(app.card_width(&ctx, &[provider]), WIDTH);
+            app.format.header.compact_spacing = false;
+            assert!(app.card_width(&ctx, &[provider]) > WIDTH);
+        })
+        .textures_delta
+        .clear();
     }
 
     #[test]
@@ -2920,13 +2984,13 @@ mod display_tests {
         let at = now_unix() + 6 * 86_400;
         let soon = now_unix() + 3600;
         for (weekly_date, session_used, expected_pct, period, reset) in [
-            (true, 0.0, "0.44%", "wk", reset_date_time(at)),
+            (true, 0.0, "0.44%", "wk", reset_date_time(at, false)),
             (false, 0.0, "0.44%", "wk", window_until(at)),
             (true, 75.0, "75.00%", "5h", window_until(soon)),
         ] {
             let (mut app, _, _) = App::for_test(vec![provider]);
-            app.weekly_reset_date = weekly_date;
-            app.precision = 2;
+            app.format.weekly_reset_date = weekly_date;
+            app.format.precision = 2;
             app.slots.insert(
                 provider,
                 Slot {
@@ -2957,10 +3021,7 @@ mod display_tests {
                                     ui,
                                     provider,
                                     &app.slots[&provider],
-                                    TextFormat {
-                                        precision: 2,
-                                        weekly_reset_date: weekly_date,
-                                    },
+                                    app.format,
                                     &mut RenewalButton {
                                         running: false,
                                         error: None,
@@ -3091,6 +3152,7 @@ mod display_tests {
                                     TextFormat {
                                         precision: 0,
                                         weekly_reset_date: true,
+                                        ..Default::default()
                                     },
                                     &mut renewal,
                                     &HashMap::new(),
@@ -3157,6 +3219,7 @@ mod display_tests {
                                 TextFormat {
                                     precision: 0,
                                     weekly_reset_date: true,
+                                    ..Default::default()
                                 },
                                 &mut renewal,
                                 &HashMap::new(),

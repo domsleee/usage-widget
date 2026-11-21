@@ -122,11 +122,14 @@ fn format_datetime(date: &NaiveDateTime) -> String {
 
 /// Local reset day and time for a weekly window, for example "Wed 2:30pm".
 /// The weekday alone is enough because the window is at most a week long.
-pub fn reset_date_time(ts: i64) -> String {
+pub fn reset_date_time(ts: i64, clock_24h: bool) -> String {
     Local
         .timestamp_opt(to_minute(ts), 0)
         .single()
-        .map(|t| t.format("%a %-I:%M%P").to_string())
+        .map(|t| {
+            t.format(if clock_24h { "%a %H:%M" } else { "%a %-I:%M%P" })
+                .to_string()
+        })
         .unwrap_or_default()
 }
 

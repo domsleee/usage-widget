@@ -22,6 +22,14 @@ precision = 0
 # instead of a countdown.
 weekly_reset_date = false
 
+[header]
+# Use "Wed 14:30" for weekly reset dates. Countdowns use the same format either way.
+clock_24h = false
+# Enclose the reset date or countdown in parentheses.
+reset_parentheses = true
+# Use 6-point gaps between header items. The default is 8 points.
+compact_spacing = false
+
 [copilot]
 enabled = true
 
@@ -60,10 +68,35 @@ pub struct Config {
     pub opacity: u32,
     pub precision: usize,
     pub weekly_reset_date: bool,
+    pub header: Header,
     pub copilot: Service,
     pub claude: Claude,
     pub codex: Codex,
     pub antigravity: Service,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Header {
+    pub clock_24h: bool,
+    pub reset_parentheses: bool,
+    pub compact_spacing: bool,
+}
+
+impl Default for Header {
+    fn default() -> Self {
+        Self {
+            clock_24h: false,
+            reset_parentheses: true,
+            compact_spacing: false,
+        }
+    }
+}
+
+impl Header {
+    pub fn gap(self) -> f32 {
+        if self.compact_spacing { 6.0 } else { 8.0 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -105,6 +138,7 @@ impl Default for Config {
             opacity: 85,
             precision: 0,
             weekly_reset_date: false,
+            header: Header::default(),
             copilot: Service::default(),
             claude: Claude::default(),
             codex: Codex::default(),
