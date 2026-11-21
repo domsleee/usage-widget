@@ -27,8 +27,8 @@ weekly_reset_date = false
 clock_24h = false
 # Enclose the reset date or countdown in parentheses.
 reset_parentheses = true
-# Use 6-point gaps between header items. The default is 8 points.
-compact_spacing = false
+# Gap between header items in logical points (0–24). Use 6 for a tighter layout.
+spacing_size = 8
 
 [copilot]
 enabled = true
@@ -76,26 +76,43 @@ pub struct Config {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(from = "HeaderSettings")]
 pub struct Header {
     pub clock_24h: bool,
     pub reset_parentheses: bool,
-    pub compact_spacing: bool,
+    pub spacing_size: f32,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct HeaderSettings {
+    clock_24h: bool,
+    reset_parentheses: Option<bool>,
+    spacing_size: Option<f32>,
+    // Older configs used this toggle. An explicit spacing_size takes precedence.
+    compact_spacing: bool,
 }
 
 impl Default for Header {
     fn default() -> Self {
-        Self {
-            clock_24h: false,
-            reset_parentheses: true,
-            compact_spacing: false,
-        }
+        HeaderSettings::default().into()
     }
 }
 
-impl Header {
-    pub fn gap(self) -> f32 {
-        if self.compact_spacing { 6.0 } else { 8.0 }
+impl From<HeaderSettings> for Header {
+    fn from(settings: HeaderSettings) -> Self {
+        let gap = settings
+            .spacing_size
+            .unwrap_or(if settings.compact_spacing { 6.0 } else { 8.0 });
+        Self {
+            clock_24h: settings.clock_24h,
+            reset_parentheses: settings.reset_parentheses.unwrap_or(true),
+            spacing_size: if gap.is_finite() {
+                gap.clamp(0.0, 24.0)
+            } else {
+                8.0
+            },
+        }
     }
 }
 
@@ -368,6 +385,27 @@ mod tests {
             toml::from_str::<Config>(TEMPLATE).unwrap(),
             Config::default()
         );
+    }
+
+    #[test]
+    fn header_spacing_accepts_numbers_and_preserves_older_configs() {
+        for (setting, expected) in [
+            ("", 8.0),
+            ("compact_spacing = false", 8.0),
+            ("compact_spacing = true", 6.0),
+            ("spacing_size = 10", 10.0),
+            ("spacing_size = 7.5\ncompact_spacing = true", 7.5),
+            ("spacing_size = -1", 0.0),
+            ("spacing_size = 1e20", 24.0),
+            ("spacing_size = nan", 8.0),
+            ("spacing_size = inf", 8.0),
+        ] {
+            let (config, error) = parse(&format!("[header]\n{setting}"));
+            assert_eq!(error, None, "{setting}");
+            assert_eq!(config.header.spacing_size, expected, "{setting}");
+        }
+        let (_, error) = parse("[header]\nspace_size = 7");
+        assert!(error.unwrap().contains("header.space_size"));
     }
 
     #[test]

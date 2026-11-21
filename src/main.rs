@@ -547,7 +547,7 @@ impl App {
 
     /// Fit the readings and reset label; status icons use the existing logo space.
     fn card_width(&self, ctx: &egui::Context, shown: &[Provider]) -> f32 {
-        let gap = self.format.header.gap();
+        let gap = self.format.header.spacing_size;
         ctx.fonts_mut(|fonts| {
             let mut text_width = |text: String, size| {
                 fonts
@@ -1374,7 +1374,7 @@ fn provider_block(
     let weights = position.map_or_else(|| vec![1.0; personal.len()], |t| vec![1.0 - t, t]);
 
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = format.header.gap();
+        ui.spacing_mut().item_spacing.x = format.header.spacing_size;
         if renewal.available(p, slot) {
             renewal.show(ui, p, slot);
         } else if slot.loading {
@@ -2774,7 +2774,7 @@ mod display_tests {
     #[test]
     fn compact_header_config_formats_and_fits_a_full_weekly_quota() {
         let config: Config = toml::from_str(
-            "weekly_reset_date = true\nprecision = 3\n[header]\nclock_24h = true\nreset_parentheses = false\ncompact_spacing = true",
+            "weekly_reset_date = true\nprecision = 3\n[header]\nclock_24h = true\nreset_parentheses = false\nspacing_size = 6",
         ).unwrap();
         let provider = Provider::Antigravity;
         let (mut app, _, _) = App::for_test(vec![provider]);
@@ -2802,7 +2802,7 @@ mod display_tests {
         let ctx = egui::Context::default();
         ctx.run_ui(Default::default(), |_| {
             assert_eq!(app.card_width(&ctx, &[provider]), WIDTH);
-            app.format.header.compact_spacing = false;
+            app.format.header.spacing_size = 8.0;
             assert!(app.card_width(&ctx, &[provider]) > WIDTH);
         })
         .textures_delta
