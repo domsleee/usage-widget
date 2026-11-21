@@ -131,8 +131,7 @@ pub struct WebLookup {
     started: Instant,
     last_poll: Instant,
     js_started: bool,
-    slot: JsSlot,
-    _blocks: Vec<RcBlock<dyn Fn(*mut AnyObject, *mut objc2_foundation::NSError)>>,
+    pending_read: Option<JsSlot>,
     result: Option<Result<Cycle, String>>,
 }
 
@@ -198,8 +197,7 @@ impl WebLookup {
             started: Instant::now(),
             last_poll: Instant::now() - POLL,
             js_started: false,
-            slot: Rc::new(RefCell::new(None)),
-            _blocks: Vec::new(),
+            pending_read: None,
             result: None,
         })
     }
@@ -242,12 +240,12 @@ impl WebLookup {
 
     fn poll_orgs(&mut self) -> Option<Result<Cycle, String>> {
         if !self.js_started {
-            self.eval(
+            self.start_fetch(
                 "window.__uw_orgs='__pending__';\
                  fetch('/api/organizations',{signal:AbortSignal.timeout(10000)})\
                  .then(r=>r.ok?r.json():null)\
                  .then(j=>{window.__uw_orgs=j?JSON.stringify(j):'__none__'})\
-                 .catch(()=>{window.__uw_orgs='__none__'});'started'",
+                 .catch(()=>{window.__uw_orgs='__none__'})",
             );
             self.js_started = true;
             return None;
@@ -297,12 +295,12 @@ impl WebLookup {
         let org = self.org.clone()?;
         if !self.js_started {
             let org_js = serde_json::to_string(&org).ok()?;
-            self.eval(&format!(
+            self.start_fetch(&format!(
                 "window.__uw_sub='__pending__';\
                  fetch('/api/organizations/'+encodeURIComponent({org_js})+'/subscription_details',\
                  {{signal:AbortSignal.timeout(25000)}})\
                  .then(async r=>{{window.__uw_sub=r.ok?JSON.stringify(await r.json()):'__http_'+r.status}})\
-                 .catch(()=>{{window.__uw_sub='__error__'}});'started'"
+                 .catch(()=>{{window.__uw_sub='__error__'}})"
             ));
             self.js_started = true;
             return None;
@@ -332,40 +330,68 @@ impl WebLookup {
         Some(crate::claude_web::cycle_from_details(&json))
     }
 
-    /// Queues a script whose string result lands in the shared slot.
-    fn eval(&mut self, js: &str) {
-        *self.slot.borrow_mut() = None;
-        let slot = self.slot.clone();
-        let block = RcBlock::new(
-            move |result: *mut AnyObject, _error: *mut objc2_foundation::NSError| {
-                let text = unsafe { Retained::retain(result) }
-                    .and_then(|obj| obj.downcast::<NSString>().ok())
-                    .map(|s| s.to_string());
-                *slot.borrow_mut() = Some(text);
-            },
-        );
+    // Only reads of the page marker produce lookup data. A fetch kickoff's
+    // immediate JavaScript return value says nothing about its HTTP response.
+    fn start_fetch(&self, js: &str) {
         unsafe {
             self.webview
-                .evaluateJavaScript_completionHandler(&NSString::from_str(js), Some(&block));
-        }
-        self._blocks.push(block);
-        if self._blocks.len() > 8 {
-            self._blocks.remove(0);
+                .evaluateJavaScript_completionHandler(&NSString::from_str(js), None);
         }
     }
 
-    /// Takes the last script result, if its completion has run.
     fn read(&mut self, js: &str) -> Option<String> {
-        if let Some(done) = self.slot.borrow_mut().take() {
-            return done;
-        }
-        self.eval(js);
-        None
+        poll_read(&mut self.pending_read, |slot| {
+            let block = RcBlock::new(
+                move |result: *mut AnyObject, _error: *mut objc2_foundation::NSError| {
+                    let text = unsafe { Retained::retain(result) }
+                        .and_then(|obj| obj.downcast::<NSString>().ok())
+                        .map(|s| s.to_string());
+                    *slot.borrow_mut() = Some(text);
+                },
+            );
+            unsafe {
+                self.webview
+                    .evaluateJavaScript_completionHandler(&NSString::from_str(js), Some(&block));
+            }
+        })
     }
+}
+
+/// Keep one marker read in flight, including when WebKit takes several polls
+/// to deliver its callback during a navigation.
+fn poll_read(pending: &mut Option<JsSlot>, submit: impl FnOnce(JsSlot)) -> Option<String> {
+    if let Some(slot) = pending {
+        let result = slot.borrow_mut().take()?;
+        *pending = None;
+        return result;
+    }
+    let slot = JsSlot::default();
+    *pending = Some(slot.clone());
+    submit(slot);
+    None
 }
 
 impl Drop for WebLookup {
     fn drop(&mut self) {
         self.window.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slow_marker_read_is_submitted_once_and_consumed_once() {
+        let mut pending = None;
+        let mut callback = None;
+        assert_eq!(poll_read(&mut pending, |slot| callback = Some(slot)), None);
+        assert_eq!(poll_read(&mut pending, |_| panic!("duplicate read")), None);
+        *callback.unwrap().borrow_mut() = Some(Some("response".into()));
+        assert_eq!(
+            poll_read(&mut pending, |_| panic!("replaced unread response")).as_deref(),
+            Some("response")
+        );
+        assert!(pending.is_none());
     }
 }
