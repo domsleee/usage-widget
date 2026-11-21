@@ -582,16 +582,8 @@ impl App {
                                 percent_label(m.percent(), self.precision, slot.estimated(m)),
                                 12.0,
                             );
-                            if let Some(label) = &m.label {
-                                width += 3.0
-                                    + text_width(
-                                        if label == "week" {
-                                            "wk".into()
-                                        } else {
-                                            label.clone()
-                                        },
-                                        12.0,
-                                    );
+                            if let Some(period) = header_period(m) {
+                                width += 3.0 + text_width(period.into(), 12.0);
                             }
                         }
                     } else if let Some(m) = slot.meters.as_deref().and_then(spend_meter) {
@@ -1239,9 +1231,25 @@ fn usage_hover(slot: &Slot, precision: usize) -> HoverCard {
     }
 }
 
+/// Only the period belongs beside a percentage. Antigravity includes the model
+/// group in the full meter label used by the quota tooltip and JSON output.
+fn header_period(m: &Meter) -> Option<&'static str> {
+    let label = m.label.as_deref()?;
+    let label = label.strip_suffix(" Limit").unwrap_or(label);
+    if label.ends_with("Five Hour") {
+        return Some("5h");
+    }
+    match label.split_whitespace().next_back()? {
+        "weekly" | "Weekly" | "week" | "wk" => Some("wk"),
+        "5h" => Some("5h"),
+        "mo" | "monthly" | "Monthly" => Some("mo"),
+        _ => None,
+    }
+}
+
 fn reset_tooltip(m: &Meter) -> Option<String> {
     let at = m.resets_at?;
-    if m.label.as_deref() == Some("5h") {
+    if header_period(m) == Some("5h") {
         return Some(format!("Resets in {}", window_until(at)));
     }
     Some(format!("Resets on {}", local_datetime(at)?))
@@ -1251,7 +1259,7 @@ fn reset_tooltip(m: &Meter) -> Option<String> {
 /// `weekly_reset_date`, the date and time it resets.
 fn reset_label(meter: &Meter, weekly_date: bool) -> Option<String> {
     meter.resets_at.map(|at| {
-        if weekly_date && matches!(meter.label.as_deref(), Some("week" | "wk")) {
+        if weekly_date && header_period(meter) == Some("wk") {
             reset_date_time(at)
         } else {
             window_until(at)
@@ -1267,12 +1275,7 @@ fn windows(ui: &mut egui::Ui, meters: &[&Meter], weights: &[f32], slot: &Slot, p
             if i > 0 {
                 ui.label(RichText::new("|").size(12.0).color(MUTED));
             }
-            if let Some(label) = &m.label {
-                let label = if label == "week" {
-                    "wk"
-                } else {
-                    label.as_str()
-                };
+            if let Some(label) = header_period(m) {
                 let label_response = ui.label(
                     RichText::new(label)
                         .size(12.0)
@@ -2909,6 +2912,68 @@ mod display_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn antigravity_weekly_row_fits_the_standard_card() {
+        let provider = Provider::Antigravity;
+        let at = now_unix() + 6 * 86_400;
+        let slot = Slot {
+            personal: true,
+            meters: Some(vec![
+                window("Gemini Models weekly", 0.44, at),
+                window("Claude and GPT models Weekly Limit", 0.0, at),
+            ]),
+            ..Slot::default()
+        };
+        let (mut app, _, _) = App::for_test(vec![provider]);
+        app.weekly_reset_date = true;
+        app.precision = 2;
+        app.slots.insert(provider, slot);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |root| {
+            let width = app.card_width(&ctx, &[provider]);
+            assert_eq!(width, WIDTH);
+            egui::CentralPanel::default().show(root, |ui| {
+                ui.set_width(width - 2.0 * f32::from(MARGIN));
+                provider_block(
+                    ui,
+                    provider,
+                    &app.slots[&provider],
+                    TextFormat {
+                        precision: 2,
+                        weekly_reset_date: true,
+                    },
+                    &mut RenewalButton {
+                        running: false,
+                        error: None,
+                        clicked: false,
+                        cancelled: false,
+                        raise_clicked: false,
+                    },
+                    &HashMap::new(),
+                    None,
+                );
+            });
+        });
+        let text = rendered_text(&output);
+        output.textures_delta.clear();
+        for expected in [
+            "Antigravity",
+            &format!("({})", reset_date_time(at)),
+            "0.44%",
+            "wk",
+        ] {
+            assert!(text.iter().any(|t| t == expected), "{text:?}");
+        }
+        assert!(!text.iter().any(|t| t.contains("Gemini")));
+        let slot = &app.slots[&provider];
+        assert_eq!(usage_hover(slot, 2).rows[0].label, "Gemini Models weekly");
+        assert_eq!(header_period(&slot.meters.as_ref().unwrap()[1]), Some("wk"));
+        assert_eq!(
+            header_period(&window("Gemini Models Five Hour Limit", 0.0, at)),
+            Some("5h")
+        );
     }
 
     #[test]
