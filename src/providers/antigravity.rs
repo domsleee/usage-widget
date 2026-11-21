@@ -3,7 +3,8 @@ use crate::timeutil::parse_rfc3339;
 use serde_json::Value;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::Instant;
 
 fn executable() -> Option<PathBuf> {
@@ -39,38 +40,98 @@ pub(super) fn fetch() -> Result<Usage, FetchError> {
         )
     })?;
     let mut cmd = Command::new(agy);
-    cmd.args(["-p", "/usage", "--output-format", "json"])
-        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    // In print mode disableSlashCommands=true would send /usage to the model.
+    cmd.args([
+        "--settings",
+        r#"{"disableSlashCommands":false}"#,
+        "-p",
+        "/usage",
+        "--output-format",
+        "json",
+    ])
+    .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+    .current_dir(std::env::temp_dir())
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     no_window(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Could not start agy: {e}"))?;
-    let stdout = child.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout.take(1024 * 1024).read_to_end(&mut bytes);
-        let _ = tx.send(result.map(|_| bytes));
-    });
+    let stdout = capture(child.stdout.take().unwrap());
+    let stderr = capture(child.stderr.take().unwrap());
     let deadline = Instant::now() + HEADLESS_TIMEOUT;
     let status = wait_for_cli(&mut child, "agy /usage", deadline)?;
-    if !status.success() {
-        return Err(FetchError::new(
-            Problem::Service,
-            format!("agy /usage exited with {status}. Open agy and check /usage."),
-        ));
-    }
-    let bytes = rx
+    let bytes = stdout
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| "Timed out reading agy /usage".to_string())?
         .map_err(|e| format!("Could not read agy /usage: {e}"))?;
-    let value = serde_json::from_slice(&bytes)
+    let diagnostic = stderr
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    parse_output(&bytes, &diagnostic, status)
+}
+
+fn parse_output(bytes: &[u8], diagnostic: &[u8], status: ExitStatus) -> Result<Usage, FetchError> {
+    let value = serde_json::from_slice::<Value>(bytes);
+    if !status.success()
+        || value
+            .as_ref()
+            .is_ok_and(|v| v["status"].as_str().is_some_and(|s| s != "SUCCESS"))
+    {
+        return Err(cli_error(value.as_ref().ok(), diagnostic, status));
+    }
+    let value = value
         .map_err(|_| FetchError::new(Problem::BadResponse, "agy /usage returned invalid JSON."))?;
     parse(&value)
+}
+
+fn capture(pipe: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.take(1024 * 1024).read_to_end(&mut bytes);
+        let _ = tx.send(result.map(|_| bytes));
+    });
+    rx
+}
+
+fn cli_error(value: Option<&Value>, stderr: &[u8], status: ExitStatus) -> FetchError {
+    let stderr = String::from_utf8_lossy(stderr);
+    let Some(detail) = value
+        .and_then(|v| v["error"].as_str())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| stderr.lines().rev().map(str::trim).find(|s| !s.is_empty()))
+    else {
+        return FetchError::new(
+            Problem::Service,
+            format!("agy /usage failed ({status}). Open agy and check /usage."),
+        );
+    };
+    let lower = detail.to_ascii_lowercase();
+    if [
+        "authentication required",
+        "not authenticated",
+        "not logged in",
+        "not signed in",
+    ]
+    .iter()
+    .any(|message| lower.contains(message))
+    {
+        return FetchError::new(
+            Problem::NotAvailable,
+            "Sign in with the Antigravity CLI (agy) to read quota.",
+        );
+    }
+    FetchError::new(
+        Problem::Service,
+        format!(
+            "agy /usage: {}",
+            detail.chars().take(300).collect::<String>()
+        ),
+    )
 }
 
 fn meter(group: &str, window: &str, remaining: f64, reset: Option<&str>) -> Option<Meter> {
@@ -88,15 +149,6 @@ fn meter(group: &str, window: &str, remaining: f64, reset: Option<&str>) -> Opti
 }
 
 fn parse(value: &Value) -> Result<Usage, FetchError> {
-    if value["status"]
-        .as_str()
-        .is_some_and(|status| status != "SUCCESS")
-    {
-        return Err(FetchError::new(
-            Problem::Service,
-            "Antigravity could not read quota. Open agy and check /usage.",
-        ));
-    }
     let mut meters = Vec::new();
     if let Some(groups) = value
         .pointer("/command/data/groups")
@@ -178,6 +230,25 @@ mod tests {
         assert!((usage.meters[0].used - 20.0).abs() < 1e-10);
         assert_eq!(usage.meters[0].resets_at, None);
         assert!(parse(&json!({"response":"Sign in"})).is_err());
-        assert!(parse(&json!({"status":"ERROR","response":"Gemini\tweekly\t100%"})).is_err());
+    }
+
+    #[test]
+    fn reports_cli_errors_before_accepting_quota() {
+        let status = ExitStatus::default();
+        let failed =
+            br#"{"status":"ERROR","error":"Not signed in","response":"Gemini\tweekly\t100%"}"#;
+        let err = parse_output(failed, b"other diagnostic", status)
+            .err()
+            .unwrap();
+        assert_eq!(err.problem, Problem::NotAvailable);
+        let err = parse_output(
+            br#"{"status":"ERROR"}"#,
+            b"starting\nquota unavailable\n",
+            status,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.problem, Problem::Service);
+        assert_eq!(err.detail, "agy /usage: quota unavailable");
     }
 }
