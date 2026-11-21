@@ -48,9 +48,10 @@ model, which uses a little of your allowance, then refreshes.
 - **Personal plans** (Claude Pro/Max, ChatGPT Plus/Pro): your 5-hour and weekly usage.
   The one you will run out of first is highlighted, the bar shows it, and the timer
   counts down to when it resets. Copilot Pro shows its monthly allowance.
-- **Antigravity** shows the percentage used and period of its most-used quota
-  window. Hover its name to see usage and reset times for each model group, or run
-  `usage-widget usage` for the same readings as JSON.
+- **Antigravity** is labelled AGY and shows the 5-hour and weekly windows of its
+  busiest model group, highlighted the same way. Hover AGY to see usage and reset
+  times for each model group, or run `usage-widget usage` for the same readings as
+  JSON.
 
 Bars go green, yellow and red as you use more. Hover a service name for its plan,
 renewal date, exact reset times and additional caps. Click Copilot, Claude, or Codex to open its usage page.

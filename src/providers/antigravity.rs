@@ -56,13 +56,23 @@ pub(super) fn fetch() -> Result<Usage, FetchError> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Could not start agy: {e}"))?;
-    let stdout = capture(child.stdout.take().unwrap());
+    let stdout = read_stdout(child.stdout.take().unwrap());
     let stderr = capture(child.stderr.take().unwrap());
     let deadline = Instant::now() + HEADLESS_TIMEOUT;
+    let bytes = match stdout.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Stdout::Usage(value)) => match parse(&value) {
+            Ok(usage) => {
+                std::thread::spawn(move || wait_for_cli(&mut child, "agy /usage", deadline));
+                return Ok(usage);
+            }
+            Err(_) => Some(serde_json::to_vec(&value).map_err(std::io::Error::other)),
+        },
+        Ok(Stdout::Done(bytes)) => Some(bytes),
+        Err(_) => None,
+    };
     let status = wait_for_cli(&mut child, "agy /usage", deadline)?;
-    let bytes = stdout
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "Timed out reading agy /usage".to_string())?
+    let bytes = bytes
+        .ok_or_else(|| "Timed out reading agy /usage".to_string())?
         .map_err(|e| format!("Could not read agy /usage: {e}"))?;
     let diagnostic = stderr
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -70,6 +80,49 @@ pub(super) fn fetch() -> Result<Usage, FetchError> {
         .and_then(Result::ok)
         .unwrap_or_default();
     parse_output(&bytes, &diagnostic, status)
+}
+
+enum Stdout {
+    Usage(Value),
+    Done(std::io::Result<Vec<u8>>),
+}
+
+fn read_stdout(pipe: impl Read + Send + 'static) -> mpsc::Receiver<Stdout> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut pipe = pipe.take(1024 * 1024);
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(value) = successful_reading(&bytes) {
+                        let _ = tx.send(Stdout::Usage(value));
+                        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let _ = tx.send(Stdout::Done(Err(e)));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Stdout::Done(Ok(bytes)));
+    });
+    rx
+}
+
+fn successful_reading(bytes: &[u8]) -> Option<Value> {
+    if bytes.trim_ascii_end().last() != Some(&b'}') {
+        return None;
+    }
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .filter(|v| v["status"] == "SUCCESS")
 }
 
 fn parse_output(bytes: &[u8], diagnostic: &[u8], status: ExitStatus) -> Result<Usage, FetchError> {
@@ -136,7 +189,14 @@ fn meter(group: &str, window: &str, remaining: f64, reset: Option<&str>) -> Opti
     if group.is_empty() || window.is_empty() || !(0.0..=1.0).contains(&remaining) {
         return None;
     }
-    let window = window.strip_suffix(" Remaining").unwrap_or(window);
+    let lower = window.to_ascii_lowercase();
+    let window = if lower == "5h" || lower.contains("five hour") {
+        "5h"
+    } else if lower.contains("weekly") {
+        "weekly"
+    } else {
+        window.strip_suffix(" Remaining").unwrap_or(window)
+    };
     Some(Meter {
         label: Some(format!("{group} {window}")),
         used: (1.0 - remaining) * 100.0,
@@ -227,6 +287,17 @@ mod tests {
         assert!((usage.meters[0].used - 20.0).abs() < 1e-10);
         assert_eq!(usage.meters[0].resets_at, None);
         assert!(parse(&json!({"response":"Sign in"})).is_err());
+    }
+
+    #[test]
+    fn uses_the_reading_once_complete_json_reports_success() {
+        let full = br#"{"status":"SUCCESS","response":"Gemini\tweekly\t80%"}"#;
+        assert!(successful_reading(&full[..full.len() - 1]).is_none());
+        assert!(successful_reading(b"{\"status\":\"SUCCESS\",\"a\":{}").is_none());
+        assert!(successful_reading(br#"{"status":"ERROR"}"#).is_none());
+        let mut line = full.to_vec();
+        line.push(b'\n');
+        assert_eq!(successful_reading(&line).unwrap()["status"], "SUCCESS");
     }
 
     #[test]
