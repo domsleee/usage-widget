@@ -92,19 +92,14 @@ impl Slot {
     }
 
     /// Primary windows share the header; scoped caps and spend stay in the tooltip.
-    fn windows(&self, provider: Provider) -> Vec<&Meter> {
+    fn windows(&self) -> Vec<&Meter> {
         if !self.personal {
             return Vec::new();
         }
-        let meters = self
-            .meters
+        self.meters
             .iter()
             .flatten()
-            .filter(|m| m.unit == Unit::Percent && m.total > 0.0);
-        if provider == Provider::Antigravity {
-            return antigravity_windows(meters.collect());
-        }
-        meters
+            .filter(|m| m.unit == Unit::Percent && m.total > 0.0)
             .filter(|m| matches!(m.label.as_deref(), Some("5h" | "week" | "wk" | "mo")))
             .collect()
     }
@@ -472,14 +467,10 @@ impl App {
     /// first this session (0 or 1).
     fn binding(&self, p: Provider) -> Option<usize> {
         let slot = self.slots.get(&p)?;
-        let windows = slot.windows(p);
+        let windows = slot.windows();
         let [five_hour, week] = windows.as_slice() else {
             return None;
         };
-        if p == Provider::Antigravity {
-            return (header_period(five_hour) == Some("5h") && header_period(week) == Some("wk"))
-                .then(|| limits::binding(five_hour, week, None));
-        }
         if five_hour.label.as_deref() != Some("5h")
             || !matches!(week.label.as_deref(), Some("week" | "wk"))
         {
@@ -521,7 +512,7 @@ impl App {
             )
         } else if self.all_fetched() {
             (
-                "No usage found. Sign in with gh, claude, codex or agy and refresh.",
+                "No usage found. Sign in with gh, claude or codex and refresh.",
                 "No plans found",
             )
         } else {
@@ -557,7 +548,7 @@ impl App {
                 .iter()
                 .filter_map(|p| {
                     let slot = self.slots.get(p)?;
-                    let windows = slot.windows(*p);
+                    let windows = slot.windows();
                     let mut width = 13.0 + gap + text_width(p.header_name().into(), 13.0);
                     if let Some(reset) = windows
                         .get(self.binding(*p).unwrap_or(0))
@@ -1242,51 +1233,6 @@ fn usage_hover(slot: &Slot, precision: usize) -> HoverCard {
     }
 }
 
-fn antigravity_windows(meters: Vec<&Meter>) -> Vec<&Meter> {
-    fn group(m: &Meter) -> Option<&str> {
-        m.label
-            .as_deref()
-            .and_then(|l| l.rsplit_once(' '))
-            .map(|(g, _)| g)
-    }
-    fn fullest<'a>(a: &'a Meter, b: &'a Meter) -> &'a Meter {
-        if b.percent() > a.percent() { b } else { a }
-    }
-    let paired = |m: &&Meter| matches!(header_period(m), Some("5h" | "wk"));
-    let Some(busiest) = meters.iter().copied().reduce(fullest) else {
-        return Vec::new();
-    };
-    if !paired(&busiest) {
-        return vec![busiest];
-    }
-    let in_group = |g| {
-        meters
-            .iter()
-            .copied()
-            .filter(paired)
-            .filter(move |m| group(m) == g)
-    };
-    let chosen = meters
-        .iter()
-        .copied()
-        .filter(paired)
-        .filter(|m| m.percent() == busiest.percent())
-        .map(group)
-        .find(|&g| {
-            let periods: Vec<_> = in_group(g).map(header_period).collect();
-            periods.contains(&Some("5h")) && periods.contains(&Some("wk"))
-        })
-        .unwrap_or_else(|| group(busiest));
-    ["5h", "wk"]
-        .into_iter()
-        .filter_map(|period| {
-            in_group(chosen)
-                .filter(|m| header_period(m) == Some(period))
-                .reduce(fullest)
-        })
-        .collect()
-}
-
 fn header_period(m: &Meter) -> Option<&'static str> {
     let label = m.label.as_deref()?;
     let label = label.strip_suffix(" Limit").unwrap_or(label);
@@ -1422,7 +1368,7 @@ fn provider_block(
 ) {
     let precision = format.precision;
     let meters = slot.meters.as_deref().unwrap_or_default();
-    let personal = slot.windows(p);
+    let personal = slot.windows();
     let single = (!slot.personal).then(|| spend_meter(meters)).flatten();
     let selected = personal.get(binding.unwrap_or(0)).copied();
     let position = binding.map(|b| ease(ui, egui::Id::new(("binding", p.name())), [b as f32])[0]);
@@ -1441,11 +1387,7 @@ fn provider_block(
         if p == Provider::Claude {
             renewal.context_menu(&response);
         }
-        if p == Provider::Antigravity {
-            response.on_hover_ui(|ui| usage_hover(slot, precision).show(ui, p.name()));
-        } else {
-            response.on_hover_text(plan_summary(p, slot));
-        }
+        response.on_hover_text(plan_summary(p, slot));
         if let Some(meter) = selected
             && let Some(reset) = format.reset_label(meter)
         {
@@ -1921,7 +1863,6 @@ fn load_logos(ctx: &egui::Context) -> HashMap<Provider, egui::TextureHandle> {
                 Provider::Copilot => include_bytes!("../assets/copilot.alpha"),
                 Provider::Claude => include_bytes!("../assets/claude.alpha"),
                 Provider::Codex => include_bytes!("../assets/codex.alpha"),
-                Provider::Antigravity => include_bytes!("../assets/antigravity.alpha"),
             };
             let rgba: Vec<u8> = alpha.iter().flat_map(|&a| [255, 255, 255, a]).collect();
             let image = egui::ColorImage::from_rgba_unmultiplied([LOGO_PX, LOGO_PX], &rgba);
@@ -1933,7 +1874,7 @@ fn load_logos(ctx: &egui::Context) -> HashMap<Provider, egui::TextureHandle> {
 fn logo_color(p: Provider) -> Color32 {
     match p {
         Provider::Claude => Color32::from_rgb(217, 119, 87),
-        Provider::Copilot | Provider::Codex | Provider::Antigravity => TEXT,
+        Provider::Copilot | Provider::Codex => TEXT,
     }
 }
 
@@ -1968,7 +1909,7 @@ fn compact_row(
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
         let top = bindings
             .get(p)
-            .and_then(|&b| slot.windows(*p).get(b).copied())
+            .and_then(|&b| slot.windows().get(b).copied())
             .or_else(|| {
                 slot.meters
                     .iter()
@@ -2335,76 +2276,12 @@ mod lookup_tests {
     }
 
     #[test]
-    fn antigravity_shows_both_windows_of_the_busiest_group() {
-        let meter = |label: &str, used| Meter {
-            label: Some(label.into()),
-            used,
-            total: 100.0,
-            unit: Unit::Percent,
-            resets_at: None,
-        };
-        let slot = Slot {
-            personal: true,
-            meters: Some(vec![
-                meter("Gemini Models weekly", 4.0),
-                meter("Gemini Models 5h", 13.0),
-                meter("Claude and GPT models weekly", 0.0),
-                meter("Claude and GPT models 5h", 0.0),
-                meter("Gemini 4 Argon weekly", 0.0),
-            ]),
-            ..Slot::default()
-        };
-        let labels = |slot: &Slot| {
-            slot.windows(Provider::Antigravity)
-                .iter()
-                .map(|m| m.label.clone().unwrap())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(labels(&slot), ["Gemini Models 5h", "Gemini Models weekly"]);
-
-        let with = |meters| Slot {
-            personal: true,
-            meters: Some(meters),
-            ..Slot::default()
-        };
-        let used = |slot: &Slot| {
-            slot.windows(Provider::Antigravity)
-                .iter()
-                .map(|m| m.used)
-                .collect::<Vec<_>>()
-        };
-        let argon = with(vec![
-            meter("Gemini Models weekly", 4.0),
-            meter("Gemini Models 5h", 13.0),
-            meter("Gemini 4 Argon weekly", 50.0),
-        ]);
-        assert_eq!(labels(&argon), ["Gemini 4 Argon weekly"]);
-        let idle = with(vec![
-            meter("Gemini 4 Argon weekly", 0.0),
-            meter("Gemini Models 5h", 0.0),
-            meter("Gemini Models weekly", 0.0),
-        ]);
-        assert_eq!(labels(&idle), ["Gemini Models 5h", "Gemini Models weekly"]);
-        let repeated = with(vec![
-            meter("Gemini Models 5h", 10.0),
-            meter("Gemini Models 5h", 30.0),
-            meter("Gemini Models weekly", 5.0),
-        ]);
-        assert_eq!(used(&repeated), [30.0, 5.0]);
-        let burst = with(vec![
-            meter("Gemini burst", 90.0),
-            meter("Gemini weekly", 10.0),
-        ]);
-        assert_eq!(labels(&burst), ["Gemini burst"]);
-    }
-
-    #[test]
     fn a_failed_refresh_keeps_the_last_reading_unless_the_service_is_gone() {
-        let (mut app, updates, _) = App::for_test(vec![Provider::Antigravity]);
+        let (mut app, updates, _) = App::for_test(vec![Provider::Claude]);
         let send = |at, result| {
             updates
                 .send(Update {
-                    provider: Provider::Antigravity,
+                    provider: Provider::Claude,
                     result,
                     at,
                     started: std::time::Instant::now(),
@@ -2419,7 +2296,7 @@ mod lookup_tests {
             estimated: Vec::new(),
             api_spend: None,
             meters: vec![Meter {
-                label: Some("Gemini 5h".into()),
+                label: Some("5h".into()),
                 used: 25.0,
                 total: 100.0,
                 unit: Unit::Percent,
@@ -2431,11 +2308,11 @@ mod lookup_tests {
             2,
             Err(FetchError {
                 problem: Problem::Service,
-                detail: "agy /usage timed out".into(),
+                detail: "request timed out".into(),
             }),
         );
         app.drain();
-        let slot = &app.slots[&Provider::Antigravity];
+        let slot = &app.slots[&Provider::Claude];
         assert_eq!(slot.meters.as_ref().map(Vec::len), Some(1));
         assert_eq!(slot.updated, Some(1));
         assert!(slot.error.is_some());
@@ -2448,7 +2325,7 @@ mod lookup_tests {
             }),
         );
         app.drain();
-        let slot = &app.slots[&Provider::Antigravity];
+        let slot = &app.slots[&Provider::Claude];
         assert!(slot.meters.is_none());
         assert_eq!(slot.updated, Some(3));
         assert!(!slot.visible());
@@ -3078,7 +2955,7 @@ mod display_tests {
     fn primary_windows_keep_scoped_caps_and_renewals_in_hover_text() {
         let slot = personal_slot();
         assert_eq!(
-            slot.windows(Provider::Claude)
+            slot.windows()
                 .iter()
                 .map(|m| m.label.as_deref().unwrap())
                 .collect::<Vec<_>>(),
@@ -3163,167 +3040,13 @@ mod display_tests {
     }
 
     #[test]
-    fn antigravity_row_shows_both_windows_without_clipping() {
-        let provider = Provider::Antigravity;
-        let at = now_unix() + 6 * 86_400;
-        let soon = now_unix() + 3600;
-        let (mut app, _, _) = App::for_test(vec![provider]);
-        app.format.precision = 2;
-        app.slots.insert(
-            provider,
-            Slot {
-                personal: true,
-                meters: Some(vec![window("Gemini 4 Argon weekly", 50.0, at)]),
-                ..Slot::default()
-            },
-        );
-        let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(Default::default(), |_| {
-            assert_eq!(app.card_width(&ctx, &[provider]), WIDTH);
-        });
-        output.textures_delta.clear();
-
-        for (weekly_date, session_used, session_pct, reset) in [
-            (true, 0.0, "0.00%", reset_date_time(at, false)),
-            (false, 0.0, "0.00%", window_until(at)),
-            (true, 75.0, "75.00%", window_until(soon)),
-        ] {
-            let (mut app, _, _) = App::for_test(vec![provider]);
-            app.format.weekly_reset_date = weekly_date;
-            app.format.precision = 2;
-            app.slots.insert(
-                provider,
-                Slot {
-                    personal: true,
-                    meters: Some(vec![
-                        window("Gemini Models weekly", 0.44, at),
-                        window("Claude and GPT models weekly", 0.0, at),
-                        window("Gemini Models 5h", session_used, soon),
-                    ]),
-                    ..Slot::default()
-                },
-            );
-            let ctx = egui::Context::default();
-            let width = std::cell::Cell::new(0.0);
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        Pos2::ZERO,
-                        Vec2::new(500.0, 60.0),
-                    )),
-                    ..Default::default()
-                },
-                |root| {
-                    width.set(app.card_width(&ctx, &[provider]));
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE.inner_margin(MARGIN))
-                        .show(root, |ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(width.get() - 2.0 * f32::from(MARGIN));
-                                provider_block(
-                                    ui,
-                                    provider,
-                                    &app.slots[&provider],
-                                    app.format,
-                                    &mut RenewalButton {
-                                        running: false,
-                                        error: None,
-                                        clicked: false,
-                                        cancelled: false,
-                                        raise_clicked: false,
-                                    },
-                                    &HashMap::new(),
-                                    app.binding(provider),
-                                );
-                            });
-                        });
-                },
-            );
-            assert!(width.get() >= WIDTH);
-            let viewport = egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(width.get(), 60.0));
-            output.textures_delta.clear();
-            let mut labels = Vec::new();
-            let mut tracks = Vec::new();
-            for shape in &output.shapes {
-                match &shape.shape {
-                    Shape::Text(t) => {
-                        let bounds = t.galley.rect.translate(t.pos.to_vec2());
-                        assert!(
-                            shape.clip_rect.intersect(viewport).contains_rect(bounds),
-                            "{} {bounds:?} clip {:?} view {viewport:?}",
-                            t.galley.job.text,
-                            shape.clip_rect
-                        );
-                        labels.push((t.galley.job.text.as_str(), bounds));
-                    }
-                    Shape::Rect(r) if r.fill == TRACK => tracks.push(r.rect),
-                    _ => {}
-                }
-            }
-            labels.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
-            assert_eq!(
-                labels.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-                [
-                    "AGY",
-                    &format!("({reset})"),
-                    session_pct,
-                    "5h",
-                    "|",
-                    "0.44%",
-                    "wk"
-                ]
-            );
-            let [track] = tracks.as_slice() else {
-                panic!("expected one progress bar")
-            };
-            for pair in labels.windows(2) {
-                let (left, right) = (pair[0].1, pair[1].1);
-                assert!(
-                    left.right() <= right.left()
-                        && left.bottom() > right.top()
-                        && right.bottom() > left.top()
-                );
-            }
-            assert!(labels.iter().all(|(_, rect)| rect.bottom() <= track.top()));
-            assert!(viewport.contains_rect(*track));
-
-            let mut compact = ctx.run_ui(Default::default(), |root| {
-                egui::CentralPanel::default().show(root, |ui| {
-                    ui.horizontal(|ui| {
-                        compact_row(
-                            ui,
-                            &[provider],
-                            &app.slots,
-                            &HashMap::new(),
-                            2,
-                            &HashMap::new(),
-                            "",
-                        )
-                    });
-                });
-            });
-            compact.textures_delta.clear();
-            let busiest = if session_used > 0.44 {
-                session_pct
-            } else {
-                "0.44%"
-            };
-            assert_eq!(rendered_text(&compact), ["AGY", busiest]);
-            assert_eq!(
-                usage_hover(&app.slots[&provider], 2).rows[0].label,
-                "Gemini Models weekly"
-            );
-        }
-    }
-
-    #[test]
     fn refresh_and_renewal_icons_keep_header_width_and_weekly_reset_visible() {
         let ctx = egui::Context::default();
         let (mut app, _, _) = App::for_test(vec![Provider::Claude]);
         app.slots.insert(Provider::Claude, personal_slot());
         assert_eq!(app.binding(Provider::Claude), Some(1));
         let slot = &app.slots[&Provider::Claude];
-        let at = slot.windows(Provider::Claude)[1].resets_at.unwrap();
+        let at = slot.windows()[1].resets_at.unwrap();
         let date = chrono::Local.timestamp_opt(at, 0).single().unwrap();
         let expected = format!("({})", date.format("%a %-I:%M%P"));
         let mut idle_width = None;
