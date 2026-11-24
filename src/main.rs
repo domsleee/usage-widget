@@ -169,12 +169,7 @@ impl App {
             providers.clone(),
             config,
         );
-        // Selectable labels grab clicks and drags, so right-click and drag-to-move
-        // would not work over text.
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.interaction.selectable_labels = false;
-            hover_style(style);
-        });
+        cc.egui_ctx.all_styles_mut(widget_style);
         let minimized = cc
             .storage
             .and_then(|s| eframe::get_value(s, MINIMIZED_KEY))
@@ -1104,6 +1099,14 @@ fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
         open_url(p.url());
     }
     response
+}
+
+/// The widget's style on top of egui's default.
+fn widget_style(style: &mut egui::Style) {
+    // Selectable labels grab clicks and drags, so right-click and drag-to-move
+    // would not work over text.
+    style.interaction.selectable_labels = false;
+    hover_style(style);
 }
 
 /// Hover cards are clipped to this small window and sit on top of the readings,
@@ -2045,7 +2048,13 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
-            let bg = ui.interact(ui.max_rect(), ui.id().with("bg"), Sense::click_and_drag());
+            // `ui.max_rect()` is the content rect, inset by the panel's margin, so
+            // add the margin back or the edges of the window can't be dragged.
+            let bg = ui.interact(
+                ui.max_rect() + panel.total_margin(),
+                ui.id().with("bg"),
+                Sense::click_and_drag(),
+            );
             if bg.drag_started_by(PointerButton::Primary) {
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
@@ -3068,6 +3077,139 @@ mod display_tests {
         assert!(text.iter().any(|t| t == "~80.12%"), "{text:?}");
         assert!(!text.iter().any(|t| t == "98%"));
         output.textures_delta.clear();
+    }
+
+    /// The commands one `App::ui` pass sends, in a window of `size`.
+    fn ui_commands(
+        ctx: &egui::Context,
+        app: &mut App,
+        size: Vec2,
+        events: Vec<egui::Event>,
+    ) -> Vec<ViewportCommand> {
+        // eframe's windowless stand-in, as egui_kittest uses for testing apps.
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |root| eframe::App::ui(app, root, &mut frame),
+        );
+        output.textures_delta.clear();
+        output
+            .viewport_output
+            .remove(&egui::ViewportId::ROOT)
+            .map(|v| v.commands)
+            .unwrap_or_default()
+    }
+
+    /// A context styled as `App::new` styles it, so text doesn't take drags.
+    fn widget_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(widget_style);
+        ctx
+    }
+
+    fn primary(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Presses the primary button at `at` in a fresh window of `size`, then sends
+    /// each of `then` in a pass of its own, and returns every command `App::ui`
+    /// sent.
+    fn press(
+        app: &mut App,
+        size: Vec2,
+        at: Pos2,
+        then: Vec<Vec<egui::Event>>,
+    ) -> Vec<ViewportCommand> {
+        let ctx = widget_ctx();
+        // Hit testing uses the previous pass's widgets, so lay them out first.
+        ui_commands(&ctx, app, size, vec![]);
+        let down = vec![egui::Event::PointerMoved(at), primary(at, true)];
+        let mut sent = ui_commands(&ctx, app, size, down);
+        for events in then {
+            sent.extend(ui_commands(&ctx, app, size, events));
+        }
+        sent
+    }
+
+    /// The whole window is a drag handle, margins and corners included (the
+    /// handle used to stop at the content, so the edges didn't drag), dragged
+    /// inwards or outwards, while a button on top of it still takes its click.
+    #[test]
+    fn window_drags_from_its_edges_and_buttons_still_click() {
+        let (mut app, _updates, refresh_rx) = App::for_test(vec![Provider::Claude]);
+        app.slots.insert(Provider::Claude, personal_slot());
+        for minimized in [false, true] {
+            app.minimized = minimized;
+            // The size the widget asks for, so the probes sit at its real edges.
+            let size = ui_commands(&widget_ctx(), &mut app, Vec2::splat(400.0), vec![])
+                .into_iter()
+                .find_map(|c| match c {
+                    ViewportCommand::InnerSize(size) => Some(size),
+                    _ => None,
+                })
+                .unwrap();
+            let centre = (size / 2.0).to_pos2();
+            // Half a point in: egui's 5pt hit radius used to cover all but the
+            // outer 1pt of the 6pt minimized margin.
+            let (near, far) = (0.5, size - Vec2::splat(0.5));
+            let probes = [
+                ("centre", centre),
+                ("top", Pos2::new(centre.x, near)),
+                ("bottom", Pos2::new(centre.x, far.y)),
+                ("left", Pos2::new(near, centre.y)),
+                ("right", Pos2::new(far.x, centre.y)),
+                ("top left", Pos2::new(near, near)),
+                ("top right", Pos2::new(far.x, near)),
+                ("bottom left", Pos2::new(near, far.y)),
+                ("bottom right", far.to_pos2()),
+            ];
+            let mut dead = vec![];
+            for (name, at) in probes {
+                let inwards = centre - at;
+                let step = Vec2::new(inwards.x.signum(), inwards.y.signum());
+                let to = |distance: f32| egui::Event::PointerMoved(at + step * distance);
+                // Inwards, past the distance that still counts as a click.
+                let mut drags = vec![("inwards", vec![vec![to(10.0)]])];
+                if name != "centre" {
+                    // Outwards, the natural way to pull an edge. On Windows, winit
+                    // reports the cursor leaving the window and where it went from
+                    // the same mouse message, so egui sees both in one pass.
+                    let gone_then_out = vec![egui::Event::PointerGone, to(-3.0)];
+                    drags.push((
+                        "outwards",
+                        vec![gone_then_out, vec![to(-8.0)], vec![to(-12.0)]],
+                    ));
+                }
+                for (way, then) in drags {
+                    if !press(&mut app, size, at, then).contains(&ViewportCommand::StartDrag) {
+                        dead.push(format!("{name} {way}"));
+                    }
+                }
+            }
+            assert!(
+                dead.is_empty(),
+                "minimized {minimized}: {dead:?} don't drag"
+            );
+
+            if !minimized {
+                // The 13pt refresh button at the bottom left of the content.
+                let inset = f32::from(MARGIN) + 6.5;
+                let at = Pos2::new(inset, size.y - inset);
+                assert!(refresh_rx.try_recv().is_err());
+                let sent = press(&mut app, size, at, vec![vec![primary(at, false)]]);
+                assert!(refresh_rx.try_recv().is_ok(), "refresh button didn't click");
+                assert!(!sent.contains(&ViewportCommand::StartDrag));
+            }
+        }
     }
 }
 
