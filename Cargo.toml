@@ -7,14 +7,14 @@ publish = false
 
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence"] }
-ureq = { version = "3", default-features = false, features = ["json", "native-tls"] }
+ureq = { version = "3", default-features = false, features = ["json", "native-tls-no-default"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 raw-window-handle = "0.6"
-sha2 = "0.11.0"
+sha2 = { version = "0.11.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-toml = "1.1.6"
+toml = { version = "1.1.6", default-features = false, features = ["std", "serde", "parse"] }
 serde_ignored = "0.1"
 
 [profile.release]
@@ -26,9 +26,16 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = "0.3"
-objc2-foundation = "0.3"
-objc2-web-kit = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "NSApplication", "NSGraphics", "NSResponder", "NSView", "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "NSError", "NSGeometry", "NSObject", "NSProcessInfo", "NSString", "NSURL", "NSURLRequest", "NSUUID",
+] }
+objc2-web-kit = { version = "0.3", default-features = false, features = [
+    "WKNavigation", "WKNavigationAction", "WKUIDelegate", "WKWebView", "WKWebViewConfiguration",
+    "WKWebsiteDataStore", "WKWindowFeatures", "block2", "objc2-app-kit", "objc2-core-foundation",
+] }
 block2 = "0.6"
-tray-icon = "0.24.2"
-winit = "0.30"
+tray-icon = { version = "0.24.2", default-features = false }
+winit = { version = "0.30", default-features = false }
