@@ -3614,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "usage-widget"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "base64 0.22.1",
  "block2 0.6.2",
