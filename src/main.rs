@@ -1110,6 +1110,26 @@ fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
     response
 }
 
+/// Whether the primary button went down on the background this pass, and not on
+/// a button or link drawn over it. The background is still the drag target under
+/// those, so its own response can't tell them apart.
+fn pressed_on_background(ctx: &egui::Context, bg: &egui::Response) -> bool {
+    if !bg.is_pointer_button_down_on() || !ctx.input(|i| i.pointer.primary_pressed()) {
+        return false;
+    }
+    let others: Vec<egui::Id> = ctx.interaction_snapshot(|s| {
+        s.hovered
+            .iter()
+            .copied()
+            .filter(|&id| id != bg.id)
+            .collect()
+    });
+    !others.into_iter().any(|id| {
+        ctx.read_response(id)
+            .is_some_and(|r| r.sense.senses_click())
+    })
+}
+
 /// The widget's style on top of egui's default.
 fn widget_style(style: &mut egui::Style) {
     // Selectable labels grab clicks and drags, so right-click and drag-to-move
@@ -2141,7 +2161,10 @@ impl eframe::App for App {
                 ui.id().with("bg"),
                 Sense::click_and_drag(),
             );
-            if bg.drag_started_by(PointerButton::Primary) {
+            // Start on the press itself. Windows' move loop starts from wherever the
+            // cursor is when it takes over and keeps that offset, so waiting for
+            // egui's drag threshold left the window trailing the cursor.
+            if pressed_on_background(&ctx, &bg) {
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
             #[cfg(not(windows))]
@@ -3552,8 +3575,9 @@ mod display_tests {
     }
 
     /// The whole window is a drag handle, margins and corners included (the
-    /// handle used to stop at the content, so the edges didn't drag), dragged
-    /// inwards or outwards, while a button on top of it still takes its click.
+    /// handle used to stop at the content, so the edges didn't drag). The drag
+    /// starts on the press, before the cursor moves, so the window doesn't trail
+    /// it. A button on top still takes its click, and a right-click doesn't drag.
     #[test]
     fn window_drags_from_its_edges_and_buttons_still_click() {
         let (mut app, _updates, refresh_rx) = App::for_test(vec![Provider::Claude]);
@@ -3583,32 +3607,35 @@ mod display_tests {
                 ("bottom left", Pos2::new(near, far.y)),
                 ("bottom right", far.to_pos2()),
             ];
-            let mut dead = vec![];
-            for (name, at) in probes {
-                let inwards = centre - at;
-                let step = Vec2::new(inwards.x.signum(), inwards.y.signum());
-                let to = |distance: f32| egui::Event::PointerMoved(at + step * distance);
-                // Inwards, past the distance that still counts as a click.
-                let mut drags = vec![("inwards", vec![vec![to(10.0)]])];
-                if name != "centre" {
-                    // Outwards, the natural way to pull an edge. On Windows, winit
-                    // reports the cursor leaving the window and where it went from
-                    // the same mouse message, so egui sees both in one pass.
-                    let gone_then_out = vec![egui::Event::PointerGone, to(-3.0)];
-                    drags.push((
-                        "outwards",
-                        vec![gone_then_out, vec![to(-8.0)], vec![to(-12.0)]],
-                    ));
-                }
-                for (way, then) in drags {
-                    if !press(&mut app, size, at, then).contains(&ViewportCommand::StartDrag) {
-                        dead.push(format!("{name} {way}"));
-                    }
-                }
-            }
+            let dead: Vec<_> = probes
+                .into_iter()
+                .filter(|&(_, at)| {
+                    !press(&mut app, size, at, vec![]).contains(&ViewportCommand::StartDrag)
+                })
+                .map(|(name, _)| name)
+                .collect();
             assert!(
                 dead.is_empty(),
-                "minimized {minimized}: {dead:?} don't drag"
+                "minimized {minimized}: {dead:?} don't drag on press"
+            );
+
+            let ctx = widget_ctx();
+            ui_commands(&ctx, &mut app, size, vec![]);
+            let right = egui::Event::PointerButton {
+                pos: centre,
+                button: PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let sent = ui_commands(
+                &ctx,
+                &mut app,
+                size,
+                vec![egui::Event::PointerMoved(centre), right],
+            );
+            assert!(
+                !sent.contains(&ViewportCommand::StartDrag),
+                "right-click dragged"
             );
 
             if !minimized {
