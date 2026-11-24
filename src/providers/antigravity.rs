@@ -164,6 +164,8 @@ fn cli_error(value: Option<&Value>, stderr: &[u8], status: ExitStatus) -> FetchE
     let lower = detail.to_ascii_lowercase();
     if [
         "authentication required",
+        // A signed-out agy waits for a browser sign-in, then reports this.
+        "authentication failed",
         "not authenticated",
         "not logged in",
         "not signed in",
@@ -308,6 +310,9 @@ mod tests {
         let err = parse_output(failed, b"other diagnostic", status)
             .err()
             .unwrap();
+        assert_eq!(err.problem, Problem::NotAvailable);
+        let signed_out = br#"{"status":"ERROR","error":"authentication failed or timed out"}"#;
+        let err = parse_output(signed_out, b"", status).err().unwrap();
         assert_eq!(err.problem, Problem::NotAvailable);
         let err = parse_output(
             br#"{"status":"ERROR"}"#,
