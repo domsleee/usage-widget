@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod antigravity;
+
 const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
 /// Copilot premium-request credits: 50,000 credits = $500.
@@ -28,16 +30,25 @@ pub enum Provider {
     Copilot,
     Claude,
     Codex,
+    Antigravity,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Copilot, Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 4] = [Self::Copilot, Self::Claude, Self::Codex, Self::Antigravity];
 
     pub fn name(self) -> &'static str {
         match self {
             Provider::Copilot => "Copilot",
             Provider::Claude => "Claude",
             Provider::Codex => "Codex",
+            Provider::Antigravity => "Antigravity",
+        }
+    }
+
+    pub fn header_name(self) -> &'static str {
+        match self {
+            Provider::Antigravity => self.short_name(),
+            _ => self.name(),
         }
     }
 
@@ -47,14 +58,16 @@ impl Provider {
             Provider::Copilot => "COP",
             Provider::Claude => "CLD",
             Provider::Codex => "CDX",
+            Provider::Antigravity => "AGY",
         }
     }
 
-    pub fn url(self) -> &'static str {
+    pub fn usage_url(self) -> Option<&'static str> {
         match self {
-            Provider::Copilot => "https://github.com/settings/copilot/features",
-            Provider::Claude => "https://claude.ai/settings/usage",
-            Provider::Codex => "https://chatgpt.com/settings/usage?tab=overview",
+            Provider::Copilot => Some("https://github.com/settings/copilot/features"),
+            Provider::Claude => Some("https://claude.ai/settings/usage"),
+            Provider::Codex => Some("https://chatgpt.com/settings/usage?tab=overview"),
+            Provider::Antigravity => None,
         }
     }
 
@@ -70,6 +83,7 @@ impl Provider {
     pub fn refresh_token(self) -> Result<(), String> {
         match self {
             Provider::Copilot => Err("the gh token does not expire".into()),
+            Provider::Antigravity => Err("sign in with the Antigravity CLI (agy)".into()),
             Provider::Claude => refresh_claude_token(),
             Provider::Codex => {
                 // The user config is skipped so a costly default model or effort
@@ -101,6 +115,7 @@ impl Provider {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(&config.claude),
             Provider::Codex => codex(config.codex.estimate),
+            Provider::Antigravity => antigravity::fetch(),
         }
     }
 }
@@ -398,22 +413,7 @@ fn run_headless(program: &str, args: &[&str]) -> Result<(), String> {
         text
     });
 
-    let deadline = Instant::now() + HEADLESS_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            // The reader is left behind: a process the shim started may still
-            // hold the pipe open.
-            Ok(None) => {
-                let _ = child.kill();
-                return Err(format!("{program} timed out"));
-            }
-            Err(e) => return Err(format!("{program} did not finish: {e}")),
-        }
-    };
+    let status = wait_for_cli(&mut child, program, Instant::now() + HEADLESS_TIMEOUT)?;
     if status.success() {
         return Ok(());
     }
@@ -422,6 +422,29 @@ fn run_headless(program: &str, args: &[&str]) -> Result<(), String> {
         Some(line) => format!("{program} failed: {}", line.trim()),
         None => format!("{program} failed ({status})"),
     })
+}
+
+fn wait_for_cli(
+    child: &mut std::process::Child,
+    program: &str,
+    deadline: Instant,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            // The reader is left behind: a process the shim started may still
+            // hold the pipe open.
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{program} timed out"));
+            }
+            Err(e) => return Err(format!("{program} did not finish: {e}")),
+        }
+    }
 }
 
 fn home() -> Result<PathBuf, String> {

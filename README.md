@@ -1,7 +1,7 @@
 # usage-widget
 
 A small always-on-top Windows and macOS widget that shows how much of your GitHub Copilot,
-Claude and Codex allowance you have used.
+Claude, Codex and Google Antigravity allowance you have used.
 
 | Business plans | Personal subscriptions |
 | --- | --- |
@@ -33,8 +33,10 @@ There is nothing to log in to. The widget uses the logins your CLIs already have
 - **Copilot:** the GitHub CLI (`gh auth login`)
 - **Claude:** Claude Code (`claude`)
 - **Codex:** the Codex CLI (`codex`)
+- **Antigravity** uses the Google Antigravity CLI (`agy`). Sign in once and check
+  that `/usage` shows your model quotas.
 
-Only services you have a paid plan with are shown. If a token expires, the widget
+Services appear when the widget finds a supported plan or quota. If a token expires, the widget
 says so; run that CLI once and it picks the new token up. Right-click > Refresh
 token does that for Claude or Codex: it runs a one-line prompt on the cheapest
 model, which uses a little of your allowance, then refreshes.
@@ -46,9 +48,13 @@ model, which uses a little of your allowance, then refreshes.
 - **Personal plans** (Claude Pro/Max, ChatGPT Plus/Pro): your 5-hour and weekly usage.
   The one you will run out of first is highlighted, the bar shows it, and the timer
   counts down to when it resets. Copilot Pro shows its monthly allowance.
+- **Antigravity** is labelled AGY and shows the 5-hour and weekly windows of its
+  busiest model group, highlighted the same way. Hover AGY to see usage and reset
+  times for each model group, or run `usage-widget usage` for the same readings as
+  JSON.
 
 Bars go green, yellow and red as you use more. Hover a service name for its plan,
-renewal date, exact reset times and additional caps. Click its name to open usage.
+renewal date, exact reset times and additional caps. Click Copilot, Claude, or Codex to open its usage page.
 
 Optional local estimates fill in the fraction between percentage ticks and show
 `~`. The widget keeps the same compact layout and widens only when decimals need
@@ -58,7 +64,7 @@ more room.
 
 - Drag it anywhere. It remembers where it was.
 - Right-click to refresh, refresh a service's token, minimize, resize, check for
-  updates, open each service's usage page, or quit.
+  updates, open available usage pages, or quit.
 - Untick a service under Show in the right-click menu to hide it. Tick it again to
   bring it back.
 - On macOS, the menu bar menu also hides and shows the widget.
@@ -87,5 +93,6 @@ Environment variables override the matching config settings:
 ## Notes
 
 The usage numbers come from the same endpoints the CLIs and web settings pages use.
-They are not officially documented and may change. Logos are from
-[Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
+Antigravity quota comes from its CLI's built-in `/usage` command. The Antigravity
+mark is from [Google](https://antigravity.google/). Other logos are from
+[Simple Icons](https://simpleicons.org) (CC0). The marks belong to their owners.

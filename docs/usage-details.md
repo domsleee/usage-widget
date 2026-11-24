@@ -12,6 +12,11 @@ opacity = 85        # window opacity, 20-100
 precision = 0       # decimal places for percentages, 0-3
 weekly_reset_date = false  # true = weekly reset as a date and time, not a countdown
 
+[header]
+clock_24h = false          # true shows "Wed 14:30" in the weekly reset date
+reset_parentheses = true   # enclose the header date or countdown in parentheses
+spacing_size = 8           # gap between header items in logical points (0–24, fractions allowed)
+
 [copilot]
 enabled = true      # false hides a service; same key under each
 
@@ -25,7 +30,15 @@ estimate = false    # estimate between percentage ticks from local logs; shown w
 [codex]
 enabled = true
 estimate = false    # as for Claude
+
+[antigravity]
+enabled = true      # read quota from agy /usage
 ```
+
+For the compact clock shown as `Wed 14:30`, set `weekly_reset_date = true` above
+the first table and set `clock_24h = true` and `reset_parentheses = false` under
+`[header]`. At three decimal places, `spacing_size = 6` leaves more room
+for the percentage. These settings apply to the expanded widget on Windows and macOS.
 
 `claude.renewal_date` uses your local calendar date and overrides browser lookup.
 Update it after each renewal; the widget does not assume a monthly billing schedule.
