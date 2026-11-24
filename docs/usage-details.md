@@ -30,9 +30,6 @@ estimate = false    # estimate between percentage ticks from local logs; shown w
 [codex]
 enabled = true
 estimate = false    # as for Claude
-
-[antigravity]
-enabled = true      # read quota from agy /usage
 ```
 
 For the compact clock shown as `Wed 14:30`, set `weekly_reset_date = true` above
