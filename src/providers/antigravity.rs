@@ -372,7 +372,10 @@ fn parse(
     let has_gemini = meters
         .iter()
         .any(|m| m.label.as_deref().is_some_and(|l| l.contains("Gemini")));
-    if !has_gemini && let Some(m) = models.and_then(|m| gemini_meter(m, now)) {
+    let plan = plan(load);
+    // The free tier's Gemini quota is its weekly window.
+    let free = plan.as_deref() == Some("Free");
+    if !has_gemini && let Some(m) = models.and_then(|m| gemini_meter(m, now, free)) {
         meters.insert(0, m);
     }
     if meters.is_empty() {
@@ -383,7 +386,7 @@ fn parse(
     }
     Ok(Usage {
         personal: true,
-        plan: plan(load),
+        plan,
         cycle: None,
         note: None,
         estimated: vec![],
@@ -393,9 +396,9 @@ fn parse(
 }
 
 /// The Gemini models share one limit, which each model's quota reports. The
-/// fullest one is the shared limit. It is the weekly window on some plans and
-/// the 5-hour window on others, so its reset time says which.
-fn gemini_meter(models: &Value, now: i64) -> Option<Meter> {
+/// fullest one is the shared limit. On paid plans it can be the 5-hour window,
+/// which its reset time shows.
+fn gemini_meter(models: &Value, now: i64, weekly: bool) -> Option<Meter> {
     models["models"]
         .as_object()?
         .values()
@@ -415,7 +418,7 @@ fn gemini_meter(models: &Value, now: i64) -> Option<Meter> {
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .and_then(|(remaining, reset)| {
             let left = reset.and_then(parse_rfc3339).map(|at| at - now);
-            let window = if left.is_some_and(|s| s <= 5 * 3600) {
+            let window = if !weekly && left.is_some_and(|s| s <= 5 * 3600) {
                 "5h"
             } else {
                 "weekly"
@@ -593,6 +596,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(usage.meters[0].label.as_deref(), Some("Gemini Models 5h"));
+        let free = parse(&load("free-tier", "Antigravity"), &summary(), Some(&m), NOW).unwrap();
+        assert_eq!(
+            free.meters[0].label.as_deref(),
+            Some("Gemini Models weekly")
+        );
     }
 
     #[test]
