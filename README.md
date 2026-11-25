@@ -33,8 +33,8 @@ There is nothing to log in to. The widget uses the logins your CLIs already have
 - **Copilot:** the GitHub CLI (`gh auth login`)
 - **Claude:** Claude Code (`claude`)
 - **Codex:** the Codex CLI (`codex`)
-- **Antigravity** uses the Google Antigravity CLI (`agy`). Sign in once and check
-  that `/usage` shows your model quotas.
+- **Antigravity:** the Google Antigravity CLI (`agy`). Sign in once; the widget reads
+  that sign-in and never runs `agy` itself.
 
 Services appear when the widget finds a supported plan or quota. If a token expires, the widget
 says so; run that CLI once and it picks the new token up. Right-click > Refresh
@@ -93,6 +93,6 @@ Environment variables override the matching config settings:
 ## Notes
 
 The usage numbers come from the same endpoints the CLIs and web settings pages use.
-Antigravity quota comes from its CLI's built-in `/usage` command. The Antigravity
+Antigravity quota comes from the endpoints behind `agy /usage`. The Antigravity
 mark is from [Google](https://antigravity.google/). Other logos are from
 [Simple Icons](https://simpleicons.org) (CC0). The marks belong to their owners.

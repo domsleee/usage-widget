@@ -2454,7 +2454,7 @@ mod lookup_tests {
             2,
             Err(FetchError {
                 problem: Problem::Service,
-                detail: "agy /usage timed out".into(),
+                detail: "request timed out".into(),
             }),
         );
         app.drain();
@@ -3188,8 +3188,9 @@ mod display_tests {
     #[test]
     fn antigravity_row_shows_both_windows_without_clipping() {
         let provider = Provider::Antigravity;
-        let at = now_unix() + 6 * 86_400;
-        let soon = now_unix() + 3600;
+        // Half a minute past the mark, so countdowns read the same when drawn.
+        let at = now_unix() + 6 * 86_400 + 30;
+        let soon = now_unix() + 3600 + 30;
         let (mut app, _, _) = App::for_test(vec![provider]);
         app.format.precision = 2;
         app.slots.insert(

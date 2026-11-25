@@ -32,7 +32,7 @@ enabled = true
 estimate = false    # as for Claude
 
 [antigravity]
-enabled = true      # read quota from agy /usage
+enabled = true      # read quota with the agy sign-in
 ```
 
 For the compact clock shown as `Wed 14:30`, set `weekly_reset_date = true` above
