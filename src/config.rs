@@ -56,6 +56,9 @@ enabled = true
 # from this machine's Codex token use (shown with "~"; it can't see Codex cloud
 # or other devices, so the decimals are a guess).
 estimate = false
+
+[antigravity]
+enabled = true
 "#;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -69,10 +72,7 @@ pub struct Config {
     pub copilot: Service,
     pub claude: Claude,
     pub codex: Codex,
-    /// Antigravity is switched off for now. Its section is still accepted so a
-    /// config written by 1.0.13 loads without an unknown-setting note.
-    #[serde(rename = "antigravity")]
-    _antigravity: Option<toml::Value>,
+    pub antigravity: Service,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
@@ -158,7 +158,7 @@ impl Default for Config {
             copilot: Service::default(),
             claude: Claude::default(),
             codex: Codex::default(),
-            _antigravity: None,
+            antigravity: Service::default(),
         }
     }
 }
@@ -187,6 +187,7 @@ impl Config {
             Provider::Copilot => self.copilot.enabled,
             Provider::Claude => self.claude.enabled,
             Provider::Codex => self.codex.enabled,
+            Provider::Antigravity => self.antigravity.enabled,
         }
     }
 
@@ -383,13 +384,6 @@ mod tests {
             toml::from_str::<Config>(TEMPLATE).unwrap(),
             Config::default()
         );
-    }
-
-    #[test]
-    fn antigravity_section_from_1_0_13_is_accepted_quietly() {
-        let (config, error) = parse("[antigravity]\nenabled = true\n[codex]\nenabled = false");
-        assert_eq!(error, None);
-        assert!(!config.codex.enabled);
     }
 
     #[test]

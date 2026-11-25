@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod antigravity;
+
 const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
 /// Copilot premium-request credits: 50,000 credits = $500.
@@ -28,21 +30,26 @@ pub enum Provider {
     Copilot,
     Claude,
     Codex,
+    Antigravity,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Self::Copilot, Self::Claude, Self::Codex];
+    pub const ALL: [Provider; 4] = [Self::Copilot, Self::Claude, Self::Codex, Self::Antigravity];
 
     pub fn name(self) -> &'static str {
         match self {
             Provider::Copilot => "Copilot",
             Provider::Claude => "Claude",
             Provider::Codex => "Codex",
+            Provider::Antigravity => "Antigravity",
         }
     }
 
     pub fn header_name(self) -> &'static str {
-        self.name()
+        match self {
+            Provider::Antigravity => self.short_name(),
+            _ => self.name(),
+        }
     }
 
     /// Three-letter tag for the minimized view.
@@ -51,6 +58,7 @@ impl Provider {
             Provider::Copilot => "COP",
             Provider::Claude => "CLD",
             Provider::Codex => "CDX",
+            Provider::Antigravity => "AGY",
         }
     }
 
@@ -59,6 +67,7 @@ impl Provider {
             Provider::Copilot => Some("https://github.com/settings/copilot/features"),
             Provider::Claude => Some("https://claude.ai/settings/usage"),
             Provider::Codex => Some("https://chatgpt.com/settings/usage?tab=overview"),
+            Provider::Antigravity => None,
         }
     }
 
@@ -74,6 +83,7 @@ impl Provider {
     pub fn refresh_token(self) -> Result<(), String> {
         match self {
             Provider::Copilot => Err("the gh token does not expire".into()),
+            Provider::Antigravity => Err("sign in with the Antigravity CLI (agy)".into()),
             Provider::Claude => refresh_claude_token(),
             Provider::Codex => {
                 // The user config is skipped so a costly default model or effort
@@ -105,6 +115,7 @@ impl Provider {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(&config.claude),
             Provider::Codex => codex(config.codex.estimate),
+            Provider::Antigravity => antigravity::fetch(),
         }
     }
 }
