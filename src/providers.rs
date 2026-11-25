@@ -45,13 +45,6 @@ impl Provider {
         }
     }
 
-    pub fn header_name(self) -> &'static str {
-        match self {
-            Provider::Antigravity => self.short_name(),
-            _ => self.name(),
-        }
-    }
-
     /// Three-letter tag for the minimized view.
     pub fn short_name(self) -> &'static str {
         match self {

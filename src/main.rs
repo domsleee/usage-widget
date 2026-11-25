@@ -558,7 +558,7 @@ impl App {
                 .filter_map(|p| {
                     let slot = self.slots.get(p)?;
                     let windows = slot.windows(*p);
-                    let mut width = 13.0 + gap + text_width(p.header_name().into(), 13.0);
+                    let mut width = 13.0 + gap + text_width(p.name().into(), 13.0);
                     if let Some(reset) = windows
                         .get(self.binding(*p).unwrap_or(0))
                         .and_then(|m| self.format.reset_label(m))
@@ -1094,10 +1094,7 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize, estimated:
 
 /// The service name opens its usage page; plan and renewal details stay on hover.
 fn name_link(ui: &mut egui::Ui, p: Provider) -> egui::Response {
-    let name = RichText::new(p.header_name())
-        .size(13.0)
-        .strong()
-        .color(TEXT);
+    let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
     let Some(url) = p.usage_url() else {
         return ui.label(name);
     };
@@ -3288,7 +3285,7 @@ mod display_tests {
             assert_eq!(
                 labels.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
                 [
-                    "AGY",
+                    "Antigravity",
                     &format!("({reset})"),
                     session_pct,
                     "5h",
