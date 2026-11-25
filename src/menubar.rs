@@ -26,7 +26,14 @@ pub struct MenuBar {
     _tray: TrayIcon,
     toggle: MenuItem,
     actions: Vec<(MenuId, Action)>,
+    refresh_menu: Submenu,
+    refresh_all: MenuItem,
+    refresh_items: Vec<(Provider, MenuItem)>,
+    show_menu: Submenu,
     services: Vec<(Provider, CheckMenuItem)>,
+    usage_menu: Submenu,
+    usage_items: Vec<(Provider, MenuItem)>,
+    last_services: RefCell<Option<(Vec<Provider>, Vec<Provider>)>>,
     rx: Receiver<MenuId>,
     /// The items of the last right-click popup. AppKit delivers a choice after
     /// the popup has closed, so it arrives with the menu bar's clicks.
@@ -36,49 +43,51 @@ pub struct MenuBar {
 impl MenuBar {
     pub fn new(ctx: &egui::Context, providers: &[Provider]) -> Result<Self, String> {
         let toggle = MenuItem::new("Hide widget", true, None);
-        let refresh = MenuItem::new("Refresh now", true, None);
-        let opens: Vec<(MenuItem, &str)> = providers
+        let refresh_all = MenuItem::new("All", true, None);
+        let refresh_items: Vec<_> = providers
             .iter()
-            .filter_map(|&p| {
-                let url = p.usage_url()?;
-                Some((
-                    MenuItem::new(format!("Open {} usage", p.name()), true, None),
-                    url,
-                ))
-            })
+            .map(|&p| (p, MenuItem::new(p.name(), true, None)))
             .collect();
-        let edit = MenuItem::new("Edit config", true, None);
+        let refresh_menu = Submenu::new("Refresh", true);
+        refresh_menu
+            .append(&refresh_all)
+            .map_err(|e| e.to_string())?;
+
         let services: Vec<_> = providers
             .iter()
-            .map(|&p| (p, CheckMenuItem::new(p.name(), false, true, None)))
+            .map(|&p| (p, CheckMenuItem::new(p.name(), true, false, None)))
             .collect();
-        let show = Submenu::new("Show", true);
-        for (_, item) in &services {
-            show.append(item).map_err(|e| e.to_string())?;
-        }
+        let show_menu = Submenu::new("Show", false);
+
+        let usage_items: Vec<_> = providers
+            .iter()
+            .filter_map(|&p| {
+                p.usage_url()?;
+                Some((p, MenuItem::new(p.name(), true, None)))
+            })
+            .collect();
+        let usage_menu = Submenu::new("View usage", false);
+
         let updates = MenuItem::new("Check for updates", true, None);
+        let edit = MenuItem::new("Edit config", true, None);
         let quit = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
         let append =
             |item: &dyn tray_icon::menu::IsMenuItem| menu.append(item).map_err(|e| e.to_string());
         append(&toggle)?;
-        append(&refresh)?;
-        append(&show)?;
+        append(&refresh_menu)?;
         append(&PredefinedMenuItem::separator())?;
-        for (item, _) in &opens {
-            append(item)?;
-        }
-        if !opens.is_empty() {
-            append(&PredefinedMenuItem::separator())?;
-        }
+        append(&show_menu)?;
+        append(&usage_menu)?;
+        append(&PredefinedMenuItem::separator())?;
         append(&updates)?;
         append(&edit)?;
         append(&quit)?;
 
         let mut actions = vec![
             (toggle.id().clone(), Action::ToggleWidget),
-            (refresh.id().clone(), Action::Refresh),
+            (refresh_all.id().clone(), Action::Refresh),
             (
                 updates.id().clone(),
                 Action::Widget(MenuAction::CheckForUpdates),
@@ -86,16 +95,21 @@ impl MenuBar {
             (edit.id().clone(), Action::EditConfig),
             (quit.id().clone(), Action::Quit),
         ];
-        actions.extend(
-            opens
-                .iter()
-                .map(|(item, url)| (item.id().clone(), Action::Open(url))),
-        );
+        actions.extend(refresh_items.iter().map(|(p, item)| {
+            (
+                item.id().clone(),
+                Action::Widget(MenuAction::RefreshProvider(*p)),
+            )
+        }));
         actions.extend(
             services
                 .iter()
                 .map(|(p, item)| (item.id().clone(), Action::Widget(MenuAction::Toggle(*p)))),
         );
+        actions.extend(usage_items.iter().filter_map(|(p, item)| {
+            let url = p.usage_url()?;
+            Some((item.id().clone(), Action::Open(url)))
+        }));
 
         // Clicks arrive on the main thread; wake the UI so it acts on them straight
         // away, even while the widget is hidden.
@@ -117,7 +131,14 @@ impl MenuBar {
             _tray: tray,
             toggle,
             actions,
+            refresh_menu,
+            refresh_all,
+            refresh_items,
+            show_menu,
             services,
+            usage_menu,
+            usage_items,
+            last_services: RefCell::default(),
             rx,
             popup_actions: RefCell::default(),
         })
@@ -149,50 +170,44 @@ impl MenuBar {
     pub unsafe fn popup(
         &self,
         ns_view: *const std::ffi::c_void,
-        providers: &[Provider],
+        available: &[Provider],
         shown: &[Provider],
         zoom: f32,
-        refresh_mins: u64,
         minimized: bool,
     ) {
         let mut actions = Vec::new();
-        let mut item = |text: &str, action: Option<MenuAction>| {
-            let item = MenuItem::new(text, action.is_some(), None);
-            if let Some(action) = action {
-                actions.push((item.id().clone(), action));
-            }
+        let add_item = |actions: &mut Vec<(MenuId, MenuAction)>, text: &str, action: MenuAction| {
+            let item = MenuItem::new(text, true, None);
+            actions.push((item.id().clone(), action));
             item
         };
-        let refresh = item("Refresh now", Some(MenuAction::Refresh));
-        let minimize = item(
+        let refresh = Submenu::new("Refresh", true);
+        let refresh_all = add_item(&mut actions, "All", MenuAction::Refresh);
+        let _ = refresh.append(&refresh_all);
+        if !shown.is_empty() {
+            let _ = refresh.append(&PredefinedMenuItem::separator());
+            for &p in shown {
+                let entry = add_item(&mut actions, p.name(), MenuAction::RefreshProvider(p));
+                let _ = refresh.append(&entry);
+            }
+        }
+        let minimize = add_item(
+            &mut actions,
             crate::minimize_label(minimized),
-            Some(MenuAction::ToggleMinimized),
+            MenuAction::ToggleMinimized,
         );
-        let opens: Vec<MenuItem> = providers
-            .iter()
-            .filter_map(|&p| {
-                let url = p.usage_url()?;
-                Some(item(
-                    &format!("Open {} usage", p.name()),
-                    Some(MenuAction::Open(url)),
-                ))
-            })
-            .collect();
-        let note = item(&format!("Refreshes every {refresh_mins} min"), None);
-        let updates = item("Check for updates", Some(MenuAction::CheckForUpdates));
-        let edit = item("Edit config", Some(MenuAction::EditConfig));
-        let quit = item("Quit", Some(MenuAction::Quit));
         let show = Submenu::new("Show", true);
-        for &p in providers {
+        for &p in available {
             let check = CheckMenuItem::new(p.name(), true, shown.contains(&p), None);
             actions.push((check.id().clone(), MenuAction::Toggle(p)));
             let _ = show.append(&check);
         }
-        let tokens = Submenu::new("Refresh token", true);
-        for &p in providers.iter().filter(|p| p.refreshes_token()) {
-            let token = MenuItem::new(p.name(), true, None);
-            actions.push((token.id().clone(), MenuAction::RefreshToken(p)));
-            let _ = tokens.append(&token);
+        let usage = Submenu::new("View usage", true);
+        let mut has_usage = false;
+        for (p, url) in shown.iter().filter_map(|&p| Some((p, p.usage_url()?))) {
+            let open = add_item(&mut actions, p.name(), MenuAction::Open(url));
+            let _ = usage.append(&open);
+            has_usage = true;
         }
         let sizes = Submenu::new("Size", true);
         for z in SIZES {
@@ -205,24 +220,27 @@ impl MenuBar {
             actions.push((size.id().clone(), MenuAction::Size(z)));
             let _ = sizes.append(&size);
         }
+        let updates = add_item(
+            &mut actions,
+            "Check for updates",
+            MenuAction::CheckForUpdates,
+        );
+        let edit = add_item(&mut actions, "Edit config", MenuAction::EditConfig);
+        let quit = add_item(&mut actions, "Quit", MenuAction::Quit);
 
         let menu = Menu::new();
         let separator = PredefinedMenuItem::separator;
-        let _ = menu.append(&refresh);
-        if providers.iter().any(|p| p.refreshes_token()) {
-            let _ = menu.append(&tokens);
+        let _ = menu.append_items(&[&refresh, &minimize, &separator()]);
+        if !available.is_empty() {
+            let _ = menu.append(&show);
         }
-        let _ = menu.append_items(&[&minimize, &separator()]);
-        if !providers.is_empty() {
-            let _ = menu.append_items(&[&show, &separator()]);
+        if has_usage {
+            let _ = menu.append(&usage);
         }
-        for open in &opens {
-            let _ = menu.append(open);
-        }
-        if !opens.is_empty() {
+        if !available.is_empty() || has_usage {
             let _ = menu.append(&separator());
         }
-        let _ = menu.append_items(&[&sizes, &separator(), &note, &updates, &edit, &quit]);
+        let _ = menu.append_items(&[&sizes, &updates, &separator(), &edit, &quit]);
 
         *self.popup_actions.borrow_mut() = actions;
         // SAFETY: upheld by the caller.
@@ -234,11 +252,47 @@ impl MenuBar {
             .set_text(if shown { "Hide widget" } else { "Show widget" });
     }
 
-    pub fn set_services(&self, found: &[Provider], shown: &[Provider]) {
-        for (p, item) in &self.services {
-            item.set_enabled(found.contains(p));
-            item.set_checked(shown.contains(p));
+    pub fn set_services(&self, available: &[Provider], shown: &[Provider]) {
+        let mut last = self.last_services.borrow_mut();
+        if last
+            .as_ref()
+            .is_some_and(|(a, s)| a.as_slice() == available && s.as_slice() == shown)
+        {
+            return;
         }
+        *last = Some((available.to_vec(), shown.to_vec()));
+
+        while self.refresh_menu.remove_at(0).is_some() {}
+        let _ = self.refresh_menu.append(&self.refresh_all);
+        let mut has_refresh = false;
+        for (p, item) in &self.refresh_items {
+            if shown.contains(p) {
+                if !has_refresh {
+                    let _ = self.refresh_menu.append(&PredefinedMenuItem::separator());
+                    has_refresh = true;
+                }
+                let _ = self.refresh_menu.append(item);
+            }
+        }
+
+        while self.show_menu.remove_at(0).is_some() {}
+        for (p, item) in &self.services {
+            item.set_checked(shown.contains(p));
+            if available.contains(p) {
+                let _ = self.show_menu.append(item);
+            }
+        }
+        self.show_menu.set_enabled(!available.is_empty());
+
+        while self.usage_menu.remove_at(0).is_some() {}
+        let mut has_usage = false;
+        for (p, item) in &self.usage_items {
+            if shown.contains(p) {
+                let _ = self.usage_menu.append(item);
+                has_usage = true;
+            }
+        }
+        self.usage_menu.set_enabled(has_usage);
     }
 }
 

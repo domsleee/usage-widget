@@ -43,6 +43,7 @@ const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
 const RATIOS_KEY: &str = "ratios";
 const HIDDEN_KEY: &str = "hidden";
+const SHOWN_KEY: &str = "shown";
 const SWITCH_SECS: f32 = 0.35;
 const FADE: f32 = 0.65;
 /// Size presets in the right-click menu, applied as egui's zoom factor on top of
@@ -60,6 +61,12 @@ const TRACK: Color32 = Color32::from_gray(58);
 const ERR: Color32 = Color32::from_rgb(235, 110, 110);
 /// Background of a hover card, a step lighter than the widget so it reads as raised.
 const CARD: Color32 = Color32::from_rgb(38, 41, 50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshRequest {
+    All,
+    One(Provider),
+}
 
 struct Update {
     provider: Provider,
@@ -91,6 +98,18 @@ impl Slot {
         !absent && (self.meters.is_some() || self.error.is_some())
     }
 
+    /// True when Antigravity has no usable login yet (missing, expired, or
+    /// rejected, with no prior quota reading).
+    fn antigravity_unauthenticated(&self) -> bool {
+        self.meters.is_none()
+            && self.error.as_ref().is_none_or(|e| {
+                matches!(
+                    e.problem,
+                    Problem::NotAvailable | Problem::TokenExpired | Problem::TokenRejected
+                )
+            })
+    }
+
     /// Primary windows share the header; scoped caps and spend stay in the tooltip.
     fn windows(&self, provider: Provider) -> Vec<&Meter> {
         if !self.personal {
@@ -120,8 +139,7 @@ struct App {
     providers: Vec<Provider>,
     slots: HashMap<Provider, Slot>,
     rx: Receiver<Update>,
-    refresh_tx: Sender<()>,
-    interval: Duration,
+    refresh_tx: Sender<RefreshRequest>,
     /// False until the window has been placed on screen and made topmost (see `settle_window`).
     settled: bool,
     /// Compact single-line view. Persisted, so the widget reopens the way it was left.
@@ -129,6 +147,9 @@ struct App {
     logos: HashMap<Provider, egui::TextureHandle>,
     ratios: HashMap<String, limits::Ratio>,
     hidden: HashSet<String>,
+    /// Providers explicitly ticked in Show even when hidden by default (such as
+    /// Antigravity with no valid login).
+    force_shown: HashSet<String>,
     restart: Arc<AtomicBool>,
     /// Services whose token is being refreshed, so a second click does not
     /// start another run.
@@ -151,7 +172,6 @@ impl App {
             .into_iter()
             .filter(|p| config.enabled(*p))
             .collect();
-        let interval = config.refresh_interval();
         let opacity = std::env::var("USAGE_WIDGET_OPACITY")
             .ok()
             .and_then(|v| v.trim().parse().ok())
@@ -184,6 +204,10 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, HIDDEN_KEY))
             .unwrap_or_default();
+        let force_shown = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, SHOWN_KEY))
+            .unwrap_or_default();
 
         let slots = providers
             .iter()
@@ -205,12 +229,12 @@ impl App {
             slots,
             rx,
             refresh_tx,
-            interval,
             settled: false,
             minimized,
             logos: load_logos(&cc.egui_ctx),
             ratios,
             hidden,
+            force_shown,
             restart,
             refreshing: Arc::default(),
             opacity,
@@ -228,7 +252,7 @@ impl App {
 
     /// An App with no window and no menu bar, plus the far ends of its channels.
     #[cfg(test)]
-    fn for_test(providers: Vec<Provider>) -> (Self, Sender<Update>, Receiver<()>) {
+    fn for_test(providers: Vec<Provider>) -> (Self, Sender<Update>, Receiver<RefreshRequest>) {
         let (updates, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
         let slots = providers.iter().map(|p| (*p, Slot::default())).collect();
@@ -237,9 +261,9 @@ impl App {
             slots,
             rx,
             refresh_tx,
-            interval: Duration::from_secs(300),
             ratios: HashMap::new(),
             hidden: HashSet::new(),
+            force_shown: HashSet::new(),
             restart: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::default(),
             opacity: 100,
@@ -286,11 +310,23 @@ impl App {
         for slot in self.slots.values_mut() {
             slot.loading = true;
         }
-        let _ = self.refresh_tx.send(());
+        let _ = self.refresh_tx.send(RefreshRequest::All);
+    }
+
+    /// Refreshes a single service; runs its CLI token refresh first when supported.
+    fn refresh_provider(&mut self, p: Provider) {
+        if p.refreshes_token() {
+            self.refresh_token(p);
+        } else {
+            if let Some(slot) = self.slots.get_mut(&p) {
+                slot.loading = true;
+            }
+            let _ = self.refresh_tx.send(RefreshRequest::One(p));
+        }
     }
 
     /// Has the service's CLI refresh its token in the background, then refreshes
-    /// every service, reporting a failed refresh.
+    /// that service, reporting a failed refresh.
     fn refresh_token(&mut self, p: Provider) {
         let refreshing = self.refreshing.clone();
         if !refreshing
@@ -300,7 +336,7 @@ impl App {
         {
             return;
         }
-        for slot in self.slots.values_mut() {
+        if let Some(slot) = self.slots.get_mut(&p) {
             slot.loading = true;
         }
         let refresh_tx = self.refresh_tx.clone();
@@ -310,7 +346,7 @@ impl App {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&p);
-            let _ = refresh_tx.send(());
+            let _ = refresh_tx.send(RefreshRequest::One(p));
             if let Err(e) = result {
                 message_box(
                     &format!("Could not refresh the {} token: {e}", p.name()),
@@ -362,7 +398,7 @@ impl App {
     fn apply_action(&mut self, action: MenuAction, ctx: &egui::Context) {
         match action {
             MenuAction::Refresh => self.refresh_now(),
-            MenuAction::RefreshToken(p) => self.refresh_token(p),
+            MenuAction::RefreshProvider(p) => self.refresh_provider(p),
             MenuAction::ToggleMinimized => self.minimized = !self.minimized,
             MenuAction::Open(url) => open_url(url),
             MenuAction::Toggle(p) => self.toggle(p),
@@ -492,21 +528,52 @@ impl App {
         Some(limits::binding(five_hour, week, k))
     }
 
-    /// The services the account has, in display order. These are listed in the
-    /// menu, ticked or not.
+    /// Services with an active account or reading, in display order.
     fn found(&self) -> Vec<Provider> {
         self.providers
             .iter()
             .copied()
-            .filter(|p| self.slots.get(p).is_some_and(Slot::visible))
+            .filter(|p| {
+                self.slots.get(p).is_some_and(|s| {
+                    s.visible() && (*p != Provider::Antigravity || !s.antigravity_unauthenticated())
+                })
+            })
             .collect()
     }
 
-    /// The found services the user has not unticked.
+    /// Services listed under Show: every found service, plus Antigravity once
+    /// checked so it can be toggled on even without a valid login.
+    fn available(&self) -> Vec<Provider> {
+        self.providers
+            .iter()
+            .copied()
+            .filter(|p| {
+                self.slots.get(p).is_some_and(|s| {
+                    s.visible()
+                        || (*p == Provider::Antigravity
+                            && (s.updated.is_some() || s.error.is_some()))
+                })
+            })
+            .collect()
+    }
+
+    /// Services currently visible in the widget.
     fn shown(&self) -> Vec<Provider> {
-        let mut found = self.found();
-        found.retain(|p| !self.hidden.contains(p.name()));
-        found
+        self.available()
+            .into_iter()
+            .filter(|&p| self.is_shown(p))
+            .collect()
+    }
+
+    fn is_shown(&self, p: Provider) -> bool {
+        let Some(slot) = self.slots.get(&p) else {
+            return false;
+        };
+        if p == Provider::Antigravity && slot.antigravity_unauthenticated() {
+            (slot.updated.is_some() || slot.error.is_some()) && self.force_shown.contains(p.name())
+        } else {
+            slot.visible() && !self.hidden.contains(p.name())
+        }
     }
 
     /// What the widget says when it has no service to show, in the full and the
@@ -530,8 +597,21 @@ impl App {
     }
 
     fn toggle(&mut self, p: Provider) {
-        if !self.hidden.remove(p.name()) {
-            self.hidden.insert(p.name().to_string());
+        let antigravity_unauth = p == Provider::Antigravity
+            && self
+                .slots
+                .get(&p)
+                .is_some_and(Slot::antigravity_unauthenticated);
+        if antigravity_unauth {
+            if !self.force_shown.remove(p.name()) {
+                self.hidden.remove(p.name());
+                self.force_shown.insert(p.name().to_string());
+            }
+        } else {
+            self.force_shown.remove(p.name());
+            if !self.hidden.remove(p.name()) {
+                self.hidden.insert(p.name().to_string());
+            }
         }
     }
 
@@ -633,47 +713,89 @@ impl App {
     }
 }
 
+/// Resolves an initial wake-up and any queued refresh requests into the
+/// providers to fetch and whether the periodic refresh timer should reset.
+fn collect_refresh_targets(
+    first: RefreshRequest,
+    queued: impl IntoIterator<Item = RefreshRequest>,
+    providers: &[Provider],
+) -> (Vec<Provider>, bool) {
+    let mut all = false;
+    let mut selected = Vec::new();
+    for req in std::iter::once(first).chain(queued) {
+        match req {
+            RefreshRequest::All => all = true,
+            RefreshRequest::One(p) if providers.contains(&p) && !selected.contains(&p) => {
+                selected.push(p);
+            }
+            RefreshRequest::One(_) => {}
+        }
+    }
+    if all {
+        (providers.to_vec(), true)
+    } else {
+        (selected, false)
+    }
+}
+
 fn spawn_worker(
     ctx: egui::Context,
     tx: Sender<Update>,
-    refresh_rx: Receiver<()>,
+    refresh_rx: Receiver<RefreshRequest>,
     providers: Vec<Provider>,
     config: Config,
 ) {
     let interval = config.refresh_interval();
     std::thread::spawn(move || {
         let mut config = config;
+        let mut targets = providers.clone();
+        let mut full_refresh = true;
+        let mut next_auto = std::time::Instant::now() + interval;
         loop {
-            let started = std::time::Instant::now();
-            // The browser helper updates this setting while the widget is open.
-            // A broken file loads as defaults, without a date; a warning such as
-            // an unknown key still has the real one.
-            let (latest, error) = config::load();
-            if error.is_none() || latest.claude.renewal_date.is_some() {
-                config.claude.renewal_date = latest.claude.renewal_date;
-            }
-            std::thread::scope(|s| {
-                for &p in &providers {
-                    let tx = tx.clone();
-                    let ctx = ctx.clone();
-                    let config = &config;
-                    s.spawn(move || {
-                        let result = p.fetch(config);
-                        let _ = tx.send(Update {
-                            provider: p,
-                            result,
-                            at: now_unix(),
-                            started,
-                        });
-                        ctx.request_repaint();
-                    });
+            if !targets.is_empty() {
+                let started = std::time::Instant::now();
+                // The browser helper updates this setting while the widget is open.
+                // A broken file loads as defaults, without a date; a warning such as
+                // an unknown key still has the real one.
+                if targets.contains(&Provider::Claude) {
+                    let (latest, error) = config::load();
+                    if error.is_none() || latest.claude.renewal_date.is_some() {
+                        config.claude.renewal_date = latest.claude.renewal_date;
+                    }
                 }
-            });
-            match refresh_rx.recv_timeout(interval) {
-                Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                std::thread::scope(|s| {
+                    for &p in &targets {
+                        let tx = tx.clone();
+                        let ctx = ctx.clone();
+                        let config = &config;
+                        s.spawn(move || {
+                            let result = p.fetch(config);
+                            let _ = tx.send(Update {
+                                provider: p,
+                                result,
+                                at: now_unix(),
+                                started,
+                            });
+                            ctx.request_repaint();
+                        });
+                    }
+                });
+            }
+            if full_refresh {
+                next_auto = std::time::Instant::now() + interval;
+            }
+            let wait = next_auto.saturating_duration_since(std::time::Instant::now());
+            match refresh_rx.recv_timeout(wait) {
+                Ok(first) => {
+                    let queued = std::iter::from_fn(|| refresh_rx.try_recv().ok());
+                    (targets, full_refresh) = collect_refresh_targets(first, queued, &providers);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    targets = providers.clone();
+                    full_refresh = true;
+                }
                 Err(RecvTimeoutError::Disconnected) => return,
             }
-            while refresh_rx.try_recv().is_ok() {}
         }
     });
 }
@@ -1473,7 +1595,12 @@ fn provider_block(
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if let Some(error) = &slot.error {
-                ui.label(RichText::new(error.problem.label()).size(12.0).color(ERR))
+                let color = if error.problem == Problem::NotAvailable {
+                    MUTED
+                } else {
+                    ERR
+                };
+                ui.label(RichText::new(error.problem.label()).size(12.0).color(color))
                     .on_hover_text(&error.detail);
             }
             if !personal.is_empty() {
@@ -1601,10 +1728,10 @@ impl RenewalButton<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum MenuAction {
     Refresh,
-    RefreshToken(Provider),
+    RefreshProvider(Provider),
     ToggleMinimized,
     Open(&'static str),
     Toggle(Provider),
@@ -1618,23 +1745,27 @@ fn minimize_label(minimized: bool) -> &'static str {
     if minimized { "Maximize" } else { "Minimize" }
 }
 
-/// Shows the right-click menu as a native popup at the cursor and blocks until
-/// it is dismissed. Unlike an egui menu it is not clipped to the window.
 #[cfg(windows)]
-fn native_menu(
-    frame: &eframe::Frame,
-    found: &[Provider],
-    shown: &[Provider],
-    zoom: f32,
-    refresh_mins: u64,
-    minimized: bool,
-) -> Option<MenuAction> {
+mod win_menu {
+    use super::{MenuAction, Provider, SIZES, minimize_label, update, wide};
+
+    pub(super) const ID_REFRESH: usize = 1;
+    pub(super) const ID_QUIT: usize = 2;
+    pub(super) const ID_MINIMIZE: usize = 3;
+    pub(super) const ID_UPDATE: usize = 4;
+    pub(super) const ID_EDIT_CONFIG: usize = 5;
+    pub(super) const ID_OPEN: usize = 10;
+    pub(super) const ID_TOGGLE: usize = 20;
+    pub(super) const ID_REFRESH_PROVIDER: usize = 30;
+    pub(super) const ID_SIZE: usize = 100;
+
     #[repr(C)]
     #[derive(Default)]
     struct Point {
         x: i32,
         y: i32,
     }
+
     #[link(name = "user32")]
     unsafe extern "system" {
         fn CreatePopupMenu() -> isize;
@@ -1648,11 +1779,12 @@ fn native_menu(
             hwnd: isize,
             rect: *const core::ffi::c_void,
         ) -> i32;
-        fn DestroyMenu(menu: isize) -> i32;
+        pub(super) fn DestroyMenu(menu: isize) -> i32;
         fn GetCursorPos(point: *mut Point) -> i32;
         fn SetForegroundWindow(hwnd: isize) -> i32;
         fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
     }
+
     const MF_STRING: u32 = 0x0;
     const MF_GRAYED: u32 = 0x1;
     const MF_CHECKED: u32 = 0x8;
@@ -1661,100 +1793,81 @@ fn native_menu(
     const TPM_RIGHTBUTTON: u32 = 0x2;
     const TPM_RETURNCMD: u32 = 0x100;
     const WM_NULL: u32 = 0;
-    const ID_REFRESH: usize = 1;
-    const ID_QUIT: usize = 2;
-    const ID_MINIMIZE: usize = 3;
-    const ID_UPDATE: usize = 4;
-    const ID_EDIT_CONFIG: usize = 5;
-    const ID_OPEN: usize = 10;
-    const ID_TOGGLE: usize = 20;
-    const ID_TOKEN: usize = 30;
-    const ID_SIZE: usize = 100;
 
-    let hwnd = hwnd(frame)?;
-    unsafe {
-        let add = |menu: isize, flags: u32, id: usize, text: &str| {
-            AppendMenuW(menu, flags, id, wide(text).as_ptr());
-        };
-        let menu = CreatePopupMenu();
-        add(menu, MF_STRING, ID_REFRESH, "Refresh now");
-        if found.iter().any(|p| p.refreshes_token()) {
-            // Owned by `menu` once appended, so destroyed along with it.
-            let tokens = CreatePopupMenu();
-            for (i, p) in Provider::ALL.iter().enumerate() {
-                if found.contains(p) && p.refreshes_token() {
-                    add(tokens, MF_STRING, ID_TOKEN + i, p.name());
+    pub(super) unsafe fn build(
+        available: &[Provider],
+        shown: &[Provider],
+        zoom: f32,
+        minimized: bool,
+    ) -> isize {
+        unsafe {
+            let add = |menu: isize, flags: u32, id: usize, text: &str| {
+                AppendMenuW(menu, flags, id, wide(text).as_ptr());
+            };
+            let menu = CreatePopupMenu();
+            // Submenus are owned by `menu` once appended, so destroyed along with it.
+            let refresh = CreatePopupMenu();
+            add(refresh, MF_STRING, ID_REFRESH, "All");
+            if !shown.is_empty() {
+                add(refresh, MF_SEPARATOR, 0, "");
+                for (i, p) in Provider::ALL.iter().enumerate() {
+                    if shown.contains(p) {
+                        add(refresh, MF_STRING, ID_REFRESH_PROVIDER + i, p.name());
+                    }
                 }
             }
-            add(menu, MF_POPUP, tokens as usize, "Refresh token");
-        }
-        add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
-        add(menu, MF_SEPARATOR, 0, "");
-        if !found.is_empty() {
-            add(menu, MF_STRING | MF_GRAYED, 0, "Show");
-            for (i, p) in Provider::ALL.iter().enumerate() {
-                if found.contains(p) {
-                    let checked = if shown.contains(p) { MF_CHECKED } else { 0 };
-                    add(menu, MF_STRING | checked, ID_TOGGLE + i, p.name());
-                }
-            }
+            add(menu, MF_POPUP, refresh as usize, "Refresh");
+            add(menu, MF_STRING, ID_MINIMIZE, minimize_label(minimized));
             add(menu, MF_SEPARATOR, 0, "");
-        }
-        for (i, p) in Provider::ALL.iter().enumerate() {
-            if found.contains(p) && p.usage_url().is_some() {
+            if !available.is_empty() {
+                let show = CreatePopupMenu();
+                for (i, p) in Provider::ALL.iter().enumerate() {
+                    if available.contains(p) {
+                        let checked = if shown.contains(p) { MF_CHECKED } else { 0 };
+                        add(show, MF_STRING | checked, ID_TOGGLE + i, p.name());
+                    }
+                }
+                add(menu, MF_POPUP, show as usize, "Show");
+            }
+            let has_usage = shown.iter().any(|p| p.usage_url().is_some());
+            if has_usage {
+                let usage = CreatePopupMenu();
+                for (i, p) in Provider::ALL.iter().enumerate() {
+                    if shown.contains(p) && p.usage_url().is_some() {
+                        add(usage, MF_STRING, ID_OPEN + i, p.name());
+                    }
+                }
+                add(menu, MF_POPUP, usage as usize, "View usage");
+            }
+            if !available.is_empty() || has_usage {
+                add(menu, MF_SEPARATOR, 0, "");
+            }
+            let sizes = CreatePopupMenu();
+            for (i, z) in SIZES.iter().enumerate() {
+                let checked = if (zoom - z).abs() < 0.01 {
+                    MF_CHECKED
+                } else {
+                    0
+                };
                 add(
-                    menu,
-                    MF_STRING,
-                    ID_OPEN + i,
-                    &format!("Open {} usage", p.name()),
+                    sizes,
+                    MF_STRING | checked,
+                    ID_SIZE + i,
+                    &format!("{:.0}%", z * 100.0),
                 );
             }
-        }
-        if found.iter().any(|p| p.usage_url().is_some()) {
+            add(menu, MF_POPUP, sizes as usize, "Size");
+            add(menu, MF_STRING, ID_UPDATE, "Check for updates");
             add(menu, MF_SEPARATOR, 0, "");
+            let version = format!("Version {}", update::CURRENT);
+            add(menu, MF_STRING | MF_GRAYED, 0, &version);
+            add(menu, MF_STRING, ID_EDIT_CONFIG, "Edit config");
+            add(menu, MF_STRING, ID_QUIT, "Quit");
+            menu
         }
-        // Owned by `menu` once appended, so destroyed along with it.
-        let sizes = CreatePopupMenu();
-        for (i, z) in SIZES.iter().enumerate() {
-            let checked = if (zoom - z).abs() < 0.01 {
-                MF_CHECKED
-            } else {
-                0
-            };
-            add(
-                sizes,
-                MF_STRING | checked,
-                ID_SIZE + i,
-                &format!("{:.0}%", z * 100.0),
-            );
-        }
-        add(menu, MF_POPUP, sizes as usize, "Size");
-        add(menu, MF_STRING, ID_UPDATE, "Check for updates");
-        add(menu, MF_SEPARATOR, 0, "");
-        let note = format!("Refreshes every {refresh_mins} min");
-        add(menu, MF_STRING | MF_GRAYED, 0, &note);
-        let version = format!("Version {}", update::CURRENT);
-        add(menu, MF_STRING | MF_GRAYED, 0, &version);
-        add(menu, MF_STRING, ID_EDIT_CONFIG, "Edit config");
-        add(menu, MF_STRING, ID_QUIT, "Quit");
+    }
 
-        let mut pt = Point::default();
-        GetCursorPos(&mut pt);
-        // Without these two calls the menu does not close when clicking elsewhere
-        // (see the TrackPopupMenu remarks).
-        SetForegroundWindow(hwnd);
-        let id = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            pt.x,
-            pt.y,
-            0,
-            hwnd,
-            std::ptr::null(),
-        ) as usize;
-        PostMessageW(hwnd, WM_NULL, 0, 0);
-        DestroyMenu(menu);
-
+    pub(super) fn action(id: usize) -> Option<MenuAction> {
         match id {
             ID_REFRESH => Some(MenuAction::Refresh),
             ID_MINIMIZE => Some(MenuAction::ToggleMinimized),
@@ -1768,8 +1881,10 @@ fn native_menu(
             _ if (ID_TOGGLE..ID_TOGGLE + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Toggle(Provider::ALL[id - ID_TOGGLE]))
             }
-            _ if (ID_TOKEN..ID_TOKEN + Provider::ALL.len()).contains(&id) => {
-                Some(MenuAction::RefreshToken(Provider::ALL[id - ID_TOKEN]))
+            _ if (ID_REFRESH_PROVIDER..ID_REFRESH_PROVIDER + Provider::ALL.len()).contains(&id) => {
+                Some(MenuAction::RefreshProvider(
+                    Provider::ALL[id - ID_REFRESH_PROVIDER],
+                ))
             }
             _ if (ID_SIZE..ID_SIZE + SIZES.len()).contains(&id) => {
                 Some(MenuAction::Size(SIZES[id - ID_SIZE]))
@@ -1777,50 +1892,98 @@ fn native_menu(
             _ => None,
         }
     }
+
+    pub(super) fn show(
+        hwnd: isize,
+        available: &[Provider],
+        shown: &[Provider],
+        zoom: f32,
+        minimized: bool,
+    ) -> Option<MenuAction> {
+        unsafe {
+            let menu = build(available, shown, zoom, minimized);
+            let mut pt = Point::default();
+            GetCursorPos(&mut pt);
+            // Without these two calls the menu does not close when clicking elsewhere
+            // (see the TrackPopupMenu remarks).
+            SetForegroundWindow(hwnd);
+            let id = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                pt.x,
+                pt.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            ) as usize;
+            PostMessageW(hwnd, WM_NULL, 0, 0);
+            DestroyMenu(menu);
+            action(id)
+        }
+    }
 }
 
-#[cfg(not(windows))]
-fn egui_menu(
-    ui: &mut egui::Ui,
-    found: &[Provider],
+/// Shows the right-click menu as a native popup at the cursor and blocks until
+/// it is dismissed. Unlike an egui menu it is not clipped to the window.
+#[cfg(windows)]
+fn native_menu(
+    frame: &eframe::Frame,
+    available: &[Provider],
     shown: &[Provider],
     zoom: f32,
-    refresh_mins: u64,
+    minimized: bool,
+) -> Option<MenuAction> {
+    let hwnd = hwnd(frame)?;
+    win_menu::show(hwnd, available, shown, zoom, minimized)
+}
+
+#[cfg(any(not(windows), test))]
+fn egui_menu(
+    ui: &mut egui::Ui,
+    available: &[Provider],
+    shown: &[Provider],
+    zoom: f32,
     minimized: bool,
 ) -> Option<MenuAction> {
     let mut action = None;
-    if ui.button("Refresh now").clicked() {
-        action = Some(MenuAction::Refresh);
-    }
-    if found.iter().any(|p| p.refreshes_token()) {
-        ui.menu_button("Refresh token", |ui| {
-            for &p in found.iter().filter(|p| p.refreshes_token()) {
+    ui.menu_button("Refresh", |ui| {
+        if ui.button("All").clicked() {
+            action = Some(MenuAction::Refresh);
+        }
+        if !shown.is_empty() {
+            ui.separator();
+            for &p in shown {
                 if ui.button(p.name()).clicked() {
-                    action = Some(MenuAction::RefreshToken(p));
+                    action = Some(MenuAction::RefreshProvider(p));
                 }
             }
-        });
-    }
+        }
+    });
     if ui.button(minimize_label(minimized)).clicked() {
         action = Some(MenuAction::ToggleMinimized);
     }
     ui.separator();
-    if !found.is_empty() {
-        ui.label(RichText::new("show").size(10.0).color(MUTED));
-        for &p in found {
-            let mut checked = shown.contains(&p);
-            if ui.checkbox(&mut checked, p.name()).clicked() {
-                action = Some(MenuAction::Toggle(p));
+    if !available.is_empty() {
+        ui.menu_button("Show", |ui| {
+            for &p in available {
+                let mut checked = shown.contains(&p);
+                if ui.checkbox(&mut checked, p.name()).clicked() {
+                    action = Some(MenuAction::Toggle(p));
+                }
             }
-        }
-        ui.separator();
+        });
     }
-    for (p, url) in found.iter().filter_map(|p| Some((p, p.usage_url()?))) {
-        if ui.button(format!("Open {} usage", p.name())).clicked() {
-            action = Some(MenuAction::Open(url));
-        }
+    let has_usage = shown.iter().any(|p| p.usage_url().is_some());
+    if has_usage {
+        ui.menu_button("View usage", |ui| {
+            for (p, url) in shown.iter().filter_map(|&p| Some((p, p.usage_url()?))) {
+                if ui.button(p.name()).clicked() {
+                    action = Some(MenuAction::Open(url));
+                }
+            }
+        });
     }
-    if found.iter().any(|p| p.usage_url().is_some()) {
+    if !available.is_empty() || has_usage {
         ui.separator();
     }
     ui.menu_button("Size", |ui| {
@@ -1835,11 +1998,6 @@ fn egui_menu(
         action = Some(MenuAction::CheckForUpdates);
     }
     ui.separator();
-    ui.label(
-        RichText::new(format!("refreshes every {refresh_mins} min"))
-            .size(10.0)
-            .color(MUTED),
-    );
     ui.label(
         RichText::new(format!("version {}", update::CURRENT))
             .size(10.0)
@@ -1857,7 +2015,7 @@ fn egui_menu(
 /// The right-click menu as a native popup from the menu bar's menu library. The
 /// choice arrives later through `MenuBar::take_actions`.
 #[cfg(target_os = "macos")]
-fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, minimized: bool) {
+fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, minimized: bool) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let Some(bar) = &app.menubar else { return };
     let Ok(handle) = frame.window_handle() else {
@@ -1871,10 +2029,9 @@ fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, mini
     unsafe {
         bar.popup(
             appkit.ns_view.as_ptr(),
-            &app.found(),
+            &app.available(),
             &app.shown(),
             zoom,
-            refresh_mins,
             minimized,
         )
     }
@@ -2070,6 +2227,7 @@ impl eframe::App for App {
         eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
         eframe::set_value(storage, RATIOS_KEY, &self.ratios);
         eframe::set_value(storage, HIDDEN_KEY, &self.hidden);
+        eframe::set_value(storage, SHOWN_KEY, &self.force_shown);
     }
 
     /// Runs before every `ui` pass, and is all that runs while the widget is
@@ -2082,7 +2240,7 @@ impl eframe::App for App {
         {
             self.handle_menu(ctx);
             if let Some(bar) = &self.menubar {
-                bar.set_services(&self.found(), &self.shown());
+                bar.set_services(&self.available(), &self.shown());
             }
         }
     }
@@ -2121,9 +2279,9 @@ impl eframe::App for App {
         let mut refresh = false;
         let mut action = None;
         let zoom = ctx.zoom_factor();
-        let refresh_mins = self.interval.as_secs() / 60;
         let minimized = self.minimized;
         let found = self.found();
+        let available = self.available();
         let providers = self.shown();
         let bindings: HashMap<Provider, usize> = providers
             .iter()
@@ -2167,7 +2325,7 @@ impl eframe::App for App {
             #[cfg(not(windows))]
             if !native_menu_available {
                 bg.context_menu(|ui| {
-                    action = egui_menu(ui, &found, &providers, zoom, refresh_mins, minimized);
+                    action = egui_menu(ui, &available, &providers, zoom, minimized);
                     if action.is_some() {
                         ui.close();
                     }
@@ -2264,10 +2422,10 @@ impl eframe::App for App {
         if native_menu_available && right_clicked && !egui::Popup::is_any_open(&ctx) {
             #[cfg(windows)]
             {
-                action = native_menu(frame, &found, &providers, zoom, refresh_mins, minimized);
+                action = native_menu(frame, &available, &providers, zoom, minimized);
             }
             #[cfg(target_os = "macos")]
-            mac_menu(frame, self, zoom, refresh_mins, minimized);
+            mac_menu(frame, self, zoom, minimized);
         }
 
         let (lookup_renewal, cancel_renewal, raise_renewal) =
@@ -3092,6 +3250,322 @@ mod display_tests {
         assert!(app.total(&app.shown()).is_none());
         app.toggle(Provider::Copilot);
         assert_eq!(app.empty_text(&app.found()).1, "All hidden");
+    }
+
+    #[test]
+    fn antigravity_without_valid_login_is_hidden_by_default_but_in_show() {
+        for problem in [
+            Problem::NotAvailable,
+            Problem::TokenExpired,
+            Problem::TokenRejected,
+        ] {
+            let (mut app, updates, _) =
+                App::for_test(vec![Provider::Copilot, Provider::Antigravity]);
+            app.slots.insert(
+                Provider::Copilot,
+                Slot {
+                    meters: Some(vec![Meter {
+                        label: None,
+                        used: 10.0,
+                        total: 100.0,
+                        unit: Unit::Dollars,
+                        resets_at: None,
+                    }]),
+                    updated: Some(now_unix()),
+                    ..Default::default()
+                },
+            );
+            updates
+                .send(Update {
+                    provider: Provider::Antigravity,
+                    result: Err(FetchError {
+                        problem,
+                        detail: "no login".into(),
+                    }),
+                    at: now_unix(),
+                    started: std::time::Instant::now(),
+                })
+                .unwrap();
+            app.drain();
+
+            assert_eq!(app.found(), [Provider::Copilot]);
+            assert_eq!(app.available(), [Provider::Copilot, Provider::Antigravity]);
+            assert_eq!(app.shown(), [Provider::Copilot]);
+
+            // Ticking Antigravity in Show reveals it, and unticking hides it again
+            // without permanently suppressing auto-show once signed in.
+            app.toggle(Provider::Antigravity);
+            assert_eq!(app.shown(), [Provider::Copilot, Provider::Antigravity]);
+            app.toggle(Provider::Antigravity);
+            assert_eq!(app.shown(), [Provider::Copilot]);
+
+            // Once a valid Antigravity reading arrives, it appears automatically.
+            updates
+                .send(Update {
+                    provider: Provider::Antigravity,
+                    result: Ok(Usage {
+                        personal: true,
+                        plan: Some("Free".into()),
+                        cycle: None,
+                        note: None,
+                        estimated: Vec::new(),
+                        api_spend: None,
+                        meters: vec![Meter {
+                            label: Some("Gemini Models 5h".into()),
+                            used: 20.0,
+                            total: 100.0,
+                            unit: Unit::Percent,
+                            resets_at: None,
+                        }],
+                    }),
+                    at: now_unix(),
+                    started: std::time::Instant::now(),
+                })
+                .unwrap();
+            app.drain();
+            assert_eq!(app.found(), [Provider::Copilot, Provider::Antigravity]);
+            assert_eq!(app.shown(), [Provider::Copilot, Provider::Antigravity]);
+
+            app.toggle(Provider::Antigravity);
+            assert_eq!(app.shown(), [Provider::Copilot]);
+        }
+    }
+
+    #[test]
+    fn refresh_provider_and_request_coalescing() {
+        let ctx = egui::Context::default();
+        let (mut app, _updates, refresh_rx) =
+            App::for_test(vec![Provider::Copilot, Provider::Antigravity]);
+
+        app.apply_action(MenuAction::RefreshProvider(Provider::Copilot), &ctx);
+        assert!(app.slots[&Provider::Copilot].loading);
+        assert!(!app.slots[&Provider::Antigravity].loading);
+        assert_eq!(
+            refresh_rx.try_recv().unwrap(),
+            RefreshRequest::One(Provider::Copilot)
+        );
+
+        app.apply_action(MenuAction::Refresh, &ctx);
+        assert!(app.slots[&Provider::Copilot].loading);
+        assert!(app.slots[&Provider::Antigravity].loading);
+        assert_eq!(refresh_rx.try_recv().unwrap(), RefreshRequest::All);
+
+        let all = [Provider::Copilot, Provider::Claude, Provider::Antigravity];
+        assert_eq!(
+            collect_refresh_targets(
+                RefreshRequest::One(Provider::Copilot),
+                [
+                    RefreshRequest::One(Provider::Copilot),
+                    RefreshRequest::One(Provider::Antigravity),
+                    RefreshRequest::One(Provider::Codex),
+                ],
+                &all,
+            ),
+            (vec![Provider::Copilot, Provider::Antigravity], false)
+        );
+        assert_eq!(
+            collect_refresh_targets(
+                RefreshRequest::One(Provider::Copilot),
+                [RefreshRequest::All],
+                &all,
+            ),
+            (all.to_vec(), true)
+        );
+    }
+
+    #[test]
+    fn egui_menu_renders_submenus() {
+        let ctx = widget_ctx();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let action = egui_menu(
+                    ui,
+                    &Provider::ALL,
+                    &[Provider::Copilot, Provider::Claude],
+                    1.0,
+                    false,
+                );
+                assert!(action.is_none());
+            });
+        });
+        out.textures_delta.clear();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_menu_organizes_refresh_show_view_usage_and_omits_interval() {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetMenuItemCount(menu: isize) -> i32;
+            fn GetMenuStringW(
+                menu: isize,
+                id: u32,
+                buf: *mut u16,
+                max_count: i32,
+                flags: u32,
+            ) -> i32;
+            fn GetMenuState(menu: isize, id: u32, flags: u32) -> u32;
+            fn GetSubMenu(menu: isize, pos: i32) -> isize;
+            fn GetMenuItemID(menu: isize, pos: i32) -> u32;
+        }
+        const MF_BYPOSITION: u32 = 0x400;
+        const MF_CHECKED: u32 = 0x8;
+        const MF_SEPARATOR: u32 = 0x800;
+
+        #[derive(Debug, PartialEq)]
+        struct Entry {
+            label: String,
+            checked: bool,
+            separator: bool,
+            action: Option<MenuAction>,
+            children: Option<Vec<Entry>>,
+        }
+
+        unsafe fn dump(menu: isize) -> Vec<Entry> {
+            unsafe {
+                let count = GetMenuItemCount(menu);
+                let mut out = Vec::new();
+                for pos in 0..count {
+                    let sub = GetSubMenu(menu, pos);
+                    let state = GetMenuState(menu, pos as u32, MF_BYPOSITION);
+                    // For a popup item, the high byte of GetMenuState holds its child count
+                    // (e.g. 8 items = 0x800), so check MF_SEPARATOR only on leaf items.
+                    let separator = sub == 0 && (state & MF_SEPARATOR) != 0;
+                    let checked = sub == 0 && (state & MF_CHECKED) != 0;
+                    let mut buf = [0u16; 128];
+                    let len = GetMenuStringW(
+                        menu,
+                        pos as u32,
+                        buf.as_mut_ptr(),
+                        buf.len() as i32,
+                        MF_BYPOSITION,
+                    );
+                    let label = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+                    let (action, children) = if sub != 0 {
+                        (None, Some(dump(sub)))
+                    } else {
+                        let id = GetMenuItemID(menu, pos);
+                        let action = (id != u32::MAX)
+                            .then(|| win_menu::action(id as usize))
+                            .flatten();
+                        (action, None)
+                    };
+                    out.push(Entry {
+                        label,
+                        checked,
+                        separator,
+                        action,
+                        children,
+                    });
+                }
+                out
+            }
+        }
+
+        let entries = unsafe {
+            let menu = win_menu::build(
+                &Provider::ALL,
+                &[Provider::Copilot, Provider::Claude],
+                1.0,
+                false,
+            );
+            let entries = dump(menu);
+            win_menu::DestroyMenu(menu);
+            entries
+        };
+
+        let top_labels: Vec<&str> = entries
+            .iter()
+            .filter(|e| !e.separator)
+            .map(|e| e.label.as_str())
+            .collect();
+        assert_eq!(top_labels[0], "Refresh");
+        assert_eq!(top_labels[1], "Minimize");
+        assert_eq!(top_labels[2], "Show");
+        assert_eq!(top_labels[3], "View usage");
+        assert_eq!(top_labels[4], "Size");
+        assert_eq!(top_labels[5], "Check for updates");
+        assert!(top_labels[6].starts_with("Version "));
+        assert_eq!(top_labels[7], "Edit config");
+        assert_eq!(top_labels[8], "Quit");
+        assert_eq!(top_labels.len(), 9);
+        assert!(
+            top_labels
+                .iter()
+                .all(|l| !l.to_ascii_lowercase().contains("refreshes every"))
+        );
+
+        let submenu = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.label == name)
+                .and_then(|e| e.children.as_ref())
+                .unwrap()
+        };
+
+        let refresh = submenu("Refresh");
+        assert_eq!(refresh.len(), 4);
+        assert_eq!(refresh[0].label, "All");
+        assert_eq!(refresh[0].action, Some(MenuAction::Refresh));
+        assert!(refresh[1].separator);
+        assert_eq!(refresh[2].label, "Copilot");
+        assert_eq!(
+            refresh[2].action,
+            Some(MenuAction::RefreshProvider(Provider::Copilot))
+        );
+        assert_eq!(refresh[3].label, "Claude");
+        assert_eq!(
+            refresh[3].action,
+            Some(MenuAction::RefreshProvider(Provider::Claude))
+        );
+
+        let show = submenu("Show");
+        let show_items: Vec<(&str, bool, Option<MenuAction>)> = show
+            .iter()
+            .map(|e| (e.label.as_str(), e.checked, e.action))
+            .collect();
+        assert_eq!(
+            show_items,
+            vec![
+                ("Copilot", true, Some(MenuAction::Toggle(Provider::Copilot))),
+                ("Claude", true, Some(MenuAction::Toggle(Provider::Claude))),
+                ("Codex", false, Some(MenuAction::Toggle(Provider::Codex))),
+                (
+                    "Antigravity",
+                    false,
+                    Some(MenuAction::Toggle(Provider::Antigravity)),
+                ),
+            ]
+        );
+
+        let usage = submenu("View usage");
+        let usage_items: Vec<(&str, Option<MenuAction>)> =
+            usage.iter().map(|e| (e.label.as_str(), e.action)).collect();
+        assert_eq!(
+            usage_items,
+            vec![
+                (
+                    "Copilot",
+                    Provider::Copilot.usage_url().map(MenuAction::Open)
+                ),
+                ("Claude", Provider::Claude.usage_url().map(MenuAction::Open)),
+            ]
+        );
+
+        // When only Antigravity is shown, View usage is omitted (it has no usage URL).
+        let agy_only = unsafe {
+            let menu = win_menu::build(
+                &[Provider::Antigravity],
+                &[Provider::Antigravity],
+                1.0,
+                true,
+            );
+            let entries = dump(menu);
+            win_menu::DestroyMenu(menu);
+            entries
+        };
+        assert!(agy_only.iter().all(|e| e.label != "View usage"));
+        assert!(agy_only.iter().any(|e| e.label == "Maximize"));
     }
 
     #[test]

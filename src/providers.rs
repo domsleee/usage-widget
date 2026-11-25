@@ -1337,7 +1337,7 @@ fn claude_access_token(oauth: &Value, now: i64) -> Result<&str, FetchError> {
     if i64_of(&oauth["expiresAt"]).is_some_and(|ms| ms / 1000 <= now) {
         return Err(FetchError::new(
             Problem::TokenExpired,
-            "Claude token expired; right-click > Refresh token, or run `claude`",
+            "Claude token expired; right-click > Refresh > Claude, or run `claude`",
         ));
     }
     Ok(token)
@@ -1362,7 +1362,7 @@ fn claude_api(
         200 => Ok(json),
         401 | 403 => Err(FetchError::new(
             Problem::TokenRejected,
-            "Claude token rejected; right-click > Refresh token, or run `claude`",
+            "Claude token rejected; right-click > Refresh > Claude, or run `claude`",
         )
         .into()),
         429 => Err(ClaudeError::RateLimited(retry_after.unwrap_or(0))),
@@ -1508,7 +1508,7 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
     {
         return Err(FetchError::new(
             Problem::TokenExpired,
-            "Codex token expired; right-click > Refresh token, or run `codex`",
+            "Codex token expired; right-click > Refresh > Codex, or run `codex`",
         ));
     }
     let account_id = tokens["account_id"].as_str().unwrap_or("");
@@ -1525,7 +1525,7 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
         401 | 403 => {
             return Err(FetchError::new(
                 Problem::TokenRejected,
-                "Codex token rejected; right-click > Refresh token, or run `codex`",
+                "Codex token rejected; right-click > Refresh > Codex, or run `codex`",
             ));
         }
         s => {
@@ -1812,7 +1812,7 @@ mod tests {
                 .expect("cached usage must not hide an expired token");
                 assert_eq!(error.problem, Problem::TokenExpired);
                 assert_eq!(error.problem.label(), "Token expired");
-                assert!(error.detail.contains("Refresh token"));
+                assert!(error.detail.contains("Refresh > Claude"));
                 assert_eq!(state.last_attempt, 0);
             }
         }

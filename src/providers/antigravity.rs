@@ -72,7 +72,11 @@ struct SignIn {
 }
 
 fn parse_sign_in(text: &str) -> Result<SignIn, FetchError> {
-    let value: Value = serde_json::from_str(text.trim())
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(FetchError::new(Problem::NotAvailable, SIGN_IN));
+    }
+    let value: Value = serde_json::from_str(trimmed)
         .map_err(|e| FetchError::from(format!("bad Antigravity sign-in entry: {e}")))?;
     let token = &value["token"];
     let field = |name: &str| token[name].as_str().unwrap_or_default().to_string();
@@ -615,6 +619,8 @@ mod tests {
         assert_eq!(sign_in.expires_at, Some(1_795_568_973));
         let empty = parse_sign_in(r#"{"token":{}}"#).unwrap_err();
         assert_eq!(empty.problem, Problem::NotAvailable);
+        let blank = parse_sign_in("   ").unwrap_err();
+        assert_eq!(blank.problem, Problem::NotAvailable);
     }
 
     #[test]
