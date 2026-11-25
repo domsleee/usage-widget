@@ -61,7 +61,7 @@ pub(super) fn fetch() -> Result<Usage, FetchError> {
     let summary = post(&auth, "retrieveUserQuotaSummary", &body)?;
     // Gemini's limit only shows in each model's quota, so it is read from there.
     let models = post(&auth, "fetchAvailableModels", &body).ok();
-    parse(&load, &summary, models.as_ref())
+    parse(&load, &summary, models.as_ref(), now_unix())
 }
 
 #[derive(Debug, PartialEq)]
@@ -347,7 +347,12 @@ fn meter(group: &str, window: &str, remaining: f64, reset: Option<&str>) -> Opti
     })
 }
 
-fn parse(load: &Value, summary: &Value, models: Option<&Value>) -> Result<Usage, FetchError> {
+fn parse(
+    load: &Value,
+    summary: &Value,
+    models: Option<&Value>,
+    now: i64,
+) -> Result<Usage, FetchError> {
     let mut meters = Vec::new();
     for group in summary["groups"].as_array().into_iter().flatten() {
         let name = group["displayName"].as_str().unwrap_or_default();
@@ -367,7 +372,7 @@ fn parse(load: &Value, summary: &Value, models: Option<&Value>) -> Result<Usage,
     let has_gemini = meters
         .iter()
         .any(|m| m.label.as_deref().is_some_and(|l| l.contains("Gemini")));
-    if !has_gemini && let Some(m) = models.and_then(gemini_meter) {
+    if !has_gemini && let Some(m) = models.and_then(|m| gemini_meter(m, now)) {
         meters.insert(0, m);
     }
     if meters.is_empty() {
@@ -387,9 +392,10 @@ fn parse(load: &Value, summary: &Value, models: Option<&Value>) -> Result<Usage,
     })
 }
 
-/// The Gemini models share one weekly limit, which each model's quota reports.
-/// The fullest one is the shared limit.
-fn gemini_meter(models: &Value) -> Option<Meter> {
+/// The Gemini models share one limit, which each model's quota reports. The
+/// fullest one is the shared limit. It is the weekly window on some plans and
+/// the 5-hour window on others, so its reset time says which.
+fn gemini_meter(models: &Value, now: i64) -> Option<Meter> {
     models["models"]
         .as_object()?
         .values()
@@ -407,7 +413,15 @@ fn gemini_meter(models: &Value) -> Option<Meter> {
             ))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
-        .and_then(|(remaining, reset)| meter("Gemini Models", "weekly", remaining, reset))
+        .and_then(|(remaining, reset)| {
+            let left = reset.and_then(parse_rfc3339).map(|at| at - now);
+            let window = if left.is_some_and(|s| s <= 5 * 3600) {
+                "5h"
+            } else {
+                "weekly"
+            };
+            meter("Gemini Models", window, remaining, reset)
+        })
 }
 
 /// agy's sign-in JSON from the Windows Credential Manager.
@@ -499,6 +513,9 @@ fn decode_keyring(value: &str) -> Result<String, FetchError> {
 mod tests {
     use super::*;
 
+    /// 2026-11-25T06:26:40Z, a week before the fixtures' weekly resets.
+    const NOW: i64 = 1_795_588_000;
+
     fn load(tier: &str, name: &str) -> Value {
         json!({
             "currentTier": {"id": tier, "name": name},
@@ -544,6 +561,7 @@ mod tests {
             &load("free-tier", "Antigravity"),
             &summary(),
             Some(&models()),
+            NOW,
         )
         .unwrap();
         let labels: Vec<_> = usage
@@ -562,6 +580,22 @@ mod tests {
     }
 
     #[test]
+    fn a_gemini_quota_resetting_within_hours_is_the_five_hour_window() {
+        let mut m = models();
+        for id in ["gemini-flash", "gemini-pro"] {
+            m["models"][id]["quotaInfo"]["resetTime"] = json!("2026-11-25T10:08:21Z");
+        }
+        let usage = parse(
+            &load("g1-pro-tier", "Google AI Pro"),
+            &summary(),
+            Some(&m),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(usage.meters[0].label.as_deref(), Some("Gemini Models 5h"));
+    }
+
+    #[test]
     fn a_gemini_group_in_the_summary_is_not_doubled() {
         let mut s = summary();
         s["groups"][0]["displayName"] = json!("Gemini Models");
@@ -569,6 +603,7 @@ mod tests {
             &load("standard-tier", "Gemini Code Assist"),
             &s,
             Some(&models()),
+            NOW,
         )
         .unwrap();
         assert_eq!(usage.meters.len(), 1);
@@ -577,7 +612,7 @@ mod tests {
 
     #[test]
     fn no_quota_windows_hides_the_row() {
-        let err = parse(&load("free-tier", "Antigravity"), &json!({}), None)
+        let err = parse(&load("free-tier", "Antigravity"), &json!({}), None, NOW)
             .err()
             .unwrap();
         assert_eq!(err.problem, Problem::NotAvailable);
